@@ -956,9 +956,9 @@ def attrition_clouds(ack, say):
         cursor = conn.cursor()
         cursor.execute(
             "SELECT DISTINCT APM_LVL_2, COUNT(*) cnt "
-            "FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT "
+            "FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT "
             "WHERE SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) "
-            "FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT) "
+            "FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT) "
             "AND APM_LVL_2 IS NOT NULL "
             "GROUP BY APM_LVL_2 ORDER BY APM_LVL_2"
         )
@@ -1090,7 +1090,7 @@ def at_risk_canvas(ack, say, command, client):
     def process():
         try:
             from domain.analytics.snowflake_client import get_snowflake_connection
-            from filter_parser import parse_filters, CLOUD_KEYWORDS
+            from filter_parser import CLOUD_KEYWORDS, parse_filters
 
             where_clauses = []
 
@@ -1117,27 +1117,25 @@ def at_risk_canvas(ack, say, command, client):
 
             query = f"""
                 SELECT DISTINCT
-                    SF_ACCOUNT_ID,
-                    ACCOUNT_NAME,
+                    ACCOUNT_ID,
                     APM_LVL_2 as PRODUCT,
-                    ATTRITION_PROBABILITY as SCORE,
+                    ATTRITION_PROBA as SCORE,
                     ATTRITION_PROBA_CATEGORY as RISK_CLASS
-                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+                FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
                 WHERE SNAPSHOT_DT = (
                     SELECT MAX(SNAPSHOT_DT)
-                    FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+                    FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
                 )
                 AND ATTRITION_PROBA_CATEGORY IN ('High', 'Medium')
-                AND SF_ACCOUNT_ID IS NOT NULL
-                AND ACCOUNT_NAME IS NOT NULL
+                AND ACCOUNT_ID IS NOT NULL
                 {where_sql}
-                ORDER BY ATTRITION_PROBABILITY DESC
+                ORDER BY ATTRITION_PROBA DESC
                 LIMIT 50
             """
 
             cursor.execute(query)
             rows = cursor.fetchall()
-            cursor.close()  # only cursor; keep shared Snowflake connection open
+            cursor.close()
 
             if not rows:
                 say(":x: No at-risk accounts found matching your criteria.")
@@ -1146,16 +1144,16 @@ def at_risk_canvas(ack, say, command, client):
             result = f":warning: *At-Risk Renewals* ({len(rows)} accounts)\n\n"
 
             for row in rows[:20]:
-                account_id, account_name, product, score, risk_class = row
+                account_id, product, score, risk_class = row
+
+                # ACCOUNT_ID in Snowflake is 15-char, display as-is
                 emoji = (
                     ":red_circle:"
                     if risk_class == "High"
                     else ":large_orange_circle:"
                 )
-                result += f"{emoji} *{account_name}* ({product})\n"
-                result += (
-                    f"   Score: {score:.3f} | Risk: {risk_class} | `{account_id}`\n\n"
-                )
+                result += f"{emoji} *Account {account_id}* ({product})\n"
+                result += f"   Score: {score:.3f} | Risk: {risk_class}\n\n"
 
             if len(rows) > 20:
                 result += f"\n_...and {len(rows) - 20} more accounts_"
