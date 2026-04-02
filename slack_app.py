@@ -15,6 +15,7 @@ from slack_sdk.errors import SlackApiError
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import server
+from log_utils import log_error
 
 def _load_dotenv_if_present() -> None:
     """
@@ -640,31 +641,251 @@ def handle_mention(event, say):
     say("Hey! 👋 I work best in direct messages.\n\nSend me a DM and upload a product brief PDF, then ask me anything!")
 
 
-@app.command("/gm-review-canvas")
-def handle_gm_review_canvas_deprecated(ack, respond):
-    """Old slash command may still be registered in the Slack app; ack with guidance."""
+@app.command("/attrition-risk")
+def attrition_risk_cmd(ack, say, command, client):
+    """
+    Attrition risk lookup for a single account.
+    Usage: /attrition-risk <Account Name>
+    """
     ack()
-    respond(
-        "This workspace still has `/gm-review-canvas`, but this bot only does *PDF brief Q&A* now.\n\n"
-        "*What to do:* open a DM with the bot, upload a product brief PDF, then ask in plain language.\n\n"
-        "*Optional cleanup:* remove the `/gm-review-canvas` command from your Slack app configuration "
-        "so this message stops appearing."
-    )
+
+    try:
+        import threading
+        import re
+        from concurrent.futures import ThreadPoolExecutor
+
+        text = command.get("text", "").strip()
+
+        if not text:
+            say(
+                ":warning: Usage:\n"
+                "`/attrition-risk <Account Name>`\n"
+                "`/attrition-risk Commerce Cloud, Titan`\n"
+                "`/attrition-risk 006xxxxxxxxxxxxx` (Opportunity ID)\n\n"
+                ":bulb: Use `/attrition-clouds` to see all available products."
+            )
+            return
+
+        def process():
+            from domain.analytics.snowflake_client import (
+                enrich_account,
+                format_enrichment_for_display,
+                get_account_attrition,
+            )
+            from domain.content.canvas_builder import build_account_brief_blocks
+            from domain.intelligence.risk_engine import generate_risk_analysis
+            from domain.salesforce.org62_client import (
+                _escape,
+                get_red_account,
+                get_renewal_opportunities,
+                get_sf_client,
+                resolve_account,
+            )
+            from filter_parser import parse_filters
+
+            # Strip markdown links
+            text_clean = re.sub(r"__?\[([^\]]+)\]\([^)]+\)__?", r"\1", text)
+            text_clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text_clean)
+            text_clean = text_clean.strip("_* ")
+
+            # Check if input is Opportunity ID
+            opp_id_match = re.match(r"^(006[a-zA-Z0-9]{12,15})$", text_clean.strip())
+
+            if opp_id_match:
+                # Mode 1: Direct Opp ID lookup
+                opp_id = opp_id_match.group(1)
+                say(":mag: Looking up opportunity *" + opp_id + "*...")
+
+                sf = get_sf_client()
+                try:
+                    result = sf.query(
+                        f"""
+                        SELECT
+                            Id, Name, StageName, Amount, CloseDate,
+                            Account.Id, Account.Name,
+                            Account.BillingCountry,
+                            ForecastCategoryName,
+                            Forecasted_Attrition__c, Swing__c,
+                            License_At_Risk_Reason__c,
+                            ACV_Reason_Detail__c, NextStep,
+                            Description, Specialist_Sales_Notes__c,
+                            Manager_Forecast_Judgement__c
+                        FROM Opportunity
+                        WHERE Id = '{_escape(opp_id)}'
+                        LIMIT 1
+                    """
+                    )
+                    if not result.get("records"):
+                        say(":x: Opportunity *" + opp_id + "* not found in org62.")
+                        return
+
+                    opp = result["records"][0]
+                    acct_data = opp.get("Account") or {}
+                    account_id = acct_data.get("Id", "")
+                    account_name = acct_data.get("Name", "Unknown")
+
+                    if not account_id:
+                        say(":x: Opportunity has no linked account.")
+                        return
+
+                    # Detect cloud from opp name
+                    opp_name = opp.get("Name", "")
+                    if "B2B" in opp_name:
+                        detected_cloud = "B2B Commerce"
+                    elif "FSC" in opp_name or "Financial" in opp_name:
+                        detected_cloud = "Financial Services Cloud"
+                    else:
+                        detected_cloud = "Commerce Cloud"
+
+                    acct = {
+                        "id": account_id,
+                        "name": account_name,
+                        "country": acct_data.get("BillingCountry", ""),
+                        "opp": opp,
+                    }
+
+                except Exception as e:
+                    say(":x: Error fetching opportunity: " + str(e)[:100])
+                    return
+
+            else:
+                # Mode 2: Account name lookup
+                f = parse_filters(text_clean)
+                account_name_input = f["manual_account_parts"][0] if f["manual_account_parts"] else text_clean
+                detected_cloud = f["cloud"]
+
+                say(":mag: Looking up *" + account_name_input + "*...")
+                acct = resolve_account(account_name_input, cloud=detected_cloud)
+
+                if not acct:
+                    say(
+                        ":x: Could not find account: *" + account_name_input + "*\n\n"
+                        "*Suggestions:*\n"
+                        "- Check spelling\n"
+                        "- Try a shorter name\n"
+                        "- Verify account has open renewals in org62\n"
+                        "- Try without cloud filter\n"
+                        "- Use opportunity ID: `/attrition-risk 006xxxxxxxxxxxxx`"
+                    )
+                    return
+
+            # Common flow
+            account_id = acct["id"]
+            account_name = acct["name"]
+
+            # Fetch opp
+            if acct.get("opp"):
+                opp = acct["opp"]
+                opps = [opp]
+            else:
+                opps = get_renewal_opportunities(account_id, detected_cloud) or []
+                opp = opps[0] if opps else {}
+
+            # Fetch red account
+            red = get_red_account(account_id)
+
+            # Snowflake enrichment (parallel)
+            opty_id = opp.get("Id", "") if opp else ""
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_enrich = ex.submit(enrich_account, account_id, opty_id, detected_cloud)
+                fut_attrition = ex.submit(get_account_attrition, account_id, cloud=detected_cloud)
+                enrichment = fut_enrich.result()
+                product_attrition = fut_attrition.result()
+
+            display = format_enrichment_for_display(enrichment)
+
+            # Risk analysis
+            risk_notes, recommendation = generate_risk_analysis(
+                account_name=account_name,
+                opp=opp,
+                red_account=red,
+                snowflake_enrichment=enrichment,
+                call_llm_fn=server.call_llm_gateway,
+            )
+
+            # Build and send blocks
+            blocks = build_account_brief_blocks(
+                account={
+                    "name": account_name,
+                    "id": account_id,
+                    "product_attrition": product_attrition,
+                },
+                opp=opp,
+                red_account=red,
+                snowflake_display=display,
+                risk_notes=risk_notes,
+                recommendation=recommendation,
+                tldr=None,
+            )
+            say(
+                text="Account Risk Briefing — " + account_name,
+                blocks=blocks,
+            )
+
+        threading.Thread(target=process).start()
+
+    except Exception as e:
+        say(f"❌ Error: {str(e)}")
+
+
+@app.command("/attrition-clouds")
+def attrition_clouds(ack, say):
+    """Show available product clouds in Snowflake."""
+    ack()
+    try:
+        from domain.analytics.snowflake_client import get_snowflake_connection
+
+        conn = get_snowflake_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT APM_LVL_2, COUNT(*) cnt "
+            "FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT "
+            "WHERE SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) "
+            "FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT) "
+            "AND APM_LVL_2 IS NOT NULL "
+            "GROUP BY APM_LVL_2 ORDER BY APM_LVL_2"
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        out = [f"- {r[0]} ({r[1]} accounts)" for r in rows]
+        say(
+            f":cloud: *Available Products ({len(rows)} total):*\n"
+            + "\n".join(out)
+            + "\n\n_Usage: `/attrition-risk <Account Name>`_"
+        )
+    except Exception as e:
+        say(":x: Error: " + str(e))
+
+
+@app.command("/gm-review-canvas")
+def gm_review_canvas(ack, say, command, client):
+    """
+    Generate GM Review canvas for at-risk renewals.
+    Usage: /gm-review-canvas Commerce Cloud, Account1, Account2
+    """
+    ack()
+    say(":soon: GM Review canvas is being restored - check back in 10 minutes!")
+
+
+@app.command("/at-risk-canvas")
+def at_risk_canvas(ack, say, command, client):
+    """
+    Generate at-risk renewals canvas.
+    Usage: /at-risk-canvas >500k FY27
+    """
+    ack()
+    say(":soon: At-risk canvas is being restored - check back in 10 minutes!")
 
 
 if __name__ == "__main__":
     if not os.environ.get("SLACK_BOT_TOKEN"):
-        print("❌ Error: SLACK_BOT_TOKEN not found")
-        exit(1)
+        log_error("❌ SLACK_BOT_TOKEN not found")
+        sys.exit(1)
     if not os.environ.get("SLACK_APP_TOKEN"):
-        print("❌ Error: SLACK_APP_TOKEN not found")
-        exit(1)
+        log_error("❌ SLACK_APP_TOKEN not found")
+        sys.exit(1)
 
+    print("🚀 Starting Adoption Intelligence Bot", flush=True)
     init_database()
-
-    print("🚀 Starting Adoption Intelligence Bot...")
-    print("✅ Briefs and last-active brief persist in ./storage/")
-    print("✅ Sessions archive to", DB_PATH)
-
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()

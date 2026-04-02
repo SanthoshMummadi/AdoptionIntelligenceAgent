@@ -13,19 +13,22 @@ def get_sf_client():
     """Get or create Salesforce client."""
     global _sf_client
     if _sf_client is None:
-        username = os.environ.get("SALESFORCE_USERNAME")
-        password = os.environ.get("SALESFORCE_PASSWORD")
-        security_token = os.environ.get("SALESFORCE_SECURITY_TOKEN")
+        access_token = os.environ.get("SF_ACCESS_TOKEN")
+        instance_url = os.environ.get("SF_INSTANCE_URL")
 
-        if not all([username, password, security_token]):
-            raise Exception("Missing Salesforce credentials in .env")
-
-        _sf_client = Salesforce(
-            username=username,
-            password=password,
-            security_token=security_token,
-        )
-        log_debug("✅ Connected to Salesforce org62")
+        if access_token and instance_url:
+            _sf_client = Salesforce(
+                instance_url=instance_url,
+                session_id=access_token,
+            )
+            log_debug("✅ Connected to Salesforce org62 (via access token)")
+        else:
+            raise Exception(
+                "Missing Salesforce credentials. "
+                "Run: sf org login web --instance-url https://org62.my.salesforce.com --alias org62 "
+                "then: sf org display --target-org org62 --json "
+                "and copy SF_ACCESS_TOKEN and SF_INSTANCE_URL to .env"
+            )
 
     return _sf_client
 
