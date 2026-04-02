@@ -1,12 +1,17 @@
-import os
-
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+"""
+log_utils.py
+Simple logging utilities
+"""
+import sys
+from datetime import datetime
 
 
 def log_debug(msg: str):
-    if LOG_LEVEL == "DEBUG":
-        print(f"[DEBUG] {msg}", flush=True)
+    """Print debug message with timestamp"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=True)
 
 
 def log_error(msg: str):
-    print(f"[ERROR] {msg}", flush=True)
+    """Print error message"""
+    print(f"❌ {msg}", file=sys.stderr, flush=True)

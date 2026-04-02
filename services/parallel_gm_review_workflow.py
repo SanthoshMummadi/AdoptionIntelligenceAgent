@@ -54,6 +54,12 @@ class ParallelGMReviewWorkflow:
             else:
                 account_id = self.sf.resolve_account_id(raw)
                 if not account_id:
+                    from domain.salesforce.org62_client import resolve_account_enhanced
+
+                    enhanced = resolve_account_enhanced(raw, cloud="Commerce Cloud")
+                    if enhanced:
+                        account_id = enhanced.get("id")
+                if not account_id:
                     opp_id = self.sf.resolve_opportunity_id(raw)
                     if opp_id:
                         od = self.sf.get_opportunity_details(opp_id)

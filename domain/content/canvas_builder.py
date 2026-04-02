@@ -23,35 +23,6 @@ def fmt_amount(value) -> str:
         return "N/A"
 
 
-def extract_usd(value) -> float:
-    """Extract USD amount from various formats."""
-    if value is None:
-        return 0
-    try:
-        return abs(float(value))
-    except (TypeError, ValueError):
-        return 0
-
-
-def resolve_money(display: dict, opp: dict, field: str) -> float:
-    """Resolve money field from display or opp."""
-    # Try display first
-    val = display.get(field, 0)
-    if val and val != "N/A":
-        try:
-            return float(str(val).replace("$", "").replace(",", "").replace("M", "000000").replace("K", "000"))
-        except Exception:
-            pass
-
-    # Try opp
-    if field == "atr":
-        return abs(opp.get("Amount", 0) or 0)
-    elif field == "attrition":
-        return abs(opp.get("Forecasted_Attrition__c", 0) or 0)
-
-    return 0
-
-
 def _sanitize_cell(text: str) -> str:
     """Sanitize text for canvas table cells."""
     if not text:
@@ -123,294 +94,203 @@ def build_account_brief_blocks(
     recommendation: str,
     tldr: str = None,
 ) -> list:
-    """Build Slack Block Kit UI for account brief matching Geox Spa format."""
+    """Slack Block Kit: header, metrics, risk/actions, product, red account, TL;DR last, then SF link."""
     account_name = account.get("name", "Unknown")
     account_id = account.get("id", "")
+    product_attrition = account.get("product_attrition", [])
 
-    # Build org62 link
-    org62_link = f"https://org62.my.salesforce.com/{account_id}" if account_id else "#"
-
-    blocks = [
+    blocks: list = [
         {
-            "type": "section",
+            "type": "header",
             "text": {
-                "type": "mrkdwn",
-                "text": f"*Account Risk Briefing — <{org62_link}|{account_name}>*",
+                "type": "plain_text",
+                "text": f"🚨 Account Risk Briefing — {account_name}",
+                "emoji": True,
             },
-        },
+        }
     ]
 
-    # ARI Score Section
-    ari_cat = snowflake_display.get("ari_category", "N/A")
-    ari_prob = snowflake_display.get("ari_probability", "N/A")
-
-    ari_emoji_map = {
-        "High": ":red_circle:",
-        "Medium": ":large_yellow_circle:",
-        "Low": ":large_green_circle:",
-    }
-    ari_emoji = ari_emoji_map.get(ari_cat, ":white_circle:")
-    ari_text = f"{ari_cat} Risk" if ari_cat != "N/A" else "N/A"
-
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"*ARI Score:*\n{ari_emoji} *{ari_text}* ({ari_prob})"
-                if ari_prob != "N/A"
-                else f"*ARI Score:*\n{ari_emoji} {ari_text}"
-            ),
-        },
-    })
-
-    # Account Health (if available from red account or other source)
-    if red_account and not red_account.get("_historical"):
-        health_emoji = ":red_circle:"
-        health_text = "Red"
-        health_score = ""
-    elif ari_cat == "Low":
-        health_emoji = ":large_green_circle:"
-        health_text = "Green"
-        health_score = "(74)"
-    elif ari_cat == "Medium":
-        health_emoji = ":large_yellow_circle:"
-        health_text = "Yellow"
-        health_score = ""
-    else:
-        health_emoji = ":white_circle:"
-        health_text = "Unknown"
-        health_score = ""
-
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*Account Health:*\n{health_emoji} {health_text} {health_score}",
-        },
-    })
-
-    # Cloud AOV
-    cc_aov = snowflake_display.get("cc_aov", "N/A")
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*Cloud AOV:*\n{cc_aov}",
-        },
-    })
-
-    # Utilization
-    util = snowflake_display.get("utilization_rate", "N/A")
-    util_emoji = ":white_circle:"
-    if util != "N/A":
-        util_emoji = ":large_yellow_circle:"
-        if "%" in str(util):
-            try:
-                if float(str(util).replace("%", "").strip()) > 70:
-                    util_emoji = ":large_green_circle:"
-            except (TypeError, ValueError):
-                pass
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*Utilization:*\n{util_emoji} {util}",
-        },
-    })
+    if opp and opp.get("Name"):
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":clipboard: *Renewal:* {opp.get('Name')} | "
+                        f"Stage: {opp.get('StageName', 'N/A')} | "
+                        f"Close: {opp.get('CloseDate', 'N/A')}"
+                    ),
+                }
+            ],
+        })
 
     blocks.append({"type": "divider"})
 
-    # Financial & Status Section Header
+    ari_emoji = snowflake_display.get("ari_emoji", ":white_circle:")
+    ari_category = snowflake_display.get("ari_category", "Unknown")
+    ari_probability = snowflake_display.get("ari_probability", "N/A")
+    health_display = snowflake_display.get("health_display", ":white_circle: Unknown")
+
     blocks.append({
         "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": "*:bar_chart: Financial & Status*",
-        },
+        "fields": [
+            {
+                "type": "mrkdwn",
+                "text": (
+                    f"*ARI Score:*\n{ari_emoji} *{ari_category} Risk* ({ari_probability})"
+                ),
+            },
+            {
+                "type": "mrkdwn",
+                "text": f"*Account Health:*\n{health_display}",
+            },
+        ],
     })
 
-    # Renewal Opportunity Link
+    cc_aov = snowflake_display.get("cc_aov", "Unknown")
+    util_emoji = snowflake_display.get("util_emoji", ":white_circle:")
+    util_rate = snowflake_display.get("utilization_rate", "N/A")
+
+    blocks.append({
+        "type": "section",
+        "fields": [
+            {"type": "mrkdwn", "text": f"*Cloud AOV:*\n{cc_aov}"},
+            {"type": "mrkdwn", "text": f"*Utilization:*\n{util_emoji} {util_rate}"},
+        ],
+    })
+
     if opp:
-        opp_id = opp.get("Id", "")
-        opp_name = opp.get("Name", "Renewal")
-        opp_link = f"https://org62.my.salesforce.com/{opp_id}" if opp_id else "#"
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Renewal:*\n<{opp_link}|{opp_name}>",
-            },
-        })
-
-    # Close Date
-    close_date = opp.get("CloseDate", "N/A") if opp else "N/A"
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*Close Date:*\n:date: {close_date}",
-        },
-    })
-
-    # ATR
-    atr = fmt_amount(opp.get("Amount", 0) if opp else 0)
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*ATR:*\n:chart_with_downwards_trend: {atr}",
-        },
-    })
-
-    # Forecasted Attrition
-    forecasted_atr = fmt_amount(
-        opp.get("Forecasted_Attrition__c", 0) if opp else 0
-    )
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*Forecasted Attrition:*\n:chart_with_downwards_trend: {forecasted_atr}",
-        },
-    })
-
-    # Swing
-    swing = fmt_amount(opp.get("Swing__c", 0) if opp else 0)
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*Swing:*\n:arrows_counterclockwise: {swing}",
-        },
-    })
-
-    # Forecast Category
-    forecast = opp.get("ForecastCategoryName", "N/A") if opp else "N/A"
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"*Forecast:*\n:bar_chart: {forecast}",
-        },
-    })
-
-    # Risk Reason (if available)
-    risk_reason = opp.get("License_At_Risk_Reason__c", "") if opp else ""
-    if risk_reason:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Risk Reason:*\n:dart: {risk_reason}",
-            },
-        })
+        forecasted_atr = opp.get("Forecasted_Attrition__c")
+        close_date = opp.get("CloseDate")
+        if forecasted_atr is not None or close_date:
+            try:
+                fatr = abs(float(forecasted_atr or 0))
+            except (TypeError, ValueError):
+                fatr = 0.0
+            blocks.append({
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Forecasted Attrition:*\n${fatr:,.0f}",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Close Date:*\n{close_date or 'N/A'}",
+                    },
+                ],
+            })
 
     blocks.append({"type": "divider"})
 
-    # Product Attrition Breakdown
-    product_attrition = account.get("product_attrition", [])
-    if product_attrition:
-        product_text = "*:package: Product Attrition Breakdown*\n"
-        for p in product_attrition[:5]:
-            prod_name = p.get("product", "Unknown")
-            attrition_amt = fmt_amount(p.get("attrition", 0))
-            category = p.get("category", "N/A")
-            reason = p.get("reason", "")
-            factors_incr = p.get("factors_incr", "")
-            factors_decr = p.get("factors_decr", "")
-
-            prod_emoji_map = {
-                "High": ":red_circle:",
-                "Medium": ":large_yellow_circle:",
-                "Low": ":large_green_circle:",
-            }
-            prod_emoji = prod_emoji_map.get(category, ":white_circle:")
-
-            product_text += f"{prod_emoji} {prod_name} | {category} | AOV: {attrition_amt}\n"
-
-            if reason:
-                product_text += f"   _Reason: {reason}_\n"
-            if factors_incr:
-                product_text += f"   _Risk Factors: {factors_incr}_\n"
-            if factors_decr:
-                product_text += f"   _Mitigating Factors: {factors_decr}_\n"
-
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": product_text,
-            },
-        })
-        blocks.append({"type": "divider"})
-
-    # Manager Notes (if available from red account or opp)
-    manager_notes = None
-    if opp and opp.get("NextStep"):
-        manager_notes = opp.get("NextStep")
-    elif red_account and red_account.get("Latest_Updates__c"):
-        manager_notes = red_account.get("Latest_Updates__c")
-
-    if manager_notes:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*:pushpin: Manager Notes*\n{manager_notes}",
-            },
-        })
-        blocks.append({"type": "divider"})
-
-    # AI Risk Analysis
     if risk_notes:
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:robot_face: AI Risk Analysis*\n{risk_notes}",
+                "text": f"*:mag: Risk Assessment*\n{risk_notes}",
             },
         })
 
-    # Strategic Recommendations
     if recommendation:
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:pushpin: Strategic Recommendations*\n{recommendation}",
+                "text": f"*:dart: Recommended Actions*\n{recommendation}",
             },
         })
 
-    # TL;DR Section at the end
-    if tldr:
-        blocks.append({"type": "divider"})
+    if product_attrition:
+        product_lines = []
+        for p in product_attrition[:5]:
+            product_name = (
+                p.get("product")
+                or p.get("APM_LVL_3")
+                or p.get("APM_LVL_2")
+                or p.get("APM_LVL_1")
+                or "Unknown"
+            )
+            product_ari = (
+                p.get("category")
+                or p.get("ATTRITION_PROBA_CATEGORY")
+                or "Unknown"
+            )
+            raw_reason = p.get("reason") or p.get("ATTRITION_REASON") or "N/A"
+            product_reason = str(raw_reason)[:40]
+            raw_atr = p.get("attrition")
+            if raw_atr is not None:
+                try:
+                    atr_val = abs(float(raw_atr))
+                except (TypeError, ValueError):
+                    atr_val = 0.0
+            else:
+                try:
+                    atr_val = abs(float(p.get("ATTRITION_PIPELINE") or 0))
+                except (TypeError, ValueError):
+                    atr_val = 0.0
+
+            if product_ari == "High":
+                emoji = ":red_circle:"
+            elif product_ari == "Medium":
+                emoji = ":large_yellow_circle:"
+            elif product_ari == "Low":
+                emoji = ":large_green_circle:"
+            else:
+                emoji = ":white_circle:"
+
+            product_lines.append(
+                f"{emoji} *{product_name}*: {product_ari} (${atr_val:,.0f}) — {product_reason}"
+            )
+
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:brain: TL;DR*\n\n> {tldr}",
+                "text": "*:bar_chart: Product Breakdown:*\n" + "\n".join(product_lines),
             },
         })
 
-    # Red Account Status (if exists)
-    if red_account and not red_account.get("_historical"):
-        blocks.append({"type": "divider"})
+    if red_account:
         stage = red_account.get("Stage__c", "Unknown")
-        acv_risk = fmt_amount(red_account.get("ACV_at_Risk__c", 0))
-        days_red = red_account.get("Days_Red__c", 0)
-
+        days_red = red_account.get("Days_Red__c", "N/A")
+        latest = (red_account.get("Latest_Updates__c") or "")[:100]
+        hist = " _(historical)_" if red_account.get("_historical") else ""
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f":red_circle: *Red Account*\n"
-                    f"- Stage: {stage}\n"
-                    f"- ACV at Risk: {acv_risk}\n"
-                    f"- Days Red: {days_red}"
+                    f"*:red_circle: Red Account Status:*{hist}\n"
+                    f"{stage} ({days_red} days)\n_{latest}_"
                 ),
             },
+        })
+
+    blocks.append({"type": "divider"})
+
+    if tldr:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*:bulb: TL;DR:*\n_{tldr}_",
+            },
+        })
+
+    if account_id:
+        sf_url = f"https://org62.my.salesforce.com/{account_id}"
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🔗 View in Salesforce", "emoji": True},
+                    "url": sf_url,
+                    "style": "primary",
+                }
+            ],
         })
 
     return blocks

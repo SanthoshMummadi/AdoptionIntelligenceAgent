@@ -3,6 +3,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import os
 import re
 import sys
+import time
 import io
 import json
 import pickle
@@ -758,6 +759,158 @@ def handle_mention(event, say):
     say("Hey! 👋 I work best in direct messages.\n\nSend me a DM and upload a product brief PDF, then ask me anything!")
 
 
+ALWAYS_UPPER_ATTRITION = {
+    "ssc",
+    "b2b",
+    "b2c",
+    "oms",
+    "pos",
+    "apm",
+    "crm",
+    "erp",
+    "api",
+}
+
+
+def smart_title_case(name: str) -> str:
+    """Title-case account names; keep common acronyms uppercased (legacy /attrition-risk)."""
+
+    def cap_word(w: str) -> str:
+        return w.upper() if w.lower() in ALWAYS_UPPER_ATTRITION else w.capitalize()
+
+    return re.sub(r"[^\s-]+", lambda m: cap_word(m.group()), name)
+
+
+def handle_list_query(text: str, user_id: str, say) -> None:
+    """Show a Snowflake at-risk account list when a single-account lookup has no match."""
+    from domain.analytics.snowflake_client import get_at_risk_accounts_snowflake
+    from domain.salesforce.org62_client import get_sf_client
+    from filter_parser import parse_filters
+
+    f = parse_filters(text)
+    text_lower = text.lower()
+    active_filters = []
+
+    cloud = f["cloud"]
+    active_filters.append(cloud)
+
+    risk_category = f.get("ari_filter")
+    if risk_category == "High":
+        active_filters.append("High Risk")
+    elif risk_category == "Medium":
+        active_filters.append("Medium Risk")
+    elif risk_category == "Low":
+        active_filters.append("Low Risk")
+
+    if f.get("health_filter"):
+        active_filters.append("Health " + f["health_filter"])
+    if f.get("min_aov", 0) > 0:
+        active_filters.append(
+            "AOV>" + ("$1M" if f["min_aov"] >= 1000000 else "$500K")
+        )
+
+    min_attrition = 0
+    if any(kw in text_lower for kw in ["over 1m", ">1m", "above 1m"]):
+        min_attrition = 1000000
+        active_filters.append("ATR > $1M")
+    elif any(kw in text_lower for kw in ["over 500k", ">500k", "above 500k"]):
+        min_attrition = 500000
+        active_filters.append("ATR > $500K")
+    elif any(kw in text_lower for kw in ["over 200k", ">200k", "above 200k"]):
+        min_attrition = 200000
+        active_filters.append("ATR > $200K")
+    elif any(kw in text_lower for kw in ["over 100k", ">100k", "above 100k"]):
+        min_attrition = 100000
+        active_filters.append("ATR > $100K")
+    elif any(kw in text_lower for kw in ["over 50k", ">50k", "above 50k"]):
+        min_attrition = 50000
+        active_filters.append("ATR > $50K")
+
+    m_top = re.search(r"top\s*(\d+)", text_lower)
+    limit = int(m_top.group(1)) if m_top else 25
+    if any(kw in text_lower for kw in ["top 50", "all"]):
+        limit = 50
+
+    say(":hourglass: Fetching at-risk accounts from Snowflake...")
+
+    records = get_at_risk_accounts_snowflake(
+        cloud=cloud,
+        risk_category=None,
+        min_attrition=min_attrition,
+        limit=limit,
+        min_aov=f.get("min_aov") or 0,
+        ari_filter=risk_category,
+        sort_by=f.get("sort_by") or "atr",
+    )
+
+    if not records:
+        say(
+            ":x: No accounts found matching: *"
+            + ", ".join(active_filters)
+            + "*\n"
+            + ":bulb: Try broader filters or remove the risk category filter."
+        )
+        return
+
+    sf = get_sf_client()
+    id_to_name: dict[str, str] = {}
+    ids = list({r["account_id"] for r in records})
+    try:
+        for i in range(0, len(ids), 50):
+            batch = ids[i : i + 50]
+            id_list = "','".join(str(b) for b in batch)
+            result = sf.query(
+                "SELECT Id, Name FROM Account WHERE Id IN ('" + id_list + "')"
+            )
+            for rec in result.get("records", []):
+                rid = rec.get("Id") or ""
+                id_to_name[rid[:15]] = rec.get("Name", rid)
+    except Exception as e:
+        print("Account name lookup error: " + str(e)[:60])
+
+    total_atr = sum(abs(r["attrition_pipeline"]) for r in records)
+    filter_label = " + ".join(active_filters) if active_filters else "All Accounts"
+    risk_emoji = {
+        "High": ":red_circle:",
+        "Medium": ":large_yellow_circle:",
+        "Low": ":large_green_circle:",
+    }
+
+    lines_out = [
+        ":bar_chart: *Accounts — " + filter_label + "*\n"
+        "*" + str(len(records)) + " accounts | Total Predicted Attrition: $"
+        + f"{total_atr:,.0f}" + "*\n"
+        "_Data: Snowflake CSS · Snapshot: "
+        + (records[0].get("snapshot_dt") or "N/A")
+        + "_\n"
+    ]
+
+    for r in records:
+        acct_id = r["account_id"]
+        acct_name = id_to_name.get(str(acct_id)[:15], acct_id)
+        risk = r["attrition_proba_category"]
+        emoji = risk_emoji.get(risk, ":white_circle:")
+        atr = abs(r["attrition_pipeline"])
+        product = r["apm_lvl_3"]
+        reason = r["attrition_reason"] or "N/A"
+        lines_out.append(
+            "- *"
+            + str(acct_name)
+            + "* — "
+            + str(product)
+            + "\n  "
+            + emoji
+            + " "
+            + str(risk)
+            + " | ATR: $"
+            + f"{atr:,.0f}"
+            + " | Reason: "
+            + str(reason)
+        )
+
+    say("\n".join(lines_out))
+
+
 @app.command("/attrition-risk")
 def attrition_risk_cmd(ack, say, command, client):
     """
@@ -765,6 +918,15 @@ def attrition_risk_cmd(ack, say, command, client):
     Usage: /attrition-risk <Account Name>
     """
     ack()
+
+    _this_cmd = (
+        command.get("user_id"),
+        (command.get("text") or "").strip(),
+        int(time.time() / 3),
+    )
+    if getattr(attrition_risk_cmd, "_last_cmd", None) == _this_cmd:
+        return
+    attrition_risk_cmd._last_cmd = _this_cmd
 
     try:
         import threading
@@ -778,6 +940,7 @@ def attrition_risk_cmd(ack, say, command, client):
                 ":warning: Usage:\n"
                 "`/attrition-risk <Account Name>`\n"
                 "`/attrition-risk Commerce Cloud, Titan`\n"
+                "`/attrition-risk Marketing Cloud, Acne Studios`\n"
                 "`/attrition-risk 006xxxxxxxxxxxxx` (Opportunity ID)\n\n"
                 ":bulb: Use `/attrition-clouds` to see all available products."
             )
@@ -793,10 +956,12 @@ def attrition_risk_cmd(ack, say, command, client):
             from domain.intelligence.risk_engine import generate_risk_analysis
             from domain.salesforce.org62_client import (
                 _escape,
+                _soql_line,
                 get_red_account,
                 get_renewal_opportunities,
+                get_renewal_opportunities_any_cloud,
                 get_sf_client,
-                resolve_account,
+                resolve_account_enhanced,
             )
             from filter_parser import parse_filters
 
@@ -809,8 +974,9 @@ def attrition_risk_cmd(ack, say, command, client):
             detected_cloud = filters.get("cloud", "Commerce Cloud")
 
             account_parts = filters.get("manual_account_parts", [])
+            # Single-account slash command: first segment after cloud (legacy behavior)
             account_search = (
-                " ".join(account_parts) if account_parts else text_clean
+                account_parts[0] if account_parts else text_clean
             )
 
             # Check if input is Opportunity ID
@@ -826,7 +992,8 @@ def attrition_risk_cmd(ack, say, command, client):
                 sf = get_sf_client()
                 try:
                     result = sf.query(
-                        f"""
+                        _soql_line(
+                            f"""
                         SELECT
                             Id, Name, StageName, Amount, CloseDate,
                             Account.Id, Account.Name,
@@ -841,6 +1008,7 @@ def attrition_risk_cmd(ack, say, command, client):
                         WHERE Id = '{_escape(opp_id)}'
                         LIMIT 1
                     """
+                        )
                     )
                     if not result.get("records"):
                         say(":x: Opportunity *" + opp_id + "* not found in org62.")
@@ -876,25 +1044,21 @@ def attrition_risk_cmd(ack, say, command, client):
                     return
 
             else:
-                # Mode 2: Account name lookup (manual_account_parts drops cloud, etc.)
-                account_search = account_search.strip() or text_clean.strip()
+                # Mode 2: Account name lookup (manual_account_parts + smart title case)
+                raw_name = account_search.strip() or text_clean.strip()
+                account_name_input = smart_title_case(raw_name)
 
                 say(
-                    f":mag: Looking up account *{account_search}* "
+                    f":mag: Looking up account *{account_name_input}* "
                     f"({detected_cloud})..."
                 )
-                acct = resolve_account(account_search, cloud=detected_cloud)
+                acct = resolve_account_enhanced(
+                    account_name_input, cloud=detected_cloud
+                )
 
                 if not acct:
-                    say(
-                        ":x: Could not find account: *" + account_search + "*\n\n"
-                        "*Suggestions:*\n"
-                        "- Check spelling\n"
-                        "- Try a shorter name\n"
-                        "- Verify account has open renewals in org62\n"
-                        "- Try without cloud filter\n"
-                        "- Use opportunity ID: `/attrition-risk 006xxxxxxxxxxxxx`"
-                    )
+                    uid = command.get("user_id") or ""
+                    handle_list_query(account_name_input, uid, say)
                     return
 
             # Common flow
@@ -908,6 +1072,10 @@ def attrition_risk_cmd(ack, say, command, client):
             else:
                 opps = get_renewal_opportunities(account_id, detected_cloud) or []
                 opp = opps[0] if opps else {}
+
+            if not opp:
+                opps_any = get_renewal_opportunities_any_cloud(account_id) or []
+                opp = opps_any[0] if opps_any else {}
 
             # Fetch red account
             red = get_red_account(account_id)
@@ -931,7 +1099,39 @@ def attrition_risk_cmd(ack, say, command, client):
                 call_llm_fn=server.call_llm_gateway,
             )
 
-            # Build and send blocks
+            health_for_tldr = display.get("health_display") or display.get(
+                "ari_category", "N/A"
+            )
+            try:
+                tldr = server.call_llm_gateway(
+                    "Summarize in 2 sentences for a PM: "
+                    + "Account: "
+                    + account_name
+                    + " | ARI: "
+                    + str(display.get("ari_category", "N/A"))
+                    + " | ATR: "
+                    + str(
+                        abs(opp.get("Forecasted_Attrition__c") or 0) if opp else 0
+                    )
+                    + " | Risk: "
+                    + str(
+                        opp.get("License_At_Risk_Reason__c") or "N/A"
+                        if opp
+                        else "N/A"
+                    )
+                    + " | Health: "
+                    + str(health_for_tldr)
+                    + " | Notes: "
+                    + (risk_notes[:300] if risk_notes else ""),
+                    system_prompt=(
+                        "You are a Salesforce PM analyst. Be direct and actionable. "
+                        "Max 2 sentences."
+                    ),
+                    max_tokens=100,
+                )
+            except Exception:
+                tldr = None
+
             blocks = build_account_brief_blocks(
                 account={
                     "name": account_name,
@@ -943,7 +1143,7 @@ def attrition_risk_cmd(ack, say, command, client):
                 snowflake_display=display,
                 risk_notes=risk_notes,
                 recommendation=recommendation,
-                tldr=None,
+                tldr=tldr,
             )
             say(
                 text="Account Risk Briefing — " + account_name,
