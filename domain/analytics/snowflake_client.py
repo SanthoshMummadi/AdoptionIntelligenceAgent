@@ -92,9 +92,12 @@ def get_ari_score_by_account(account_id: str, cloud: str = "Commerce Cloud") -> 
             APM_LVL_3 as product,
             ATTRITION_PROBA_CATEGORY as category,
             ATTRITION_PROBA * 100 as probability,
-            ATTRITION_REASON as reason
+            ATTRITION_REASON as reason,
+            FACTORS_INCR_RISK as factors_increasing,
+            FACTORS_DECR_RISK as factors_decreasing,
+            RISK_DESCRIPTION as description
         FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-        WHERE SF_ACCOUNT_ID = '{account_id}'
+        WHERE ACCOUNT_ID = '{account_id}'
         AND SNAPSHOT_DT = (
             SELECT MAX(SNAPSHOT_DT)
             FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
@@ -110,7 +113,10 @@ def get_ari_score_by_account(account_id: str, cloud: str = "Commerce Cloud") -> 
                 "product": row[0],
                 "category": row[1],
                 "probability": round(float(row[2]), 1) if row[2] else 0,
-                "reason": row[3],
+                "reason": row[3] or "",
+                "factors_incr": row[4] or "",
+                "factors_decr": row[5] or "",
+                "description": row[6] or "",
             })
         return results
 
@@ -203,18 +209,20 @@ def enrich_account(account_id: str, opp_id: str, cloud: str) -> dict:
 
         query = f"""
         SELECT
-            UTILIZATION_RATE,
-            GMV_RATE,
-            BURN_RATE,
-            CC_AOV,
-            TERRITORY,
-            CSG_GEO
-        FROM CIDM.WV_AV_USAGE_EXTRACT_VW
-        WHERE SF_ACCOUNT_ID = '{account_id}'
-        AND SNAPSHOT_DT = (
-            SELECT MAX(SNAPSHOT_DT)
-            FROM CIDM.WV_AV_USAGE_EXTRACT_VW
-        )
+            aov.TOTALAOV as cloud_aov,
+            SUM(usage.TOTAL_USAGE) as total_usage,
+            SUM(usage.PRECOMMIT_QTY) as total_provisioned,
+            CASE
+                WHEN SUM(usage.PRECOMMIT_QTY) > 0
+                THEN (SUM(usage.TOTAL_USAGE) / SUM(usage.PRECOMMIT_QTY)) * 100
+                ELSE 0
+            END as utilization_rate
+        FROM CIDM.CI_FACT_TENANT_ENT_USG_MTHLY usage
+        LEFT JOIN CIDM.CI_FACT_AOV_ACCOUNT aov
+            ON usage.ACCOUNT_ID = aov.ACCOUNT_ID
+        WHERE usage.ACCOUNT_ID = '{account_id}'
+        AND usage.CURR_SNAP = 1
+        GROUP BY aov.TOTALAOV
         LIMIT 1
         """
 
@@ -225,12 +233,18 @@ def enrich_account(account_id: str, opp_id: str, cloud: str) -> dict:
         usage = {}
         if row:
             usage = {
-                "utilization_rate": f"{float(row[0]):.1f}%" if row[0] else "N/A",
-                "gmv_rate": f"{float(row[1]):.1f}%" if row[1] else "N/A",
-                "burn_rate": f"{float(row[2]):.1f}%" if row[2] else "N/A",
-                "cc_aov": f"${float(row[3]):,.0f}" if row[3] else "N/A",
-                "territory": row[4] or "N/A",
-                "csg_geo": row[5] or "N/A",
+                "cc_aov": f"${float(row[0]):,.0f}" if row[0] else "N/A",
+                "total_usage": float(row[1]) if row[1] else 0,
+                "total_provisioned": float(row[2]) if row[2] else 0,
+                "utilization_rate": (
+                    f"{float(row[3]):.1f}%"
+                    if row[3] is not None
+                    else "N/A"
+                ),
+                "gmv_rate": "N/A",
+                "burn_rate": "N/A",
+                "territory": "N/A",
+                "csg_geo": "N/A",
             }
 
         return {
@@ -296,7 +310,7 @@ def get_account_attrition(account_id: str, cloud: str = "Commerce Cloud") -> lis
             ABS(ATTRITION_PIPELINE) as attrition,
             ATTRITION_PROBA_CATEGORY as category
         FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-        WHERE SF_ACCOUNT_ID = '{account_id}'
+        WHERE ACCOUNT_ID = '{account_id}'
         AND SNAPSHOT_DT = (
             SELECT MAX(SNAPSHOT_DT)
             FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
@@ -394,7 +408,7 @@ class SnowflakeClient:
                 TERRITORY,
                 CSG_GEO
             FROM CIDM.WV_AV_USAGE_EXTRACT_VW
-            WHERE SF_ACCOUNT_ID = '{aid}'
+            WHERE ACCOUNT_ID = '{aid}'
             AND SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
                 FROM CIDM.WV_AV_USAGE_EXTRACT_VW
@@ -427,7 +441,7 @@ class SnowflakeClient:
             query = f"""
             SELECT ATTRITION_PROBA * 100 AS probability
             FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-            WHERE SF_ACCOUNT_ID = '{aid}'
+            WHERE ACCOUNT_ID = '{aid}'
             AND SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
                 FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
@@ -457,7 +471,7 @@ class SnowflakeClient:
                 ABS(ATTRITION_PIPELINE) AS attrition,
                 ATTRITION_PROBA_CATEGORY AS category
             FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-            WHERE SF_ACCOUNT_ID = '{aid}'
+            WHERE ACCOUNT_ID = '{aid}'
             AND SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
                 FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
