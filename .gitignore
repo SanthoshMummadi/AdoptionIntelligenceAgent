@@ -1,0 +1,116 @@
+# Editor / backup
+.gitignore.backup
+
+# Environment & Secrets
+.env
+*.env
+.env.*
+
+# Google OAuth / Credentials
+google_token.pkl
+google_token.pickle
+credentials.json
+oauth_credentials.json
+*_credentials.json
+*.pkl
+
+# Local SQLite/history
+*.db
+bot_history.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+
+# IDEs
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Data directories (don't commit large data)
+PFT_Data/
+data/
+storage/
+*.csv
+*.xlsx
+*.xls
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+.pyre/
+
+# Archive (keep structure but ignore contents if needed)
+# archive/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# MCP specific
+.mcp/
