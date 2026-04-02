@@ -1143,17 +1143,43 @@ def at_risk_canvas(ack, say, command, client):
 
             result = f":warning: *At-Risk Renewals* ({len(rows)} accounts)\n\n"
 
-            for row in rows[:20]:
-                account_id, product, score, risk_class = row
+            top = rows[:20]
+            account_ids = [str(row[0]).strip() for row in top]
+            account_names: dict[str, str] = {}
 
-                # ACCOUNT_ID in Snowflake is 15-char, display as-is
+            try:
+                from domain.salesforce.org62_client import _escape, get_sf_client
+
+                sf = get_sf_client()
+                ids_quoted = "','".join(_escape(aid) for aid in account_ids)
+                sf_result = sf.query(
+                    f"SELECT Id, Name FROM Account WHERE Id IN ('{ids_quoted}')"
+                )
+                for record in sf_result.get("records", []):
+                    rid = str(record["Id"])
+                    name = record["Name"]
+                    account_names[rid] = name
+                    if len(rid) >= 15:
+                        account_names[rid[:15]] = name
+            except Exception as e:
+                print(f"Could not fetch account names: {e}")
+
+            for row in top:
+                account_id, product, score, risk_class = row
+                aid = str(account_id).strip()
+                account_name = account_names.get(aid) or account_names.get(
+                    aid[:15], f"Account {aid}"
+                )
+
                 emoji = (
                     ":red_circle:"
                     if risk_class == "High"
                     else ":large_orange_circle:"
                 )
-                result += f"{emoji} *Account {account_id}* ({product})\n"
-                result += f"   Score: {score:.3f} | Risk: {risk_class}\n\n"
+                result += f"{emoji} *{account_name}* ({product})\n"
+                result += (
+                    f"   Score: {score:.3f} | Risk: {risk_class} | `{aid}`\n\n"
+                )
 
             if len(rows) > 20:
                 result += f"\n_...and {len(rows) - 20} more accounts_"
