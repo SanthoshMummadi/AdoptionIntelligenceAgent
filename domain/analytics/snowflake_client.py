@@ -56,11 +56,11 @@ def resolve_account_from_snowflake(account_name: str, cloud: str = "Commerce Clo
         SELECT DISTINCT
             SF_ACCOUNT_ID,
             ACCOUNT_NAME
-        FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+        FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
         WHERE UPPER(ACCOUNT_NAME) LIKE '%{account_name.upper()}%'
         AND SNAPSHOT_DT = (
             SELECT MAX(SNAPSHOT_DT)
-            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
         )
         LIMIT 1
         """
@@ -91,15 +91,15 @@ def get_ari_score_by_account(account_id: str, cloud: str = "Commerce Cloud") -> 
         SELECT
             APM_LVL_3 as product,
             ATTRITION_PROBA_CATEGORY as category,
-            ATTRITION_PROBABILITY * 100 as probability,
+            ATTRITION_PROBA * 100 as probability,
             ATTRITION_REASON as reason
-        FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+        FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
         WHERE SF_ACCOUNT_ID = '{account_id}'
         AND SNAPSHOT_DT = (
             SELECT MAX(SNAPSHOT_DT)
-            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
         )
-        ORDER BY ATTRITION_PROBABILITY DESC
+        ORDER BY ATTRITION_PROBA DESC
         """
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -136,7 +136,7 @@ def get_at_risk_accounts_snowflake(
 
     try:
         where_clauses = [
-            "SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT)"
+            "SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT)"
         ]
 
         if min_attrition > 0:
@@ -149,7 +149,7 @@ def get_at_risk_accounts_snowflake(
 
         sort_map = {
             "atr": "ABS(ATTRITION_PIPELINE) DESC",
-            "ari": "ATTRITION_PROBABILITY DESC",
+            "ari": "ATTRITION_PROBA DESC",
             "cc_aov": "CC_AOV DESC",
         }
         order_by = sort_map.get(sort_by, "ABS(ATTRITION_PIPELINE) DESC")
@@ -163,7 +163,7 @@ def get_at_risk_accounts_snowflake(
             ATTRITION_PROBA_CATEGORY as attrition_proba_category,
             ATTRITION_REASON as attrition_reason,
             SNAPSHOT_DT as snapshot_dt
-        FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+        FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
         WHERE {where_sql}
         ORDER BY {order_by}
         LIMIT {limit}
@@ -295,11 +295,11 @@ def get_account_attrition(account_id: str, cloud: str = "Commerce Cloud") -> lis
             APM_LVL_3 as product,
             ABS(ATTRITION_PIPELINE) as attrition,
             ATTRITION_PROBA_CATEGORY as category
-        FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+        FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
         WHERE SF_ACCOUNT_ID = '{account_id}'
         AND SNAPSHOT_DT = (
             SELECT MAX(SNAPSHOT_DT)
-            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
         )
         ORDER BY ABS(ATTRITION_PIPELINE) DESC
         """
@@ -425,14 +425,14 @@ class SnowflakeClient:
         cursor = self._cursor()
         try:
             query = f"""
-            SELECT ATTRITION_PROBABILITY * 100 AS probability
-            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            SELECT ATTRITION_PROBA * 100 AS probability
+            FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
             WHERE SF_ACCOUNT_ID = '{aid}'
             AND SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
-                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+                FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
             )
-            ORDER BY ATTRITION_PROBABILITY DESC
+            ORDER BY ATTRITION_PROBA DESC
             LIMIT 1
             """
             cursor.execute(query)
@@ -456,11 +456,11 @@ class SnowflakeClient:
                 APM_LVL_3 AS product,
                 ABS(ATTRITION_PIPELINE) AS attrition,
                 ATTRITION_PROBA_CATEGORY AS category
-            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
             WHERE SF_ACCOUNT_ID = '{aid}'
             AND SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
-                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+                FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
             )
             ORDER BY ABS(ATTRITION_PIPELINE) DESC
             """

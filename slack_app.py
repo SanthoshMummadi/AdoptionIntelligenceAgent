@@ -1074,17 +1074,20 @@ def gm_review_canvas(ack, say, command, client):
 @app.command("/at-risk-canvas")
 def at_risk_canvas(ack, say, command, client):
     """
-    Generate at-risk renewals canvas.
-    Usage: /at-risk-canvas >500k FY27
-           /at-risk-canvas Commerce Cloud
+    Generate at-risk renewals canvas across ALL clouds.
+    Usage: /at-risk-canvas                    → All clouds
+           /at-risk-canvas Commerce Cloud     → Filter by cloud
+           /at-risk-canvas B2C Commerce       → Filter by L2
+           /at-risk-canvas >500k              → Filter by ARR
     """
     ack()
 
     text = command.get("text", "").strip()
+    filter_label = text if text else "all clouds"
 
     say(
         f":hourglass_flowing_sand: Generating at-risk renewals canvas...\n"
-        f"_Analyzing accounts matching: {text or 'all'}_"
+        f"_Analyzing accounts matching: {filter_label}_"
     )
 
     def process():
@@ -1093,28 +1096,30 @@ def at_risk_canvas(ack, say, command, client):
             from filter_parser import CLOUD_KEYWORDS, parse_filters
 
             where_clauses = []
-
             text_lower = text.lower()
+
             if any(kw.lower() in text_lower for kw in CLOUD_KEYWORDS):
                 filters = parse_filters(text)
-                cloud = filters.get("cloud", "Commerce Cloud")
-                cloud_safe = cloud.replace("'", "''")
-                where_clauses.append(
-                    f"AND ("
-                    f"APM_LVL_1 LIKE '%{cloud_safe}%' OR "
-                    f"APM_LVL_2 LIKE '%{cloud_safe}%' OR "
-                    f"APM_LVL_3 LIKE '%{cloud_safe}%'"
-                    f")"
-                )
+                cloud = filters.get("cloud", "")
+                if cloud:
+                    cloud_safe = cloud.replace("'", "''")
+                    where_clauses.append(
+                        f"AND ("
+                        f"atr.APM_LVL_1 LIKE '%{cloud_safe}%' OR "
+                        f"atr.APM_LVL_2 LIKE '%{cloud_safe}%' OR "
+                        f"atr.APM_LVL_3 LIKE '%{cloud_safe}%'"
+                        f")"
+                    )
 
             if any(
-                threshold in text_lower
-                for threshold in [">1m", ">500k", ">400k", ">200k"]
+                t in text_lower for t in [">1m", ">500k", ">400k", ">200k"]
             ):
                 filters = parse_filters(text)
                 min_arr = filters.get("min_attrition")
                 if min_arr:
-                    where_clauses.append(f"AND ARR_AMOUNT > {min_arr}")
+                    where_clauses.append(
+                        f"AND ren.RENEWAL_AMT_CONV > {min_arr}"
+                    )
 
             where_sql = " ".join(where_clauses)
 
@@ -1123,21 +1128,30 @@ def at_risk_canvas(ack, say, command, client):
 
             query = f"""
                 SELECT DISTINCT
-                    ACCOUNT_ID,
-                    APM_LVL_1,
-                    APM_LVL_2,
-                    APM_LVL_3,
-                    ATTRITION_PROBA as SCORE,
-                    ATTRITION_PROBA_CATEGORY as RISK_CLASS
-                FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-                WHERE SNAPSHOT_DT = (
+                    atr.ACCOUNT_ID,
+                    ren.ACCOUNT_NM,
+                    atr.APM_LVL_1,
+                    atr.APM_LVL_2,
+                    atr.APM_LVL_3,
+                    atr.ATTRITION_PROBA as SCORE,
+                    atr.ATTRITION_PROBA_CATEGORY as RISK_CLASS,
+                    ren.RENEWAL_OPTY_ID_18,
+                    ren.RENEWAL_AMT_CONV,
+                    ren.RENEWAL_ATR_CONV,
+                    ren.RENEWAL_CLSD_DT,
+                    ren.RENEWAL_STG_NM,
+                    ren.ACCOUNT_18_ID
+                FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT atr
+                LEFT JOIN RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
+                    ON atr.ACCOUNT_ID = ren.ACCT_ID
+                WHERE atr.SNAPSHOT_DT = (
                     SELECT MAX(SNAPSHOT_DT)
                     FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
                 )
-                AND ATTRITION_PROBA_CATEGORY IN ('High', 'Medium')
-                AND ACCOUNT_ID IS NOT NULL
+                AND atr.ATTRITION_PROBA_CATEGORY IN ('High', 'Medium')
+                AND atr.ACCOUNT_ID IS NOT NULL
                 {where_sql}
-                ORDER BY ATTRITION_PROBA DESC
+                ORDER BY atr.ATTRITION_PROBA DESC
                 LIMIT 50
             """
 
@@ -1146,69 +1160,83 @@ def at_risk_canvas(ack, say, command, client):
             cursor.close()
 
             if not rows:
-                say(":x: No at-risk accounts found matching your criteria.")
+                say(f":x: No at-risk accounts found for: {filter_label}")
                 return
 
-            result = f":warning: *At-Risk Renewals* ({len(rows)} accounts)\n\n"
+            result = (
+                f":warning: *At-Risk Renewals — {filter_label.title()}* "
+                f"({len(rows)} accounts)\n\n"
+            )
 
-            top = rows[:20]
-            account_ids = [str(row[0]).strip() for row in top]
-            account_names: dict[str, str] = {}
-
-            try:
-                from domain.salesforce.org62_client import _escape, get_sf_client
-
-                sf = get_sf_client()
-                ids_quoted = "','".join(_escape(aid) for aid in account_ids)
-                sf_result = sf.query(
-                    f"SELECT Id, Name FROM Account WHERE Id IN ('{ids_quoted}')"
-                )
-                for record in sf_result.get("records", []):
-                    rid = str(record["Id"])
-                    name = record["Name"]
-                    account_names[rid] = name
-                    if len(rid) >= 15:
-                        account_names[rid[:15]] = name
-            except Exception as e:
-                print(f"Could not fetch account names: {e}")
-
-            for row in top:
+            for row in rows[:20]:
                 (
                     account_id,
+                    account_name,
                     apm_l1,
                     apm_l2,
                     apm_l3,
                     score,
                     risk_class,
+                    opp_id_18,
+                    renewal_amt,
+                    atr_amt,
+                    close_date,
+                    _stage,
+                    account_18_id,
                 ) = row
-                aid = str(account_id).strip()
-                account_name = account_names.get(aid) or account_names.get(
-                    aid[:15], f"Account {aid}"
+
+                aid = str(account_id).strip() if account_id is not None else ""
+                sf_account_url = (
+                    f"https://org62.my.salesforce.com/"
+                    f"{account_18_id or aid}"
+                )
+                sf_opp_url = (
+                    f"https://org62.my.salesforce.com/{opp_id_18}"
+                    if opp_id_18
+                    else None
                 )
 
-                segments: list[str] = []
-                for v in (apm_l1, apm_l2, apm_l3):
-                    if v is None or v == "":
-                        continue
-                    sv = str(v)
-                    if not segments or sv != segments[-1]:
-                        segments.append(sv)
-                product_path = (
-                    " > ".join(segments) if segments else "(no product path)"
-                )
+                product_path = apm_l1 or ""
+                if apm_l2 and apm_l2 != apm_l1:
+                    product_path += f" > {apm_l2}"
+                if apm_l3 and apm_l3 != apm_l2:
+                    product_path += f" > {apm_l3}"
 
                 emoji = (
                     ":red_circle:"
                     if risk_class == "High"
                     else ":large_orange_circle:"
                 )
-                sf_url = f"https://org62.my.salesforce.com/{aid}"
-                result += f"{emoji} *<{sf_url}|{account_name}>*\n"
-                result += f"   {product_path}\n"
-                result += f"   Score: {score:.3f} | Risk: {risk_class}\n\n"
+                display_name = account_name or f"Account {aid}"
+
+                result += f"{emoji} *<{sf_account_url}|{display_name}>*\n"
+                result += f"   _{product_path}_\n"
+                result += f"   Score: {score:.3f} | Risk: {risk_class}"
+
+                if renewal_amt:
+                    try:
+                        result += f" | ARR: ${float(renewal_amt):,.0f}"
+                    except (TypeError, ValueError):
+                        result += f" | ARR: {renewal_amt}"
+                if atr_amt:
+                    try:
+                        result += f" | ATR: ${float(atr_amt):,.0f}"
+                    except (TypeError, ValueError):
+                        result += f" | ATR: {atr_amt}"
+                if close_date:
+                    result += f" | Close: {close_date}"
+                if sf_opp_url:
+                    result += f" | <{sf_opp_url}|View Opp>"
+
+                result += "\n\n"
 
             if len(rows) > 20:
-                result += f"\n_...and {len(rows) - 20} more accounts_"
+                result += f"_...and {len(rows) - 20} more accounts_\n"
+
+            result += (
+                "\n_Use `/at-risk-canvas Commerce Cloud` or "
+                "`/at-risk-canvas >500k` to filter_"
+            )
 
             say(result)
 
