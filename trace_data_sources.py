@@ -15,6 +15,7 @@ from domain.analytics.snowflake_client import (
     get_ari_score_by_account,
     get_customer_health,
     get_renewal_aov,
+    get_usage_summary,
     to_15_char_id,
 )
 
@@ -177,6 +178,19 @@ else:
     print("  ⚠️ No red account record")
 
 print()
+
+print("STEP 9: Usage/Utilization (CIDM.WV_AV_USAGE_EXTRACT_VW)")
+print("-" * 70)
+usage = get_usage_summary(account_id_15, "Commerce Cloud")
+if usage:
+    print("✓ SOURCE: CIDM.WV_AV_USAGE_EXTRACT_VW")
+    print(f"  Utilization: {usage.get('utilization_rate')}")
+    print(f"  Source: {usage.get('source')}")
+    print(f"  GMV Util: {usage.get('gmv_util')}")
+else:
+    print("  ⚠️ No usage data found")
+
+print()
 print("=" * 70)
 print("SUMMARY")
 print("=" * 70)
@@ -199,10 +213,17 @@ print(
     f"Cloud AOV:        {display.get('cc_aov')} - FROM: "
     f"{('RENEWALS.WV_CI_RENEWAL_OPTY_VW' if renewal and renewal.get('renewal_aov') else 'NOT FOUND')}"
 )
-print(
-    f"Utilization:      {display.get('utilization_rate')} - FROM: NOT AVAILABLE "
-    f"(FC_USAGE_BY_APM doesn't exist)"
-)
+_util = display.get("utilization_rate")
+_u = enrichment.get("usage") or {}
+if _util not in (None, "", "N/A") and str(_util).strip():
+    _util_src = (
+        f"CIDM.WV_AV_USAGE_EXTRACT_VW ({_u.get('source')})"
+        if _u.get("source")
+        else "CIDM.WV_AV_USAGE_EXTRACT_VW"
+    )
+else:
+    _util_src = "NOT FOUND"
+print(f"Utilization:      {_util} - FROM: {_util_src}")
 print(
     f"Forecasted ATR:   ${abs(opp.get('Forecasted_Attrition__c', 0) or 0):,.0f} - FROM: "
     f"Salesforce Opportunity.Forecasted_Attrition__c"

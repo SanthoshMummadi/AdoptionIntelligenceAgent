@@ -11,11 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import GM Review components
-from adapters.salesforce_adapter import SalesforceAdapter
-from adapters.snowflake_adapter import SnowflakeAdapter
-from adapters.canvas_adapter import CanvasAdapter
-from domain.intelligence.risk_engine import RiskEngine
-from services.parallel_gm_review_workflow import ParallelGMReviewWorkflow
+from services.gm_review_workflow import GMReviewWorkflow
 
 mcp = FastMCP("Product Adoption MCP")
 
@@ -130,28 +126,10 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
 # GM REVIEW WORKFLOW INITIALIZATION
 # ============================================================================
 
-def init_gm_workflow() -> ParallelGMReviewWorkflow:
-    """Initialize GM Review workflow with adapters"""
-
-    # Get Salesforce credentials from environment
-    sf_token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
-    sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
-
-    if not sf_token or not sf_instance:
-        raise ValueError("Salesforce credentials not found in environment")
-
-    # Initialize adapters
-    sf_adapter = SalesforceAdapter(sf_token, sf_instance)
-    snow_adapter = SnowflakeAdapter()
-    canvas_adapter = CanvasAdapter()
-    risk_engine = RiskEngine(call_llm_fn=call_llm_gateway)
-
-    # Create workflow
-    return ParallelGMReviewWorkflow(
-        salesforce_adapter=sf_adapter,
-        snowflake_adapter=snow_adapter,
-        canvas_adapter=canvas_adapter,
-        risk_engine=risk_engine,
+def init_gm_workflow() -> GMReviewWorkflow:
+    """Initialize GM Review workflow (domain calls + LLM gateway)."""
+    return GMReviewWorkflow(
+        call_llm_fn=call_llm_gateway,
         max_concurrent=5,
     )
 
@@ -308,7 +286,8 @@ def generate_gm_reviews(account_inputs: list[str]) -> str:
         workflow = init_gm_workflow()
 
         print(f"📊 Processing {len(account_inputs)} accounts...")
-        reviews = workflow.run(account_inputs)
+        out = workflow.run(account_inputs)
+        reviews = out.get("reviews") or []
 
         if not reviews:
             return "❌ No reviews generated. Check if account names/IDs are valid."
@@ -317,14 +296,9 @@ def generate_gm_reviews(account_inputs: list[str]) -> str:
 
         for review in reviews:
             result += f"**{review['account_name']}** (ID: {review['account_id']})\n"
-            result += (
-                f"📋 Risk Analysis:\n"
-                f"{json.dumps(review['risk_analysis'], indent=2, default=str)}\n\n"
-            )
-            result += (
-                f"📈 Adoption POV:\n"
-                f"{json.dumps(review['adoption_pov'], indent=2, default=str)}\n\n"
-            )
+            result += f"📋 Risk notes:\n{review.get('risk_notes', '')}\n\n"
+            result += f"📌 Recommendations:\n{review.get('recommendation', '')}\n\n"
+            result += f"📈 Adoption POV:\n{review.get('adoption_pov', '')}\n\n"
             result += "---\n\n"
 
         return result
@@ -349,17 +323,10 @@ def generate_gm_review_canvas(account_inputs: list[str]) -> str:
         workflow = init_gm_workflow()
 
         print(f"📊 Processing {len(account_inputs)} accounts...")
-        reviews = workflow.run(account_inputs)
-
-        if not reviews:
+        out = workflow.run(account_inputs)
+        combined = (out.get("combined_canvas") or "").strip()
+        if not combined:
             return "❌ No reviews generated."
-
-        if len(reviews) == 1:
-            return reviews[0]["canvas_content"]
-        combined = "# GM Reviews for At-Risk Renewals\n\n"
-        for review in reviews:
-            combined += f"## {review['account_name']}\n\n"
-            combined += review["canvas_content"] + "\n\n---\n\n"
         return combined
 
     except Exception as e:
@@ -370,10 +337,9 @@ def generate_gm_review_canvas(account_inputs: list[str]) -> str:
 def test_snowflake_connection() -> str:
     """Test Snowflake connection and credentials"""
     try:
-        from adapters.snowflake_adapter import SnowflakeAdapter
+        from domain.analytics.snowflake_client import run_query
 
-        adapter = SnowflakeAdapter()
-        adapter.close()
+        run_query("SELECT 1 AS ok")
         return "✓ Snowflake connection successful!"
     except Exception as e:
         return f"❌ Snowflake connection failed: {str(e)}"
@@ -383,14 +349,11 @@ def test_snowflake_connection() -> str:
 def test_salesforce_connection() -> str:
     """Test Salesforce connection and credentials"""
     try:
-        sf_token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
-        sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
+        from domain.salesforce.org62_client import get_sf_client
 
-        if not sf_token or not sf_instance:
-            return "❌ Salesforce credentials not found in .env file"
-
-        SalesforceAdapter(sf_token, sf_instance)
-        return "✓ Salesforce adapter initialized successfully!"
+        sf = get_sf_client()
+        sf.query("SELECT Id FROM User LIMIT 1")
+        return "✓ Salesforce session successful!"
     except Exception as e:
         return f"❌ Salesforce connection failed: {str(e)}"
 

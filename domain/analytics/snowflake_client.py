@@ -21,15 +21,120 @@ CORPORATE_SUFFIXES = (
     r"Enterprises?)\b"
 )
 
-_snowflake_conn: Any = None
+SUCCESS_PLAN_KEYWORDS = [
+    "success plan",
+    "success plans",
+    "- premier",
+    "- signature",
+    "- standard",
+]
+
+_sf_connection: Any = None
+
+
+def _product_atr_amount(p: dict) -> float:
+    """ABS attrition pipeline from raw Snowflake row or normalized get_account_attrition dict."""
+    try:
+        if p.get("ATTRITION_PIPELINE") is not None:
+            return abs(float(p.get("ATTRITION_PIPELINE") or 0))
+        return abs(float(p.get("attrition") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _product_proba(p: dict) -> float:
+    try:
+        v = p.get("ATTRITION_PROBA")
+        if v is None:
+            return 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def is_success_plan(product: dict) -> bool:
+    """True if APM L2/L3 looks like a Success Plan offer (excluded from overall ARI)."""
+    l2 = str(product.get("APM_LVL_2") or "").lower()
+    l3 = str(product.get("APM_LVL_3") or "").lower()
+    return any(kw in l2 or kw in l3 for kw in SUCCESS_PLAN_KEYWORDS)
+
+
+def calculate_overall_ari(products: list, min_atr_threshold: float = 0) -> dict:
+    """
+    Account-level ARI: exclude Success Plans, optional ATR floor, then sort by ATR then probability.
+    """
+    core = [p for p in products if not is_success_plan(p)]
+
+    if not core:
+        return {
+            "category": "Unknown",
+            "probability": None,
+            "reason": "No qualifying products (all Success Plans)",
+            "top_product": None,
+            "atr_amount": 0,
+        }
+
+    qualified = [p for p in core if _product_atr_amount(p) >= min_atr_threshold]
+    if not qualified:
+        qualified = list(core)
+
+    qualified.sort(
+        key=lambda x: (_product_atr_amount(x), _product_proba(x)),
+        reverse=True,
+    )
+    top = qualified[0]
+    product_name = (
+        top.get("APM_LVL_3")
+        or top.get("APM_LVL_2")
+        or top.get("APM_LVL_1")
+        or top.get("product")
+        or "Unknown"
+    )
+
+    return {
+        "category": top.get("ATTRITION_PROBA_CATEGORY")
+        or top.get("category", "Unknown"),
+        "probability": top.get("ATTRITION_PROBA"),
+        "reason": top.get("ATTRITION_REASON") or top.get("reason") or "N/A",
+        "top_product": product_name,
+        "atr_amount": _product_atr_amount(top),
+    }
+
+
+def split_products_by_type(products: list) -> dict:
+    """Split into core vs success-plan rows; sort each by ATR desc then probability desc."""
+    core: list = []
+    success_plans: list = []
+    for p in products:
+        if is_success_plan(p):
+            success_plans.append(p)
+        else:
+            core.append(p)
+    sort_key = lambda x: (_product_atr_amount(x), _product_proba(x))
+    core.sort(key=sort_key, reverse=True)
+    success_plans.sort(key=sort_key, reverse=True)
+    return {"core": core, "success_plans": success_plans}
 
 
 def get_snowflake_connection():
-    """Singleton Snowflake connection (password or externalbrowser)."""
-    global _snowflake_conn
+    """
+    Singleton Snowflake connection (password or externalbrowser).
+    Reconnects if the session is closed or unhealthy.
+    """
+    global _sf_connection
 
-    if _snowflake_conn is not None:
-        return _snowflake_conn
+    if _sf_connection is not None:
+        try:
+            if not _sf_connection.is_closed():
+                return _sf_connection
+        except Exception:
+            pass
+        log_debug("Snowflake connection lost — reconnecting...")
+        try:
+            _sf_connection.close()
+        except Exception:
+            pass
+        _sf_connection = None
 
     user = os.getenv("SNOWFLAKE_USER")
     account = os.getenv("SNOWFLAKE_ACCOUNT")
@@ -42,43 +147,72 @@ def get_snowflake_connection():
     if not account or not user:
         raise Exception("Missing SNOWFLAKE_ACCOUNT or SNOWFLAKE_USER in .env")
 
-    params: dict[str, Any] = {
+    conn_params: dict[str, Any] = {
         "user": user,
         "account": account,
         "warehouse": warehouse,
         "database": database,
+        "client_session_keep_alive": True,
     }
     if schema:
-        params["schema"] = schema
+        conn_params["schema"] = schema
     if role:
-        params["role"] = role
+        conn_params["role"] = role
 
     if password:
-        params["password"] = password
+        conn_params["password"] = password
     else:
-        params["authenticator"] = os.getenv("SNOWFLAKE_AUTHENTICATOR", "externalbrowser")
+        conn_params["authenticator"] = os.getenv(
+            "SNOWFLAKE_AUTHENTICATOR", "externalbrowser"
+        )
 
-    _snowflake_conn = snowflake.connector.connect(**params)
-    log_debug("✅ Connected to Snowflake")
-    return _snowflake_conn
+    _sf_connection = snowflake.connector.connect(**conn_params)
+    log_debug("✓ Connected to Snowflake")
+    return _sf_connection
 
 
 def run_query(sql: str, params: Optional[list] = None) -> list[dict]:
-    """Execute Snowflake query; return list of row dicts (column names from cursor)."""
+    """Execute Snowflake query; return list of row dicts (singleton connection)."""
+
+    def _execute(conn: Any) -> list[dict]:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql, params or [])
+            rows = cursor.fetchall()
+            if not cursor.description:
+                return []
+            columns = [d[0] for d in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+        finally:
+            cursor.close()
+
+    global _sf_connection
     conn = get_snowflake_connection()
-    cursor = conn.cursor()
     try:
-        cursor.execute(sql, params or [])
-        rows = cursor.fetchall()
-        if not cursor.description:
-            return []
-        columns = [d[0] for d in cursor.description]
-        return [dict(zip(columns, row)) for row in rows]
+        return _execute(conn)
     except Exception as e:
-        log_debug(f"Snowflake query error: {str(e)[:100]}")
+        error_str = str(e)
+        log_debug(f"Snowflake query error: {error_str[:100]}")
+        if any(
+            kw in error_str.lower()
+            for kw in (
+                "connection",
+                "session",
+                "expired",
+                "closed",
+                "reset",
+                "390114",
+                "250002",
+            )
+        ):
+            _sf_connection = None
+            log_debug("Retrying Snowflake query with fresh connection...")
+            try:
+                return _execute(get_snowflake_connection())
+            except Exception as retry_e:
+                log_debug(f"Snowflake retry failed: {str(retry_e)[:100]}")
+                raise
         raise
-    finally:
-        cursor.close()
 
 
 def to_15_char_id(account_id: str) -> str:
@@ -119,15 +253,210 @@ def get_cloud_filter(cloud: str) -> str:
 
 
 def fmt_amount(val) -> str:
+    """
+    Format dollar amount — M shorthand (Option A).
+    $695,492 → $0.7M ; $1,608,311 → $1.6M ; $0 → $0
+    """
     try:
         num = float(val)
-        if num >= 1_000_000:
+        if num == 0:
+            return "$0"
+        elif abs(num) >= 1_000:
             return f"${num / 1_000_000:.1f}M"
-        if num >= 1000:
-            return f"${num / 1000:.0f}K"
-        return f"${num:.0f}"
+        else:
+            return f"${num:.0f}"
     except (TypeError, ValueError):
-        return str(val)
+        return str(val) if val else "N/A"
+
+
+def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
+    """
+    Get usage from CIDM.WV_AV_USAGE_EXTRACT_VW.
+    Priority: GMV row → Commerce L1/L2 → all products.
+    """
+    CLOUD_L1_MAP = {
+        "Commerce Cloud": "Commerce",
+        "B2C Commerce": "Commerce",
+        "B2B Commerce": "Commerce",
+        "Marketing Cloud": "Marketing",
+        "Sales Cloud": "Sales",
+        "Service Cloud": "Service",
+        "Data Cloud": "AI and Data",
+        "Tableau": "Analytics",
+        "MuleSoft": "Integration",
+    }
+
+    def _build_cloud_filter(cloud_val: str | None) -> str:
+        if not cloud_val or cloud_val == "All Clouds":
+            return ""
+
+        l1_value = CLOUD_L1_MAP.get(str(cloud_val).strip(), cloud_val)
+        l1_safe = str(l1_value).replace("'", "''").replace("%", "%%")
+
+        return f"""
+            AND (
+                DRVD_APM_LVL_1 LIKE '%%{l1_safe}%%'
+                OR DRVD_APM_LVL_2 LIKE '%%{l1_safe}%%'
+            )
+        """
+
+    cloud_filter = _build_cloud_filter(cloud)
+
+    def _run_usage_query(snap_filter: str, params: list) -> list:
+        sql = f"""
+            SELECT
+                DRVD_APM_LVL_1,
+                DRVD_APM_LVL_2,
+                GRP,
+                TYPE,
+                SUM(PROVISIONED) as TOTAL_PROV,
+                SUM(ACTIVATED) as TOTAL_ACTIVATED,
+                SUM(USED) as TOTAL_USED
+            FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+            WHERE ACCOUNT_ID = %s
+            {snap_filter}
+            {cloud_filter}
+            AND PROVISIONED > 0
+            GROUP BY DRVD_APM_LVL_1, DRVD_APM_LVL_2, GRP, TYPE
+            ORDER BY TOTAL_PROV DESC
+        """
+        try:
+            return run_query(sql, params)
+        except Exception as e:
+            log_debug(f"get_usage_summary query error: {str(e)[:100]}")
+            return []
+
+    rows = _run_usage_query("AND CURR_SNAP_FLG = 'Y'", [account_id])
+
+    if not rows:
+        log_debug(
+            "get_usage_summary: CURR_SNAP_FLG=Y returned nothing, trying MAX(SNAPSHOT_DT)"
+        )
+        rows = _run_usage_query(
+            """
+            AND SNAPSHOT_DT = (
+                SELECT MAX(SNAPSHOT_DT)
+                FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+                WHERE ACCOUNT_ID = %s
+            )
+        """,
+            [account_id, account_id],
+        )
+
+    if not rows:
+        log_debug("get_usage_summary: trying without cloud filter, GMV only")
+        try:
+            rows = run_query(
+                """
+                SELECT
+                    DRVD_APM_LVL_1, DRVD_APM_LVL_2,
+                    GRP, TYPE,
+                    SUM(PROVISIONED) as TOTAL_PROV,
+                    SUM(ACTIVATED) as TOTAL_ACTIVATED,
+                    SUM(USED) as TOTAL_USED
+                FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+                WHERE ACCOUNT_ID = %s
+                AND CURR_SNAP_FLG = 'Y'
+                AND GRP = 'GMV'
+                AND PROVISIONED > 0
+                GROUP BY DRVD_APM_LVL_1, DRVD_APM_LVL_2, GRP, TYPE
+            """,
+                [account_id],
+            )
+        except Exception as e:
+            log_debug(f"GMV fallback error: {str(e)[:100]}")
+
+    if not rows:
+        return {}
+
+    gmv_rows = [r for r in rows if str(r.get("GRP", "")).upper() == "GMV"]
+
+    if gmv_rows:
+        total_prov = sum(float(r.get("TOTAL_PROV") or 0) for r in gmv_rows)
+        total_used = sum(float(r.get("TOTAL_USED") or 0) for r in gmv_rows)
+        source = "GMV"
+    else:
+        commerce_rows = [
+            r
+            for r in rows
+            if "commerce" in str(r.get("DRVD_APM_LVL_1", "")).lower()
+            or "commerce" in str(r.get("DRVD_APM_LVL_2", "")).lower()
+        ]
+        target_rows = commerce_rows if commerce_rows else rows
+        total_prov = sum(float(r.get("TOTAL_PROV") or 0) for r in target_rows)
+        total_used = sum(float(r.get("TOTAL_USED") or 0) for r in target_rows)
+        source = "Commerce aggregate" if commerce_rows else "All products"
+
+    if total_prov > 0:
+        util_rate = (total_used / total_prov) * 100
+        util_str = f"{util_rate:.1f}%"
+    else:
+        util_rate = 0
+        util_str = "N/A"
+
+    log_debug(
+        f"✓ Usage ({source}): {util_str} util, prov={total_prov:,.0f}, used={total_used:,.0f}"
+    )
+
+    if util_rate >= 70:
+        util_emoji = ":large_green_circle:"
+    elif util_rate >= 40:
+        util_emoji = ":large_yellow_circle:"
+    elif util_rate > 0:
+        util_emoji = ":red_circle:"
+    else:
+        util_emoji = ":white_circle:"
+
+    return {
+        "utilization_rate": util_str,
+        "util_emoji": util_emoji,
+        "cloud_aov": "Unknown",
+        "gmv_util": util_str if gmv_rows else None,
+        "source": source,
+    }
+
+
+def get_usage_raw_data(account_id: str, cloud: str | None = None) -> list:
+    """
+    Raw usage rows from CIDM.WV_AV_USAGE_EXTRACT_VW for build_adoption_pov().
+    """
+    def _run(snap_filter: str, params: list) -> list:
+        sql = f"""
+            SELECT
+                DRVD_APM_LVL_1,
+                DRVD_APM_LVL_2,
+                GRP,
+                TYPE,
+                PROVISIONED,
+                ACTIVATED,
+                USED
+            FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+            WHERE ACCOUNT_ID = %s
+            {snap_filter}
+            AND PROVISIONED > 0
+            ORDER BY PROVISIONED DESC
+        """
+        try:
+            return run_query(sql, params)
+        except Exception as e:
+            log_debug(f"get_usage_raw_data error: {str(e)[:100]}")
+            return []
+
+    rows = _run("AND CURR_SNAP_FLG = 'Y'", [account_id])
+
+    if not rows:
+        rows = _run(
+            """
+            AND SNAPSHOT_DT = (
+                SELECT MAX(SNAPSHOT_DT)
+                FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+                WHERE ACCOUNT_ID = %s
+            )
+            """,
+            [account_id, account_id],
+        )
+
+    return rows
 
 
 def extract_usd(value) -> float:
@@ -181,8 +510,7 @@ def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
 
 def enrich_account(account_id, opty_id=None, cloud=None):
     """
-    Full enrichment: renewal AOV (drives usage), ARI, health.
-    Usage comes from the renewal view only (FC_USAGE_BY_APM not used).
+    Full enrichment: renewal AOV, CIDM usage (WV_AV_USAGE_EXTRACT_VW), ARI, health.
     """
     start = time.time()
     account_id_15 = to_15_char_id(account_id)
@@ -195,7 +523,13 @@ def enrich_account(account_id, opty_id=None, cloud=None):
         },
         "renewal_aov": {},
         "health": {"overall_score": 0, "overall_literal": "Unknown"},
-        "usage": {"utilization_rate": "N/A", "cloud_aov": "Unknown"},
+        "usage": {
+            "utilization_rate": "N/A",
+            "util_emoji": ":white_circle:",
+            "cloud_aov": "Unknown",
+            "gmv_util": None,
+            "source": "",
+        },
     }
 
     if opty_id:
@@ -203,13 +537,37 @@ def enrich_account(account_id, opty_id=None, cloud=None):
             renewal_data = get_renewal_aov(opty_id)
             if renewal_data:
                 result["renewal_aov"] = renewal_data
-                result["usage"] = {
-                    "utilization_rate": "N/A",
-                    "cloud_aov": fmt_amount(renewal_data.get("renewal_aov", 0)),
-                    "clouds": [renewal_data.get("target_cloud") or ""],
-                }
         except Exception as e:
             log_debug(f"Renewal AOV error: {str(e)[:60]}")
+
+    # 4. Usage summary (CIDM.WV_AV_USAGE_EXTRACT_VW)
+    try:
+        usage_data = get_usage_summary(account_id_15, cloud)
+        if usage_data:
+            result["usage"] = {
+                "utilization_rate": usage_data.get("utilization_rate", "N/A"),
+                "util_emoji": usage_data.get("util_emoji", ":white_circle:"),
+                "cloud_aov": usage_data.get("cloud_aov", "Unknown"),
+                "gmv_util": usage_data.get("gmv_util"),
+                "source": usage_data.get("source", ""),
+            }
+            if (
+                result["usage"].get("cloud_aov") == "Unknown"
+                and result.get("renewal_aov")
+            ):
+                result["usage"]["cloud_aov"] = fmt_amount(
+                    result["renewal_aov"].get("renewal_aov", 0)
+                )
+            log_debug(
+                f"✓ Usage: {usage_data.get('utilization_rate')} "
+                f"({usage_data.get('source')})"
+            )
+        elif result.get("renewal_aov"):
+            result["usage"]["cloud_aov"] = fmt_amount(
+                result["renewal_aov"].get("renewal_aov", 0)
+            )
+    except Exception as e:
+        log_debug(f"Usage fetch error: {str(e)[:60]}")
 
     try:
         if opty_id:
@@ -223,14 +581,22 @@ def enrich_account(account_id, opty_id=None, cloud=None):
                 }
 
         if result["ari"]["category"] == "Unknown":
-            account_ari = get_ari_score_by_account(account_id_15, cloud)
-            if account_ari:
-                first = account_ari[0]
+            all_products = get_account_attrition(account_id_15, cloud)
+            if all_products:
+                ari_result = calculate_overall_ari(
+                    all_products, min_atr_threshold=0
+                )
                 result["ari"] = {
-                    "probability": first.get("ATTRITION_PROBA"),
-                    "category": first.get("ATTRITION_PROBA_CATEGORY", "Unknown"),
-                    "reason": first.get("ATTRITION_REASON", "N/A"),
+                    "probability": ari_result["probability"],
+                    "category": ari_result["category"],
+                    "reason": ari_result["reason"],
+                    "top_product": ari_result.get("top_product"),
+                    "atr_amount": ari_result.get("atr_amount", 0),
                 }
+                log_debug(
+                    "ARI from account-level: "
+                    f"{ari_result['category']} via {ari_result.get('top_product')}"
+                )
     except Exception as e:
         log_debug(f"ARI fetch error: {str(e)[:60]}")
 
@@ -323,15 +689,61 @@ def get_customer_health(account_id):
     }
 
 
+_GMV_RATE_COLUMN_PREFERENCE: tuple[str, ...] = (
+    "RENEWAL_GMV_UTIL_PCT",
+    "RENEWAL_GMV_UTILIZATION_PCT",
+    "GMV_UTILIZATION_RATE",
+    "RENEWAL_GMV_RATE_PCT",
+    "GMV_RATE_PCT",
+    "RENEWAL_GMV_RATE",
+    "GMV_RATE",
+    "RENEWAL_GMV_UTLZTN_PCT",
+    "GMV_UTLZN_RATE",
+)
+
+
+def _format_gmv_rate_for_display(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        s = str(val).strip()
+        return s if s else None
+    if 0 <= f <= 1.0:
+        return f"{f * 100:.1f}%"
+    return f"{f:.1f}%"
+
+
+def _gmv_rate_pct_from_renewal_row(row: dict) -> Optional[str]:
+    """Pick GMV rate from WV_CI_RENEWAL_OPTY_VW row (SELECT *); prefers known column names."""
+    if not row:
+        return None
+    for key in _GMV_RATE_COLUMN_PREFERENCE:
+        if key in row and row[key] is not None:
+            out = _format_gmv_rate_for_display(row[key])
+            if out:
+                return out
+    for k, v in row.items():
+        if v is None:
+            continue
+        ku = str(k).upper()
+        if "GMV" in ku and any(
+            x in ku for x in ("RATE", "UTIL", "PCT", "UTLZ", "BURN")
+        ):
+            out = _format_gmv_rate_for_display(v)
+            if out:
+                return out
+    return None
+
+
 def get_renewal_aov(opty_id):
-    """Get renewal AOV and ATR from WV_CI_RENEWAL_OPTY_VW - CORRECTED: Use 15-char ID"""
+    """Renewal row from WV_CI_RENEWAL_OPTY_VW (AOV, ATR, CSG_GEO, GMV rate from view)."""
     if not opty_id:
         return {}
     opty_id_15 = to_15_char_id(opty_id)
     sql = """
-        SELECT ACCOUNT_NM, TARGET_CLOUD,
-               RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV,
-               RENEWAL_FCAST_ATTRITION_CONV
+        SELECT *
         FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
         WHERE RENEWAL_OPTY_ID = %s
         LIMIT 1
@@ -339,12 +751,17 @@ def get_renewal_aov(opty_id):
     rows = run_query(sql, [opty_id_15])
     if rows:
         r = rows[0]
-        return {
+        out: dict[str, Any] = {
             "account_name": r.get("ACCOUNT_NM"),
             "target_cloud": r.get("TARGET_CLOUD"),
             "renewal_aov": float(r.get("RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV") or 0),
             "renewal_atr": abs(float(r.get("RENEWAL_FCAST_ATTRITION_CONV") or 0)),
+            "csg_geo": r.get("CSG_GEO") or "",
         }
+        gmv = _gmv_rate_pct_from_renewal_row(r)
+        if gmv:
+            out["gmv_rate_pct"] = gmv
+        return out
     return {}
 
 
@@ -358,19 +775,27 @@ def _apm_product_display_name(row: dict) -> str:
 
 
 def get_account_attrition(account_id: str, cloud: str | None = "Commerce Cloud") -> list:
-    base = [
+    """
+    Product-level attrition on latest CSS snapshot.
+    ``cloud=None`` (or empty / ``All Clouds``): all products, no APM cloud predicate.
+    """
+    conditions = [
         "ACCOUNT_ID = %s",
         "SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM "
         "SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT)",
     ]
     params: list[Any] = [to_15_char_id(account_id)]
 
-    def _run(with_cloud: str | None) -> list:
-        cond = list(base)
-        if with_cloud:
-            pred = apm_cloud_levels_predicate(with_cloud)
-            if pred:
-                cond.append(pred)
+    use_cloud = (
+        cloud is not None
+        and str(cloud).strip()
+        and str(cloud) != "All Clouds"
+    )
+
+    def _run(extra_predicate: str | None) -> list:
+        cond = list(conditions)
+        if extra_predicate:
+            cond.append(extra_predicate)
         where_clause = " AND ".join(cond)
         sql = f"""
             SELECT
@@ -380,13 +805,13 @@ def get_account_attrition(account_id: str, cloud: str | None = "Commerce Cloud")
             FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
             WHERE {where_clause}
             ORDER BY ATTRITION_PIPELINE DESC NULLS LAST
-            LIMIT 20
+            LIMIT 50
         """
         return run_query(sql, params)
 
-    use_cloud = cloud and str(cloud).strip() and str(cloud) != "All Clouds"
-    rows = _run(cloud if use_cloud else None)
-    if not rows and use_cloud:
+    pred = apm_cloud_levels_predicate(str(cloud).strip()) if use_cloud else ""
+    rows = _run(pred if pred else None)
+    if not rows and use_cloud and pred:
         log_debug("get_account_attrition: no rows with cloud filter; retrying without")
         rows = _run(None)
 
@@ -397,6 +822,10 @@ def get_account_attrition(account_id: str, cloud: str | None = "Commerce Cloud")
             "APM_LVL_1": r.get("APM_LVL_1"),
             "APM_LVL_2": r.get("APM_LVL_2"),
             "APM_LVL_3": r.get("APM_LVL_3"),
+            "ATTRITION_PIPELINE": r.get("ATTRITION_PIPELINE"),
+            "ATTRITION_PROBA": r.get("ATTRITION_PROBA"),
+            "ATTRITION_PROBA_CATEGORY": r.get("ATTRITION_PROBA_CATEGORY"),
+            "ATTRITION_REASON": r.get("ATTRITION_REASON"),
             "attrition": abs(float(r.get("ATTRITION_PIPELINE") or 0)),
             "category": r.get("ATTRITION_PROBA_CATEGORY"),
             "reason": r.get("ATTRITION_REASON") or "",
@@ -412,7 +841,6 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
 
     ari = enrichment.get("ari", {})
     ari_cat = ari.get("category", "Unknown")
-    ari_prob = ari.get("probability", "")
     if ari_cat == "High":
         ari_emoji = ":red_circle:"
     elif ari_cat == "Medium":
@@ -422,12 +850,18 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
     else:
         ari_emoji = ":white_circle:"
 
-    prob_display = "N/A"
-    if ari_prob is not None and ari_prob != "":
+    ari_prob = ari.get("probability")
+    if ari_prob is not None:
         try:
-            prob_display = f"{float(ari_prob):.1f}"
+            prob_float = float(ari_prob)
+            if prob_float <= 1.0:
+                prob_display = f"{prob_float * 100:.1f}%"
+            else:
+                prob_display = f"{prob_float:.1f}%"
         except (TypeError, ValueError):
-            prob_display = str(ari_prob)
+            prob_display = "N/A"
+    else:
+        prob_display = "N/A"
 
     result = {
         "ari_category": ari_cat,
@@ -443,6 +877,22 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
     health = enrichment.get("health", {})
     health_score = health.get("overall_score")
     health_literal = health.get("overall_literal", "Unknown")
+    score_val = None
+    if health_literal not in (None, "", "Unknown"):
+        if isinstance(health_literal, (int, float)):
+            try:
+                score_val = float(health_literal)
+            except (TypeError, ValueError):
+                pass
+        elif str(health_literal).isdigit():
+            score_val = float(health_literal)
+    if score_val is not None:
+        if score_val >= 70:
+            health_literal = "Green"
+        elif score_val >= 40:
+            health_literal = "Yellow"
+        else:
+            health_literal = "Red"
     if health_score:
         try:
             hs = float(health_score)
@@ -495,8 +945,14 @@ def format_enrichment_for_claude(enrichment: dict) -> str:
     if not enrichment:
         return ""
     display = format_enrichment_for_display(enrichment)
+    _ap = display.get("ari_probability", "N/A")
+    _ap_paren = (
+        _ap
+        if (_ap == "N/A" or str(_ap).strip().endswith("%"))
+        else f"{_ap}%"
+    )
     return "\n".join([
-        f"ARI: {display.get('ari_category', 'N/A')} ({display.get('ari_probability', 'N/A')}%)",
+        f"ARI: {display.get('ari_category', 'N/A')} ({_ap_paren})",
         f"Utilization: {display.get('utilization_rate', 'N/A')}",
         f"GMV Rate: {display.get('gmv_rate', 'N/A')}",
         f"Territory: {display.get('territory', 'N/A')}",
@@ -634,6 +1090,13 @@ def get_at_risk_accounts_snowflake(
     if min_attrition > 0:
         conditions.append(f"ABS(ATTRITION_PIPELINE) > {min_attrition}")
 
+    conditions.append(
+        "LOWER(COALESCE(APM_LVL_2, '')) NOT LIKE '%success plan%'"
+    )
+    conditions.append(
+        "LOWER(COALESCE(APM_LVL_3, '')) NOT LIKE '%success plan%'"
+    )
+
     where_clause = " AND ".join(conditions)
     sort_map = {
         "atr": "ABS(ATTRITION_PIPELINE) DESC",
@@ -666,7 +1129,15 @@ def get_at_risk_accounts_snowflake(
         out.append({
             "account_id": r.get("ACCOUNT_ID"),
             "account_name": r.get("ACCOUNT_NAME") or "",
+            "apm_lvl_1": r.get("APM_LVL_1"),
+            "apm_lvl_2": r.get("APM_LVL_2"),
             "apm_lvl_3": r.get("APM_LVL_3"),
+            # Uppercase aliases for callers/tests expecting SQL-style keys
+            "ACCOUNT_ID": r.get("ACCOUNT_ID"),
+            "APM_LVL_2": r.get("APM_LVL_2"),
+            "APM_LVL_3": r.get("APM_LVL_3"),
+            "ATTRITION_PROBA_CATEGORY": r.get("ATTRITION_PROBA_CATEGORY"),
+            "ATTRITION_PIPELINE": r.get("ATTRITION_PIPELINE"),
             "attrition_pipeline": float(r.get("ATTRITION_PIPELINE") or 0),
             "attrition_proba_category": r.get("ATTRITION_PROBA_CATEGORY"),
             "attrition_reason": r.get("ATTRITION_REASON"),
@@ -680,7 +1151,17 @@ def _escape_sf_id(account_id: str) -> str:
 
 
 class SnowflakeClient:
-    """OOP wrapper (parallel GM workflow / adapters)."""
+    """Singleton OOP wrapper; always uses module-level get_snowflake_connection()."""
+
+    _instance: Optional["SnowflakeClient"] = None
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "SnowflakeClient":
+        # args/kwargs are for __init__ only; Python still passes them to __new__
+        if cls._instance is None:
+            inst = super().__new__(cls)
+            inst._initialized = False
+            cls._instance = inst
+        return cls._instance
 
     def __init__(
         self,
@@ -692,81 +1173,39 @@ class SnowflakeClient:
         schema: Optional[str] = None,
         role: Optional[str] = None,
         authenticator: Optional[str] = None,
-    ):
-        self._conn: Any = None
+    ) -> None:
+        if self._initialized:
+            return
         self._account = account or os.getenv("SNOWFLAKE_ACCOUNT")
         self._user = user or os.getenv("SNOWFLAKE_USER")
-        self._password = password if password is not None else os.getenv("SNOWFLAKE_PASSWORD")
-        self._warehouse = warehouse or os.getenv("SNOWFLAKE_WAREHOUSE") or "COMPUTE_WH"
-        self._database = database if database is not None else os.getenv("SNOWFLAKE_DATABASE")
-        self._schema = schema if schema is not None else os.getenv("SNOWFLAKE_SCHEMA")
-        self._role = role if role is not None else os.getenv("SNOWFLAKE_ROLE")
-        self._authenticator = (
-            authenticator if authenticator is not None else os.getenv("SNOWFLAKE_AUTHENTICATOR")
-        )
-
         if not self._account or not self._user:
             raise ValueError("SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER are required")
+        get_snowflake_connection()
+        self._initialized = True
 
-        conn_params: dict[str, Any] = {
-            "account": self._account,
-            "user": self._user,
-            "warehouse": self._warehouse,
-        }
-        if self._database:
-            conn_params["database"] = self._database
-        if self._schema:
-            conn_params["schema"] = self._schema
-        if self._role:
-            conn_params["role"] = self._role
-        if self._password:
-            conn_params["password"] = self._password
-        else:
-            conn_params["authenticator"] = self._authenticator or "externalbrowser"
-
-        self._conn = snowflake.connector.connect(**conn_params)
-        log_debug("✅ SnowflakeClient connected")
+    @property
+    def conn(self) -> Any:
+        """Always the current module singleton (stays valid after reconnect)."""
+        return get_snowflake_connection()
 
     def _cursor(self):
-        return self._conn.cursor()
+        return self.conn.cursor()
 
-    def get_account_usage(self, account_id: str) -> Optional[dict[str, Any]]:
-        aid = _escape_sf_id(account_id)
-        cursor = self._cursor()
+    def get_account_usage(
+        self, account_id: str, cloud: str = "Commerce Cloud"
+    ) -> Optional[dict[str, Any]]:
         try:
-            query = f"""
-            SELECT
-                UTILIZATION_RATE,
-                GMV_RATE,
-                BURN_RATE,
-                CC_AOV,
-                TERRITORY,
-                CSG_GEO
-            FROM CIDM.WV_AV_USAGE_EXTRACT_VW
-            WHERE ACCOUNT_ID = '{aid}'
-            AND SNAPSHOT_DT = (
-                SELECT MAX(SNAPSHOT_DT)
-                FROM CIDM.WV_AV_USAGE_EXTRACT_VW
-            )
-            LIMIT 1
-            """
-            cursor.execute(query)
-            row = cursor.fetchone()
-            if not row:
-                return None
-            return {
-                "utilization_rate": float(row[0]) if row[0] is not None else None,
-                "gmv_rate": float(row[1]) if row[1] is not None else None,
-                "burn_rate": float(row[2]) if row[2] is not None else None,
-                "cc_aov": float(row[3]) if row[3] is not None else None,
-                "territory": row[4],
-                "csg_geo": row[5],
-            }
+            usage = get_usage_summary(to_15_char_id(account_id), cloud)
+            if usage:
+                return {
+                    "utilization_rate": usage.get("utilization_rate", "N/A"),
+                    "util_emoji": usage.get("util_emoji", ":white_circle:"),
+                    "gmv_util": usage.get("gmv_util"),
+                    "source": usage.get("source", ""),
+                }
         except Exception as e:
-            log_error(f"SnowflakeClient.get_account_usage error: {e}")
-            return None
-        finally:
-            cursor.close()
+            log_error(f"SnowflakeClient.get_account_usage error: {str(e)[:100]}")
+        return None
 
     def get_ari_score(self, account_id: str) -> Optional[float]:
         aid = _escape_sf_id(account_id)
@@ -829,10 +1268,42 @@ class SnowflakeClient:
             cursor.close()
 
     def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception as e:
-                log_error(f"SnowflakeClient.close error: {e}")
-            finally:
-                self._conn = None
+        """No-op: singleton connection is shared; do not close from here."""
+        pass
+
+
+# --- SF Products label cleanup (canvas, Sheets, exporters) -----------------
+
+APM_L1_DISPLAY_MAP: dict[str, str] = {
+    "Salesforce Platform": "Platform",
+    "Integration": "MuleSoft",
+    "AI and Data": "Data Cloud",
+    "Cross Cloud - CRM": "CRM",
+    "Cross Cloud - Einstein": "Einstein",
+}
+
+APM_L1_EXCLUDE = frozenset({"Other", ""})
+
+
+def get_sf_products_display(all_products: list) -> str:
+    """Deduped APM L1 labels for Salesforce products (maps long L1 names to short labels)."""
+    if not all_products:
+        return "N/A"
+
+    unique_l1s = list(
+        dict.fromkeys(
+            str(p.get("APM_LVL_1") or "").strip()
+            for p in all_products
+            if str(p.get("APM_LVL_1") or "").strip()
+        )
+    )
+
+    cleaned: list[str] = []
+    for l1 in unique_l1s:
+        if l1 in APM_L1_EXCLUDE:
+            continue
+        display = APM_L1_DISPLAY_MAP.get(l1, l1)
+        if display not in cleaned:
+            cleaned.append(display)
+
+    return ", ".join(cleaned) if cleaned else "N/A"

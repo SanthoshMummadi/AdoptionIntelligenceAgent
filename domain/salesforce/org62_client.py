@@ -5,6 +5,8 @@ Salesforce org62 operations: account lookup, opportunities, team, red accounts.
 Loads `.env` from the repository root (not only CWD). Accepts SF_* and SALESFORCE_* tokens.
 """
 import os
+import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -68,6 +70,21 @@ def _escape(s: str) -> str:
 def _soql_line(soql: str) -> str:
     """Collapse whitespace/newlines — multi-line SOQL can break REST query URLs."""
     return " ".join(str(soql).split())
+
+
+def clean_html(text: str) -> str:
+    """Strip HTML tags and normalize whitespace for Latest Updates and similar fields."""
+    if not text:
+        return ""
+    text = text.replace("<p>", "").replace("</p>", " ")
+    text = text.replace("<br>", " ").replace("<br/>", " ")
+    text = text.replace("<strong>", "**").replace("</strong>", "**")
+    text = text.replace("<em>", "_").replace("</em>", "_")
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&#39;", "'").replace("&nbsp;", " ")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def resolve_account(account_name: str, cloud: str = "Commerce Cloud") -> dict:
@@ -177,94 +194,134 @@ def resolve_account_enhanced(name: str, cloud: str = "Commerce Cloud") -> Option
 def get_renewal_opportunities(account_id: str, cloud: str = "Commerce Cloud") -> list:
     """Renewal opps for account, filtered by cloud name in Opportunity Name."""
     sf = get_sf_client()
-    account_id_escaped = _escape(account_id)
-    cloud_escaped = _escape(cloud)
-    query = (
-        "SELECT Id, Name, StageName, Amount, CloseDate, "
+    aid = _escape(account_id)
+    fields = (
+        "Id, Name, StageName, Amount, CloseDate, "
         "Account.Id, Account.Name, Account.BillingCountry, "
         "ForecastCategoryName, Forecasted_Attrition__c, Swing__c, "
         "License_At_Risk_Reason__c, ACV_Reason_Detail__c, NextStep, "
-        "Description, Specialist_Sales_Notes__c, Manager_Forecast_Judgement__c "
-        f"FROM Opportunity "
-        f"WHERE AccountId = '{account_id_escaped}' "
-        f"AND Name LIKE '%{cloud_escaped}%' "
+        "Description, Specialist_Sales_Notes__c, "
+        "Manager_Forecast_Judgement__c"
+    )
+    where = (
+        f"AccountId = '{aid}' "
+        f"AND Name LIKE '%{_escape(cloud)}%' "
         f"AND Name LIKE '%Renewal%' "
-        f"AND StageName NOT LIKE '%Closed%' "
-        f"ORDER BY Forecasted_Attrition__c DESC NULLS LAST "
-        f"LIMIT 10"
+        f"AND IsClosed = false "
+        f"AND CloseDate >= 2025-01-01"
+    )
+    query = (
+        f"SELECT {fields} FROM Opportunity WHERE {where} "
+        f"ORDER BY Forecasted_Attrition__c DESC LIMIT 10"
     )
     try:
-        return sf.query(query).get("records", [])
+        return sf.query(_soql_line(query)).get("records", [])
     except Exception as e:
         log_debug(f"Error fetching opportunities: {str(e)[:100]}")
         return []
 
 
 def get_renewal_opportunities_any_cloud(account_id: str) -> list:
-    """Open renewal opps for account without filtering Opportunity Name by cloud (fallback for enrichment)."""
+    """Open renewal opps without filtering Opportunity Name by cloud (enrichment fallback)."""
     sf = get_sf_client()
-    account_id_escaped = _escape(account_id)
-    query = (
-        "SELECT Id, Name, StageName, Amount, CloseDate, "
+    aid = _escape(account_id)
+    fields = (
+        "Id, Name, StageName, Amount, CloseDate, "
         "Account.Id, Account.Name, Account.BillingCountry, "
         "ForecastCategoryName, Forecasted_Attrition__c, Swing__c, "
         "License_At_Risk_Reason__c, ACV_Reason_Detail__c, NextStep, "
-        "Description, Specialist_Sales_Notes__c, Manager_Forecast_Judgement__c "
-        f"FROM Opportunity "
-        f"WHERE AccountId = '{account_id_escaped}' "
+        "Description, Specialist_Sales_Notes__c, "
+        "Manager_Forecast_Judgement__c"
+    )
+    where = (
+        f"AccountId = '{aid}' "
         f"AND Name LIKE '%Renewal%' "
-        f"AND StageName NOT LIKE '%Closed%' "
-        f"ORDER BY Forecasted_Attrition__c DESC NULLS LAST "
-        f"LIMIT 10"
+        f"AND IsClosed = false "
+        f"AND CloseDate >= 2025-01-01"
+    )
+    query = (
+        f"SELECT {fields} FROM Opportunity WHERE {where} "
+        f"ORDER BY Forecasted_Attrition__c DESC LIMIT 10"
     )
     try:
-        return sf.query(query).get("records", [])
+        return sf.query(_soql_line(query)).get("records", [])
     except Exception as e:
         log_debug(f"Error fetching opportunities (any cloud): {str(e)[:100]}")
         return []
 
 
-def get_red_account(account_id: str) -> dict:
-    """Get Red Account record if exists."""
-    sf = get_sf_client()
-
+def _fill_days_red_from_start_date(red: dict) -> None:
+    """Set Days_Red__c from Red_Start_Date__c when the field is null."""
+    if red.get("Days_Red__c") is not None:
+        return
+    rs = red.get("Red_Start_Date__c")
+    if not rs:
+        return
     try:
-        query = f"""
+        if hasattr(rs, "date"):
+            start = rs.date()
+        elif isinstance(rs, str):
+            start = date.fromisoformat(rs.split("T")[0])
+        else:
+            return
+        red["Days_Red__c"] = (date.today() - start).days
+    except (TypeError, ValueError):
+        pass
+
+
+def _finalize_red_account_record(red: dict) -> None:
+    """Derive Days Red when missing; strip HTML from Latest Updates."""
+    _fill_days_red_from_start_date(red)
+    lu = red.get("Latest_Updates__c")
+    if lu:
+        red["Latest_Updates__c"] = clean_html(str(lu))
+
+
+def get_red_account(account_id: str) -> Optional[dict]:
+    """Active Red Account (Open / Precautionary); derive days red when missing."""
+    sf = get_sf_client()
+    aid = _escape(account_id)
+
+    query = f"""
         SELECT
             Id, Name, Stage__c, ACV_at_Risk__c,
-            Days_Red__c, Red_Trending__c,
+            Days_Red__c, Red_Trending__c, Red_Start_Date__c,
             Latest_Updates__c, Action_Plan__c,
             Issue_Product__c, Red_Account__c
         FROM Red_Account__c
-        WHERE Red_Account__c = '{_escape(account_id)}'
-        AND Stage__c != 'Closed'
-        ORDER BY CreatedDate DESC
+        WHERE Red_Account__c = '{aid}'
+        AND Stage__c IN ('Open', 'Precautionary')
+        ORDER BY Red_Start_Date__c DESC NULLS LAST, CreatedDate DESC
         LIMIT 1
-        """
+    """
+
+    try:
         result = sf.query(_soql_line(query))
-
         if result.get("records"):
-            return result["records"][0]
+            red = result["records"][0]
+            _finalize_red_account_record(red)
+            return red
 
-        # Check for historical (closed) red accounts
         query_historical = f"""
-        SELECT Id, Stage__c
-        FROM Red_Account__c
-        WHERE Red_Account__c = '{_escape(account_id)}'
-        ORDER BY CreatedDate DESC
-        LIMIT 1
+            SELECT
+                Id, Name, Stage__c, Days_Red__c, Red_Start_Date__c,
+                Latest_Updates__c, Action_Plan__c, Issue_Product__c, Red_Account__c
+            FROM Red_Account__c
+            WHERE Red_Account__c = '{aid}'
+            ORDER BY CreatedDate DESC
+            LIMIT 1
         """
         result_historical = sf.query(_soql_line(query_historical))
-
         if result_historical.get("records"):
             historical = result_historical["records"][0]
+            _finalize_red_account_record(historical)
             historical["_historical"] = True
             return historical
 
         return None
 
     except Exception as e:
-        log_error(f"get_red_account error: {e}")
+        log_debug(f"Error fetching red account: {str(e)[:100]}")
         return None
 
 
@@ -406,7 +463,7 @@ class Org62Client:
         try:
             q = f"""
             SELECT Id, Name, BillingCountry, BillingCity, BillingState, Industry, Type,
-                   Website, Phone, OwnerId, Owner.Name
+                   Website, OwnerId, Owner.Name
             FROM Account
             WHERE Id = '{_escape(account_id)}'
             LIMIT 1
@@ -466,34 +523,7 @@ class Org62Client:
     def get_red_account_info(self, account_id: str) -> Optional[Dict[str, Any]]:
         """Red Account custom object row for this Account Id, if any."""
         try:
-            q = f"""
-            SELECT
-                Id, Name, Stage__c, ACV_at_Risk__c,
-                Days_Red__c, Red_Trending__c,
-                Latest_Updates__c, Action_Plan__c,
-                Issue_Product__c, Red_Account__c
-            FROM Red_Account__c
-            WHERE Red_Account__c = '{_escape(account_id)}'
-            AND Stage__c != 'Closed'
-            ORDER BY CreatedDate DESC
-            LIMIT 1
-            """
-            result = self._sf.query(_soql_line(q))
-            if result.get("records"):
-                return result["records"][0]
-            qh = f"""
-            SELECT Id, Stage__c
-            FROM Red_Account__c
-            WHERE Red_Account__c = '{_escape(account_id)}'
-            ORDER BY CreatedDate DESC
-            LIMIT 1
-            """
-            rh = self._sf.query(_soql_line(qh))
-            if rh.get("records"):
-                historical = rh["records"][0]
-                historical["_historical"] = True
-                return historical
-            return None
+            return get_red_account(account_id)
         except Exception as e:
             log_error(f"Org62Client.get_red_account_info error: {e}")
             return None
@@ -501,28 +531,12 @@ class Org62Client:
     def get_renewal_opportunity(
         self, account_id: str, _cloud: str = "Commerce Cloud"
     ) -> Optional[Dict[str, Any]]:
-        """First open renewal opportunity for account (by close date), if any."""
+        """First renewal opportunity (same query logic as get_renewal_opportunities)."""
         try:
-            q = f"""
-            SELECT
-                Id, Name, StageName, Amount, CloseDate,
-                AccountId, Account.Name, Account.BillingCountry,
-                ForecastCategoryName,
-                Forecasted_Attrition__c, Swing__c,
-                License_At_Risk_Reason__c,
-                ACV_Reason_Detail__c, NextStep,
-                Description, Specialist_Sales_Notes__c,
-                Manager_Forecast_Judgement__c
-            FROM Opportunity
-            WHERE AccountId = '{_escape(account_id)}'
-            AND (Name LIKE '%Renewal%' OR Name LIKE '%renew%')
-            AND IsClosed = false
-            ORDER BY CloseDate ASC
-            LIMIT 1
-            """
-            result = self._sf.query(_soql_line(q))
-            recs = result.get("records", [])
-            return recs[0] if recs else None
+            opps = get_renewal_opportunities(account_id, _cloud)
+            if not opps:
+                opps = get_renewal_opportunities_any_cloud(account_id)
+            return opps[0] if opps else None
         except Exception as e:
             log_error(f"Org62Client.get_renewal_opportunity error: {e}")
             return None

@@ -1,26 +1,51 @@
 """
-canvas_builder.py
-Canvas builder for account briefs and GM Review canvases.
+domain/content/canvas_builder.py
+Canvas generation for Slack (account brief blocks + GM Review markdown).
 """
 import re
-from datetime import datetime, timezone
-from typing import Any, Dict
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
 
+from domain.analytics.snowflake_client import (
+    fmt_amount,
+    get_sf_products_display,
+    split_products_by_type,
+)
 from log_utils import log_debug
 
 
-def fmt_amount(value) -> str:
-    """Format amount as $XM or $XK."""
+def _ari_emoji(category: str) -> str:
+    if category == "High":
+        return ":red_circle:"
+    if category == "Medium":
+        return ":large_yellow_circle:"
+    if category == "Low":
+        return ":large_green_circle:"
+    return ":white_circle:"
+
+
+def _health_emoji(score) -> str:
     try:
-        val = float(value)
-        if val >= 1000000:
-            return f"${val/1000000:.1f}M"
-        elif val >= 1000:
-            return f"${val/1000:.0f}K"
-        else:
-            return f"${val:,.0f}"
+        s = float(score)
+        if s >= 70:
+            return ":large_green_circle:"
+        if s >= 40:
+            return ":large_yellow_circle:"
+        return ":red_circle:"
     except (TypeError, ValueError):
-        return "N/A"
+        return ":white_circle:"
+
+
+def _util_emoji(util_rate) -> str:
+    try:
+        val = float(str(util_rate).rstrip("%"))
+        if val >= 70:
+            return ":large_green_circle:"
+        if val >= 40:
+            return ":large_yellow_circle:"
+        return ":red_circle:"
+    except (TypeError, ValueError):
+        return ":white_circle:"
 
 
 def _sanitize_cell(text: str) -> str:
@@ -38,6 +63,92 @@ def _sanitize_cell(text: str) -> str:
         text = text[:497] + "..."
 
     return text
+
+
+def clean_html(text: str) -> str:
+    """Strip HTML tags and normalize whitespace for Slack/canvas text."""
+    if not text:
+        return ""
+    text = text.replace("<p>", "").replace("</p>", " ")
+    text = text.replace("<br>", " ").replace("<br/>", " ")
+    text = text.replace("<strong>", "**").replace("</strong>", "**")
+    text = text.replace("<em>", "_").replace("</em>", "_")
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&#39;", "'").replace("&nbsp;", " ")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def build_adoption_pov(usage_data: list, cloud: str = "Commerce Cloud") -> str:
+    """
+    Build Adoption POV from CIDM.WV_AV_USAGE_EXTRACT_VW data.
+    Only shows Commerce L1 — excludes Success Plans, Partner, Sandbox, On Demand.
+
+    Example output:
+        - B2C Commerce: 214.83M provisioned, 82% utilized (176.55M used)
+        - Order Management: 500 provisioned, 3% utilized (15 used)
+    """
+    if not usage_data:
+        return "No adoption data available."
+
+    commerce_rows = [
+        u
+        for u in usage_data
+        if str(u.get("DRVD_APM_LVL_1") or "").strip().lower() == "commerce"
+        and "success plan" not in str(u.get("DRVD_APM_LVL_2") or "").lower()
+        and "partner" not in str(u.get("DRVD_APM_LVL_2") or "").lower()
+        and "sandbox" not in str(u.get("DRVD_APM_LVL_2") or "").lower()
+        and "on demand" not in str(u.get("TYPE") or "").lower()
+    ]
+
+    if not commerce_rows:
+        return "No Commerce adoption data available."
+
+    l2_summary: Dict[str, Dict[str, float]] = {}
+    for u in commerce_rows:
+        l2 = str(u.get("DRVD_APM_LVL_2") or "").strip()
+        if not l2:
+            continue
+        provisioned = float(
+            u.get("TOTAL_PROV") or u.get("PROVISIONED") or 0
+        )
+        activated = float(
+            u.get("TOTAL_ACTIVATED") or u.get("ACTIVATED") or 0
+        )
+        used = float(u.get("TOTAL_USED") or u.get("USED") or 0)
+        active = activated if activated > 0 else used
+
+        if l2 not in l2_summary:
+            l2_summary[l2] = {"provisioned": 0.0, "active": 0.0}
+        l2_summary[l2]["provisioned"] += provisioned
+        l2_summary[l2]["active"] += active
+
+    pov_lines: list[str] = []
+    for l2, vals in sorted(
+        l2_summary.items(),
+        key=lambda x: x[1]["provisioned"],
+        reverse=True,
+    ):
+        prov = vals["provisioned"]
+        active = vals["active"]
+        if prov <= 0:
+            continue
+        pct = (active / prov) * 100
+
+        if prov >= 1_000_000:
+            prov_fmt = f"{prov / 1_000_000:.2f}M"
+            active_fmt = f"{active / 1_000_000:.2f}M"
+        else:
+            prov_fmt = f"{prov:,.0f}"
+            active_fmt = f"{active:,.0f}"
+
+        pov_lines.append(
+            f"- {l2}: {prov_fmt} provisioned, "
+            f"{pct:.0f}% utilized ({active_fmt} used)"
+        )
+
+    return "\n".join(pov_lines) if pov_lines else "No Commerce adoption data available."
 
 
 def get_canvas_url(canvas_id: str) -> str:
@@ -94,178 +205,228 @@ def build_account_brief_blocks(
     recommendation: str,
     tldr: str = None,
 ) -> list:
-    """Slack Block Kit: header, metrics, risk/actions, product, red account, TL;DR last, then SF link."""
+    """Slack Block Kit: header, ARI/health, AOV/util, financial status, products, notes, risk, actions, summary, link."""
     account_name = account.get("name", "Unknown")
     account_id = account.get("id", "")
     product_attrition = account.get("product_attrition", [])
 
-    blocks: list = [
+    blocks = [
         {
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": f"🚨 Account Risk Briefing — {account_name}",
+                "text": f"Account Risk Briefing — {account_name}",
                 "emoji": True,
             },
         }
     ]
 
-    if opp and opp.get("Name"):
-        blocks.append({
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f":clipboard: *Renewal:* {opp.get('Name')} | "
-                        f"Stage: {opp.get('StageName', 'N/A')} | "
-                        f"Close: {opp.get('CloseDate', 'N/A')}"
-                    ),
-                }
-            ],
-        })
-
-    blocks.append({"type": "divider"})
-
     ari_emoji = snowflake_display.get("ari_emoji", ":white_circle:")
     ari_category = snowflake_display.get("ari_category", "Unknown")
-    ari_probability = snowflake_display.get("ari_probability", "N/A")
-    health_display = snowflake_display.get("health_display", ":white_circle: Unknown")
+    ari_prob = snowflake_display.get("ari_probability", "N/A")
+
+    health_score = snowflake_display.get("health_score", "")
+    health_emoji = _health_emoji(health_score)
 
     blocks.append({
         "type": "section",
         "fields": [
             {
                 "type": "mrkdwn",
-                "text": (
-                    f"*ARI Score:*\n{ari_emoji} *{ari_category} Risk* ({ari_probability})"
-                ),
+                "text": f"*ARI Score:*\n{ari_emoji} *{ari_category} Risk* ({ari_prob})",
             },
             {
                 "type": "mrkdwn",
-                "text": f"*Account Health:*\n{health_display}",
+                "text": f"*Account Health:*\n{health_emoji} {health_score}",
             },
         ],
     })
 
     cc_aov = snowflake_display.get("cc_aov", "Unknown")
-    util_emoji = snowflake_display.get("util_emoji", ":white_circle:")
     util_rate = snowflake_display.get("utilization_rate", "N/A")
+
+    if util_rate and util_rate != "N/A":
+        util_emoji = _util_emoji(util_rate)
+        util_display = f"{util_emoji} {util_rate}"
+    else:
+        util_display = ":white_circle: N/A"
 
     blocks.append({
         "type": "section",
         "fields": [
             {"type": "mrkdwn", "text": f"*Cloud AOV:*\n{cc_aov}"},
-            {"type": "mrkdwn", "text": f"*Utilization:*\n{util_emoji} {util_rate}"},
+            {"type": "mrkdwn", "text": f"*Utilization:*\n{util_display}"},
         ],
     })
 
-    if opp:
-        forecasted_atr = opp.get("Forecasted_Attrition__c")
-        close_date = opp.get("CloseDate")
-        if forecasted_atr is not None or close_date:
+    blocks.append({"type": "divider"})
+
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": "*:bar_chart: Financial & Status*"},
+    })
+
+    fin_fields = []
+    if opp and opp.get("Name"):
+        fin_fields.append({
+            "type": "mrkdwn",
+            "text": f"*Renewal:*\n{opp.get('Name', 'N/A')}",
+        })
+    if opp and opp.get("CloseDate"):
+        fin_fields.append({
+            "type": "mrkdwn",
+            "text": f"*Close Date:*\n:date: {opp.get('CloseDate')}",
+        })
+    if fin_fields:
+        blocks.append({"type": "section", "fields": fin_fields})
+
+    renewal_atr_raw = snowflake_display.get("renewal_atr", 0)
+    try:
+        renewal_atr = float(renewal_atr_raw or 0)
+    except (TypeError, ValueError):
+        renewal_atr = 0.0
+    try:
+        forecasted_atr = abs(float(opp.get("Forecasted_Attrition__c", 0) or 0)) if opp else 0.0
+    except (TypeError, ValueError):
+        forecasted_atr = 0.0
+    try:
+        swing = abs(float(opp.get("Swing__c", 0) or 0)) if opp else 0.0
+    except (TypeError, ValueError):
+        swing = 0.0
+    forecast_judgement = opp.get("Manager_Forecast_Judgement__c", "") if opp else ""
+
+    atr_fields = []
+    if renewal_atr > 0:
+        atr_fields.append({
+            "type": "mrkdwn",
+            "text": f"*ATR:*\n:chart_with_downwards_trend: {fmt_amount(renewal_atr)}",
+        })
+    if forecasted_atr > 0:
+        atr_fields.append({
+            "type": "mrkdwn",
+            "text": f"*Forecasted Attrition:*\n:chart_with_downwards_trend: {fmt_amount(forecasted_atr)}",
+        })
+    if atr_fields:
+        blocks.append({"type": "section", "fields": atr_fields})
+
+    swing_fields = []
+    if swing > 0:
+        swing_fields.append({
+            "type": "mrkdwn",
+            "text": f"*Swing:*\n:arrows_counterclockwise: {fmt_amount(swing)}",
+        })
+    if forecast_judgement:
+        swing_fields.append({
+            "type": "mrkdwn",
+            "text": f"*Forecast:*\n:bar_chart: {forecast_judgement}",
+        })
+    if swing_fields:
+        blocks.append({"type": "section", "fields": swing_fields})
+
+    risk_reason = opp.get("License_At_Risk_Reason__c", "") if opp else ""
+    if risk_reason:
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Risk Reason:*\n:dart: {risk_reason}"},
+            ],
+        })
+
+    blocks.append({"type": "divider"})
+
+    if product_attrition:
+        split = split_products_by_type(product_attrition)
+        all_products = split["core"] + split["success_plans"]
+
+        product_lines = []
+        for p in all_products[:8]:
+            product_name = (
+                p.get("APM_LVL_3")
+                or p.get("APM_LVL_2")
+                or p.get("APM_LVL_1")
+                or p.get("product")
+                or "Unknown"
+            )
+            product_ari = (
+                p.get("ATTRITION_PROBA_CATEGORY")
+                or p.get("category")
+                or "Unknown"
+            )
             try:
-                fatr = abs(float(forecasted_atr or 0))
+                pipe = p.get("ATTRITION_PIPELINE")
+                if pipe is not None:
+                    atr_val = abs(float(pipe or 0))
+                else:
+                    atr_val = abs(float(p.get("attrition", 0) or 0))
             except (TypeError, ValueError):
-                fatr = 0.0
+                atr_val = 0.0
+
+            emoji = _ari_emoji(product_ari)
+            aov_str = f"AOV: {fmt_amount(atr_val)}" if atr_val > 0 else ""
+            line = f"{emoji} *{product_name}* | {product_ari}"
+            if aov_str:
+                line += f" | {aov_str}"
+            product_lines.append(line)
+
+        if product_lines:
             blocks.append({
                 "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Forecasted Attrition:*\n${fatr:,.0f}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Close Date:*\n{close_date or 'N/A'}",
-                    },
-                ],
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*:package: Product Attrition Breakdown*\n" + "\n".join(product_lines),
+                },
             })
 
     blocks.append({"type": "divider"})
 
-    if risk_notes:
+    manager_notes_parts = []
+    if opp:
+        forecast_j = opp.get("Manager_Forecast_Judgement__c", "")
+        specialist_notes = opp.get("Specialist_Sales_Notes__c", "")
+        description = opp.get("Description", "")
+        next_step = opp.get("NextStep", "")
+
+        if forecast_j:
+            manager_notes_parts.append(f"*Forecast Judgement:* {forecast_j}")
+        if specialist_notes:
+            manager_notes_parts.append(f"*CSG Notes:* {specialist_notes[:200]}")
+        elif description:
+            manager_notes_parts.append(f"*Notes:* {description[:200]}")
+        if next_step:
+            manager_notes_parts.append(f"*Next Step:* {next_step[:150]}")
+
+    if red_account:
+        stage = red_account.get("Stage__c", "")
+        days_red = red_account.get("Days_Red__c", "")
+        latest = (red_account.get("Latest_Updates__c") or "")[:150]
+
+        if stage:
+            manager_notes_parts.append(
+                f"*Red Account:* :red_circle: {stage} ({days_red} days)"
+            )
+        if latest:
+            manager_notes_parts.append(f"*Latest Update:* {clean_html(latest)}")
+
+    if manager_notes_parts:
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:mag: Risk Assessment*\n{risk_notes}",
+                "text": "*:pushpin: Manager Notes*\n" + "\n".join(manager_notes_parts),
             },
+        })
+        blocks.append({"type": "divider"})
+
+    if risk_notes:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*:mag: Risk Assessment*\n{risk_notes}"},
         })
 
     if recommendation:
         blocks.append({
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*:dart: Recommended Actions*\n{recommendation}",
-            },
-        })
-
-    if product_attrition:
-        product_lines = []
-        for p in product_attrition[:5]:
-            product_name = (
-                p.get("product")
-                or p.get("APM_LVL_3")
-                or p.get("APM_LVL_2")
-                or p.get("APM_LVL_1")
-                or "Unknown"
-            )
-            product_ari = (
-                p.get("category")
-                or p.get("ATTRITION_PROBA_CATEGORY")
-                or "Unknown"
-            )
-            raw_reason = p.get("reason") or p.get("ATTRITION_REASON") or "N/A"
-            product_reason = str(raw_reason)[:40]
-            raw_atr = p.get("attrition")
-            if raw_atr is not None:
-                try:
-                    atr_val = abs(float(raw_atr))
-                except (TypeError, ValueError):
-                    atr_val = 0.0
-            else:
-                try:
-                    atr_val = abs(float(p.get("ATTRITION_PIPELINE") or 0))
-                except (TypeError, ValueError):
-                    atr_val = 0.0
-
-            if product_ari == "High":
-                emoji = ":red_circle:"
-            elif product_ari == "Medium":
-                emoji = ":large_yellow_circle:"
-            elif product_ari == "Low":
-                emoji = ":large_green_circle:"
-            else:
-                emoji = ":white_circle:"
-
-            product_lines.append(
-                f"{emoji} *{product_name}*: {product_ari} (${atr_val:,.0f}) — {product_reason}"
-            )
-
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "*:bar_chart: Product Breakdown:*\n" + "\n".join(product_lines),
-            },
-        })
-
-    if red_account:
-        stage = red_account.get("Stage__c", "Unknown")
-        days_red = red_account.get("Days_Red__c", "N/A")
-        latest = (red_account.get("Latest_Updates__c") or "")[:100]
-        hist = " _(historical)_" if red_account.get("_historical") else ""
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*:red_circle: Red Account Status:*{hist}\n"
-                    f"{stage} ({days_red} days)\n_{latest}_"
-                ),
-            },
+            "text": {"type": "mrkdwn", "text": f"*:dart: Recommended Actions*\n{recommendation}"},
         })
 
     blocks.append({"type": "divider"})
@@ -275,7 +436,7 @@ def build_account_brief_blocks(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:bulb: TL;DR:*\n_{tldr}_",
+                "text": f"*:bulb: Executive Summary*\n_{tldr}_",
             },
         })
 
@@ -286,7 +447,11 @@ def build_account_brief_blocks(
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "🔗 View in Salesforce", "emoji": True},
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🔗 View in Salesforce",
+                        "emoji": True,
+                    },
                     "url": sf_url,
                     "style": "primary",
                 }
@@ -346,6 +511,176 @@ def build_canvas_row(
         "risk_details": _sanitize_cell(risk_notes),
         "recommendation": _sanitize_cell(recommendation),
     }
+
+
+def build_gm_review_canvas_markdown(
+    reviews: list,
+    cloud: str = "Commerce Cloud",
+    filter_label: str = "",
+    today: Optional[str] = None,
+) -> str:
+    """
+    GM Review: single wide At-Risk Renewals table (13 columns), links, summary.
+    """
+    if not today:
+        today = date.today().strftime("%A, %B %d, %Y")
+
+    if not filter_label:
+        filter_label = f"{cloud} - Q2 FY2027"
+
+    if not reviews:
+        return "\n".join(
+            [
+                f"# {cloud} — GM Review",
+                f"### {today}",
+                "",
+                "_No accounts._",
+            ]
+        )
+
+    lines = [
+        f"# {cloud} — GM Review",
+        f"### {today}",
+        "",
+        "---",
+        "",
+        "## At-Risk Renewals",
+        "",
+        "| ACCOUNT | ARI | CC AOV | ATR | For. Attrition | GMV Rate | Util Rate | Close Date | Territory | SF Products | Notes | Risk Analysis | Recommendation |",
+        "|---------|-----|--------|-----|----------------|----------|-----------|------------|-----------|-------------|-------|---------------|----------------|",
+    ]
+
+    total_aov = 0.0
+    total_atr = 0.0
+
+    for review in reviews:
+        account_name = review.get("account_name", "Unknown")
+        account_id = review.get("account_id", "")
+        opp = review.get("opp") or {}
+        display = review.get("snowflake_display") or {}
+        red = review.get("red_account")
+        enrichment = review.get("enrichment") or {}
+        product_attrition = review.get("product_attrition") or []
+        risk_notes = review.get("risk_notes", "")
+        recommendation = review.get("recommendation", "")
+
+        sf_url = f"https://org62.my.salesforce.com/{account_id}"
+        account_link = f"[{account_name}]({sf_url})"
+
+        ari_cat = display.get("ari_category", "Unknown")
+        ari_prob = display.get("ari_probability", "N/A")
+        ari_cell = f"{ari_cat} ({ari_prob})"
+
+        renewal_aov = float(
+            enrichment.get("renewal_aov", {}).get("renewal_aov", 0) or 0
+        )
+        cc_aov_cell = f"${renewal_aov:,.0f}" if renewal_aov > 0 else "Unknown"
+        total_aov += renewal_aov
+
+        renewal_atr = float(
+            enrichment.get("renewal_aov", {}).get("renewal_atr", 0) or 0
+        )
+        atr_cell = fmt_amount(renewal_atr) if renewal_atr > 0 else "N/A"
+
+        forecasted_atr = abs(float(opp.get("Forecasted_Attrition__c", 0) or 0))
+        for_atr_cell = f"$-{forecasted_atr:,.0f}" if forecasted_atr > 0 else "N/A"
+        total_atr += forecasted_atr
+
+        gmv_rate = display.get("gmv_rate", "Unknown")
+        util_rate = display.get("utilization_rate", "N/A")
+        close_date = opp.get("CloseDate", "N/A")
+
+        territory = (
+            str(enrichment.get("renewal_aov", {}).get("csg_geo", "") or "").strip()
+            or (str(red.get("CSG_GEO__c", "") or "").strip() if red else "")
+            or "N/A"
+        )
+
+        all_prods = review.get("all_products_attrition") or []
+        sf_products = get_sf_products_display(all_prods)
+
+        notes_parts = []
+        specialist = (opp.get("Specialist_Sales_Notes__c") or "") if opp else ""
+        description = (opp.get("Description") or "") if opp else ""
+        notes_text = specialist or description
+        if notes_text:
+            notes_parts.append(notes_text)
+
+        if red:
+            latest = red.get("Latest_Updates__c") or ""
+            if latest:
+                notes_parts.append(f"Red Account: {clean_html(latest)}")
+
+        notes_cell = " · ".join(notes_parts) if notes_parts else "N/A"
+        notes_cell = notes_cell.replace("|", "-")
+
+        if risk_notes:
+            bullets = [
+                line.strip().lstrip("- ").strip()
+                for line in risk_notes.split("\n")
+                if line.strip().startswith("-")
+            ][:2]
+            risk_cell = (
+                " · - ".join(b[:80] for b in bullets)
+                if bullets
+                else risk_notes[:120]
+            )
+        else:
+            risk_cell = "N/A"
+        risk_cell = risk_cell.replace("|", "-")
+
+        if recommendation:
+            bullets = [
+                line.strip().lstrip("- ").strip()
+                for line in recommendation.split("\n")
+                if line.strip().startswith("-")
+            ][:2]
+            rec_cell = (
+                " · - ".join(b[:80] for b in bullets)
+                if bullets
+                else recommendation[:120]
+            )
+        else:
+            rec_cell = "N/A"
+        rec_cell = rec_cell.replace("|", "-")
+
+        lines.append(
+            f"| {account_link} | {ari_cell} | {cc_aov_cell} | {atr_cell} "
+            f"| {for_atr_cell} | {gmv_rate} | {util_rate} | {close_date} "
+            f"| {territory} | {sf_products} | {notes_cell} "
+            f"| {risk_cell} | {rec_cell} |"
+        )
+
+    lines += ["", "---", ""]
+
+    lines += [
+        "## Account Links",
+        "",
+    ]
+    for review in reviews:
+        an = review.get("account_name", "Unknown")
+        aid = review.get("account_id", "")
+        url = f"https://org62.my.salesforce.com/{aid}"
+        lines.append(f"- [{an}]({url})")
+
+    lines += ["", "---", ""]
+
+    lines += [
+        "## Summary",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| **Cloud** | {cloud} |",
+        f"| **Filter** | {filter_label} |",
+        f"| **Accounts Reviewed** | {len(reviews)} |",
+        f"| **Total CC AOV** | {fmt_amount(total_aov)} |",
+        f"| **Total Forecasted Attrition** | ${total_atr:,.0f} |",
+        f"| **Generated** | {today} |",
+        "",
+        "_Data: Salesforce org62 · Snowflake ARI · GMV Sheet · Claude AI_",
+    ]
+
+    return "\n".join(lines)
 
 
 def build_gm_review_canvas(
@@ -458,7 +793,13 @@ class CanvasBuilder:
             )
 
         acc = account_data.get("salesforce", {}).get("account") or {}
-        title = acc.get("Name") or account_data.get("account_id") or "Account"
+        title = (
+            account_data.get("account_name")
+            or acc.get("Name")
+            or account_data.get("account_id")
+            or "Account"
+        )
+        title = " ".join(str(title).split())
         parts = [
             f"# GM Review — {_sanitize_cell(str(title))}",
             f"### {today}",

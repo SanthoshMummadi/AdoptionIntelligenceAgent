@@ -1,127 +1,284 @@
 """
-Batched Google Sheets export for GM reviews (service account).
+domain/integrations/gsheet_exporter.py
+Google Sheets export — batched 22-column write.
 """
+import json
 import os
-from typing import Any
+import traceback
+from datetime import date, datetime
+from pathlib import Path
 
 import gspread
+from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 
-_SCOPES = (
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(_REPO_ROOT / ".env")
+load_dotenv()
+
+# Prefer reading sheet ID inside export_to_gsheet() so runtime env/.env matches Slack (not import-time only).
+def _gsheet_id() -> str:
+    return (os.getenv("GSHEET_ID") or os.getenv("GOOGLE_SHEET_ID") or "").strip()
+
+
+GSHEET_ID = _gsheet_id()  # convenience for debug scripts; may be stale until re-import
+
+_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
-)
+]
+
+HEADERS_22 = [
+    "Account",
+    "OU",
+    "CC AOV",
+    "ATR",
+    "Forecasted Attrition",
+    "Util Rate",
+    "Attrition Risk Reasons",
+    "Red AC Flag",
+    "Renewal Month",
+    "Attrition Predictor",
+    "Customer Success Score",
+    "Adoption POV",
+    "Health",
+    "SF Products",
+    "Risk Assessment",
+    "Next Key Action",
+    "AE",
+    "Renewal Manager",
+    "CSM",
+    "Attrition Slack Channel",
+    "Latest Commentary",
+    "Exported At",
+]
 
 
-def _credentials_path() -> str:
-    env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv("GSPREAD_CREDENTIALS")
-    if env:
-        return env
-    root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    for name in ("credentials.json", "google_creds.json"):
-        path = os.path.join(root, name)
-        if os.path.isfile(path):
-            return path
-    return os.path.join(root, "credentials.json")
+def _safe_cell(value) -> str:
+    """Convert any value to a safe string for Google Sheets."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return str(
+            value.get("narrative")
+            or value.get("cc_aov")
+            or value.get("utilization_rate")
+            or ""
+        )
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value if v)
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    return str(value).strip()
 
 
-def _hyperlink_formula(url: str, label: str) -> str:
-    u = str(url).replace('"', '""')
-    lab = str(label).replace('"', '""')
-    return f'=HYPERLINK("{u}", "{lab}")'
+def get_google_creds():
+    """Google credentials from env (JSON string) or project-root service account files."""
+    creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv(
+        "GSPREAD_CREDENTIALS"
+    )
+    if creds_json and creds_json.strip().startswith("{"):
+        try:
+            info = json.loads(creds_json)
+            return Credentials.from_service_account_info(info, scopes=_SCOPES)
+        except Exception:
+            pass
+
+    root = str(_REPO_ROOT)
+    for fname in ("credentials.json", "google_creds.json"):
+        fpath = os.path.join(root, fname)
+        if os.path.isfile(fpath):
+            return Credentials.from_service_account_file(fpath, scopes=_SCOPES)
+
+    raise FileNotFoundError(
+        "No Google credentials found. Set GOOGLE_SERVICE_ACCOUNT_JSON (JSON body) "
+        "or place credentials.json in the project root."
+    )
 
 
-def export_to_gsheet(reviews: list, sheet_url: str) -> int:
+def export_to_gsheet(reviews: list, sheet_name: str | None = None) -> str:
     """
-    Append GM review rows in one batched request (USER_ENTERED so HYPERLINK formulas work).
-
-    Args:
-        reviews: List of dicts with keys account, opp, snowflake_display, red_account,
-            risk_notes, recommendation.
-        sheet_url: Full spreadsheet URL or spreadsheet ID.
+    Export GM reviews to Google Sheets — batched 22-column append.
 
     Returns:
-        Number of rows appended.
+        Sheet URL, or "" on skip/failure.
     """
-    path = _credentials_path()
-    creds = Credentials.from_service_account_file(path, scopes=list(_SCOPES))
-    client = gspread.authorize(creds)
+    from domain.analytics.snowflake_client import fmt_amount, get_sf_products_display
+    from domain.salesforce.org62_client import get_account_team
 
-    if sheet_url.startswith("http"):
-        sheet = client.open_by_url(sheet_url)
-    else:
-        sheet = client.open_by_key(sheet_url.strip())
+    sheet_id = _gsheet_id()
+    if not sheet_id:
+        print(
+            "⚠️ GSHEET_ID / GOOGLE_SHEET_ID not set — skipping Google Sheets export "
+            "(set in .env and restart the bot if you just added it)."
+        )
+        return ""
 
-    worksheet = sheet.get_worksheet(0)
+    sheet_name = sheet_name or date.today().strftime("GM Review %Y-%m-%d")
 
-    headers = [
-        "Account Name",
-        "Account ID",
-        "Opportunity ID",
-        "Opportunity Name",
-        "ARI Category",
-        "ARI Probability",
-        "ARI Reason",
-        "Health Score",
-        "Health Literal",
-        "Cloud AOV",
-        "Utilization Rate",
-        "GMV Rate",
-        "Forecasted Attrition",
-        "Close Date",
-        "Stage",
-        "Risk Assessment",
-        "Recommendations",
-        "Product Breakdown",
-        "Red Account Stage",
-        "Days Red",
-        "Region",
-        "Salesforce Link",
-    ]
+    try:
+        creds = get_google_creds()
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(sheet_id)
 
-    existing = worksheet.row_values(1)
-    if not existing or len(existing) < len(headers):
-        worksheet.update("A1:V1", [headers], value_input_option="USER_ENTERED")
+        try:
+            ws = sh.worksheet("Commerce Cloud GM Review")
+        except Exception:
+            try:
+                ws = sh.worksheet(sheet_name)
+            except Exception:
+                ws = sh.add_worksheet(title=sheet_name, rows=500, cols=25)
 
-    all_rows: list[list[Any]] = []
+        existing_row1: list = []
+        try:
+            existing_row1 = ws.row_values(1)
+        except Exception:
+            pass
 
-    for review in reviews:
-        acct = review.get("account") or {}
-        opp = review.get("opp") or {}
-        snow = review.get("snowflake_display") or {}
-        red = review.get("red_account") or {}
+        if existing_row1 != HEADERS_22:
+            if not existing_row1:
+                ws.append_row(
+                    HEADERS_22, value_input_option="USER_ENTERED"
+                )
+                print("✓ Headers written to sheet")
+            else:
+                ws.insert_row(
+                    HEADERS_22,
+                    index=1,
+                    value_input_option="USER_ENTERED",
+                    inherit_from_before=False,
+                )
+                print("✓ Headers inserted at row 1")
+        else:
+            print("✓ Headers already correct")
 
-        account_name = acct.get("name", "Unknown")
-        account_id = acct.get("id", "")
-        sf_link = f"https://org62.my.salesforce.com/{account_id}"
+        exported_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        all_rows: list[list] = []
 
-        row = [
-            _hyperlink_formula(sf_link, account_name),
-            account_id,
-            opp.get("Id", ""),
-            opp.get("Name", ""),
-            snow.get("ari_category", "Unknown"),
-            snow.get("ari_probability", "N/A"),
-            snow.get("ari_reason", "N/A"),
-            snow.get("health_score", ""),
-            snow.get("health_literal", "Unknown"),
-            snow.get("cc_aov", "Unknown"),
-            snow.get("utilization_rate", "N/A"),
-            snow.get("gmv_rate", "N/A"),
-            abs(opp.get("Forecasted_Attrition__c") or 0),
-            opp.get("CloseDate", ""),
-            opp.get("StageName", ""),
-            (review.get("risk_notes", "") or "")[:100],
-            (review.get("recommendation", "") or "")[:100],
-            "",
-            red.get("Stage__c", "") if red else "",
-            red.get("Days_Red__c", "") if red else "",
-            acct.get("billing_country", ""),
-            sf_link,
-        ]
-        all_rows.append(row)
+        for review in reviews:
+            account_name = review.get("account_name", "Unknown")
+            account_id = review.get("account_id", "")
+            opp = review.get("opp") or {}
+            display = review.get("snowflake_display") or {}
+            enrichment = review.get("enrichment") or {}
+            red = review.get("red_account")
+            all_prods = review.get("all_products_attrition") or []
+            recommendation = review.get("recommendation", "")
+            adoption_pov = review.get("adoption_pov") or ""
+            if not adoption_pov or isinstance(adoption_pov, dict):
+                adoption_pov = ""
+            adoption_pov = str(adoption_pov).strip()
 
-    if all_rows:
-        worksheet.append_rows(all_rows, value_input_option="USER_ENTERED")
+            ari_cat = display.get("ari_category", "Unknown")
+            ari_prob = display.get("ari_probability", "N/A")
+            ou = f"{ari_cat} ({ari_prob})"
 
-    return len(all_rows)
+            renewal_aov = float(
+                enrichment.get("renewal_aov", {}).get("renewal_aov", 0) or 0
+            )
+            cc_aov = fmt_amount(renewal_aov) if renewal_aov > 0 else "Unknown"
+
+            renewal_atr = float(
+                enrichment.get("renewal_aov", {}).get("renewal_atr", 0) or 0
+            )
+            atr = fmt_amount(renewal_atr) if renewal_atr > 0 else "N/A"
+
+            forecasted_atr = abs(float(opp.get("Forecasted_Attrition__c", 0) or 0))
+            for_attrition = fmt_amount(forecasted_atr) if forecasted_atr > 0 else "N/A"
+
+            util_rate = display.get("utilization_rate", "N/A")
+
+            risk_reason = opp.get("License_At_Risk_Reason__c", "") or ""
+            acv_reason = opp.get("ACV_Reason_Detail__c", "") or ""
+            risk_reasons = risk_reason
+            if acv_reason and acv_reason != risk_reason:
+                risk_reasons = f"{risk_reasons} | {acv_reason}" if risk_reasons else acv_reason
+
+            red_flag = "No"
+            if red:
+                red_stage = red.get("Stage__c", "")
+                days_red = red.get("Days_Red__c", "")
+                red_flag = f"Yes - {red_stage} ({days_red} days)"
+
+            close_date = opp.get("CloseDate", "") or ""
+            renewal_month = close_date[:7] if close_date else "N/A"
+
+            ari_reason = display.get("ari_reason", "N/A")
+            attrition_pred = f"{ari_cat} ({ari_prob}) - {ari_reason}"
+
+            health_score = display.get("health_score", "Unknown")
+            health_literal = display.get("health_literal", "")
+            if health_literal:
+                css_score = f"{health_score} ({health_literal})"
+            else:
+                css_score = str(health_score)
+
+            health_display = display.get("health_display", "Unknown")
+            sf_products = get_sf_products_display(all_prods)
+            risk_assessment = recommendation
+
+            next_step = opp.get("NextStep", "") or ""
+
+            try:
+                team = get_account_team(account_id) or {}
+            except Exception:
+                team = {}
+
+            ae = team.get("ae", "") or ""
+            renewal_mgr = team.get("renewal_mgr", "") or ""
+            csm = team.get("csm", "") or ""
+
+            slack_channel = ""
+
+            specialist_notes = opp.get("Specialist_Sales_Notes__c", "") or ""
+            description = opp.get("Description", "") or ""
+            latest_update = ""
+            if red:
+                latest_update = red.get("Latest_Updates__c", "") or ""
+            latest_commentary = specialist_notes or description or latest_update
+
+            sf_url = f"https://org62.my.salesforce.com/{account_id}"
+            account_name_escaped = str(account_name).replace('"', '""')
+            acct_cell = f'=HYPERLINK("{sf_url}","{account_name_escaped}")'
+
+            all_rows.append(
+                [
+                    _safe_cell(acct_cell),
+                    _safe_cell(ou),
+                    _safe_cell(cc_aov),
+                    _safe_cell(atr),
+                    _safe_cell(for_attrition),
+                    _safe_cell(util_rate),
+                    _safe_cell(risk_reasons),
+                    _safe_cell(red_flag),
+                    _safe_cell(renewal_month),
+                    _safe_cell(attrition_pred),
+                    _safe_cell(css_score),
+                    _safe_cell(adoption_pov),
+                    _safe_cell(health_display),
+                    _safe_cell(sf_products),
+                    _safe_cell(risk_assessment),
+                    _safe_cell(next_step),
+                    _safe_cell(ae),
+                    _safe_cell(renewal_mgr),
+                    _safe_cell(csm),
+                    _safe_cell(slack_channel),
+                    _safe_cell(latest_commentary),
+                    _safe_cell(exported_at),
+                ]
+            )
+
+        if all_rows:
+            ws.append_rows(all_rows, value_input_option="USER_ENTERED")
+            print(f"✓ Exported {len(all_rows)} rows to Google Sheets (batched)")
+
+        sheet_url = (
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={ws.id}"
+        )
+        return sheet_url
+
+    except Exception as e:
+        msg = str(e).strip() or repr(e)
+        print(f"❌ Google Sheets export error: {msg[:500]}")
+        traceback.print_exc()
+        return ""

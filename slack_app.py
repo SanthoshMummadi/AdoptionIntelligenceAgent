@@ -774,6 +774,7 @@ ALWAYS_UPPER_ATTRITION = {
 
 def smart_title_case(name: str) -> str:
     """Title-case account names; keep common acronyms uppercased (legacy /attrition-risk)."""
+    name = " ".join(str(name or "").split())
 
     def cap_word(w: str) -> str:
         return w.upper() if w.lower() in ALWAYS_UPPER_ATTRITION else w.capitalize()
@@ -1017,7 +1018,9 @@ def attrition_risk_cmd(ack, say, command, client):
                     opp = result["records"][0]
                     acct_data = opp.get("Account") or {}
                     account_id = acct_data.get("Id", "")
-                    account_name = acct_data.get("Name", "Unknown")
+                    account_name = " ".join(
+                        str(acct_data.get("Name", "Unknown") or "").split()
+                    )
 
                     if not account_id:
                         say(":x: Opportunity has no linked account.")
@@ -1063,7 +1066,7 @@ def attrition_risk_cmd(ack, say, command, client):
 
             # Common flow
             account_id = acct["id"]
-            account_name = acct["name"]
+            account_name = " ".join(str(acct.get("name") or "").split())
 
             # Fetch opp
             if acct.get("opp"):
@@ -1189,7 +1192,7 @@ def attrition_clouds(ack, say):
 def gm_review_canvas(ack, say, command, client):
     """
     Generate GM Review canvas for at-risk renewals.
-    Usage: /gm-review-canvas Account1, Account2, 006xxxxx
+    Usage: optional cloud as first comma-separated token, then accounts or opp IDs.
     """
     ack()
 
@@ -1198,77 +1201,146 @@ def gm_review_canvas(ack, say, command, client):
     if not text:
         say(
             ":warning: *Usage:*\n"
-            "`/gm-review-canvas <Account Names or Opp IDs>`\n\n"
+            "`/gm-review-canvas <Account Names or Opp IDs>`\n"
+            "`/gm-review-canvas Commerce Cloud, Acme Corp, Wayne Enterprises`\n"
+            "`/gm-review-canvas B2C Commerce, Adidas AG, Oxford Industries`\n\n"
             "*Examples:*\n"
-            "- `/gm-review-canvas Acme Corp, Wayne Enterprises`\n"
-            "- `/gm-review-canvas 006XXXXXXXXXXXX`\n"
-            "- `/gm-review-canvas Commerce Cloud, Acme Corp`\n\n"
-            ":bulb: Tip: You can mix account names and opportunity IDs!"
+            "- `/gm-review-canvas Adidas AG, Oxford Industries`\n"
+            "- `/gm-review-canvas Commerce Cloud, Adidas AG, Oxford Industries`\n"
+            "- `/gm-review-canvas 006XXXXXXXXXXXX`\n\n"
+            ":bulb: Tip: Cloud name is optional; it defaults to *Commerce Cloud*."
         )
         return
 
-    inputs = [item.strip() for item in text.split(",") if item.strip()]
+    from filter_parser import CLOUD_KEYWORDS, parse_filters
+
+    filters = parse_filters(text)
+    detected_cloud = filters.get("cloud", "Commerce Cloud")
+
+    cloud_lower = {kw.lower() for kw in CLOUD_KEYWORDS}
+    raw_parts = [p.strip() for p in text.split(",") if p.strip()]
+    inputs = []
+    for part in raw_parts:
+        if part.lower() in cloud_lower:
+            continue
+        inputs.append(part)
+
+    if not inputs:
+        say(
+            ":warning: No accounts found in that command.\n"
+            f"Detected cloud: *{detected_cloud}*\n"
+            "Add account names or opportunity IDs after the cloud (or omit the cloud to use defaults)."
+        )
+        return
 
     say(
-        f":hourglass_flowing_sand: Generating GM reviews for {len(inputs)} account(s)...\n"
-        "_This may take 30-60 seconds..._"
+        f":hourglass_flowing_sand: Generating GM reviews for *{len(inputs)}* account(s) "
+        f"in *{detected_cloud}*…\n"
+        "_This may take 30–60 seconds._"
     )
 
     def process():
         try:
-            from adapters.canvas_adapter import CanvasAdapter
-            from adapters.salesforce_adapter import SalesforceAdapter
-            from adapters.snowflake_adapter import SnowflakeAdapter
-            from domain.intelligence.risk_engine import RiskEngine
-            from services.parallel_gm_review_workflow import ParallelGMReviewWorkflow
+            from datetime import date as date_type
 
-            sf_token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
-            sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv(
-                "SALESFORCE_INSTANCE_URL"
-            )
+            from domain.content.canvas_builder import create_canvas
+            from domain.integrations.gsheet_exporter import export_to_gsheet
+            from services.gm_review_workflow import GMReviewWorkflow
 
-            workflow = ParallelGMReviewWorkflow(
-                salesforce_adapter=SalesforceAdapter(sf_token, sf_instance),
-                snowflake_adapter=SnowflakeAdapter(),
-                canvas_adapter=CanvasAdapter(),
-                risk_engine=RiskEngine(call_llm_fn=server.call_llm_gateway),
+            workflow = GMReviewWorkflow(
+                call_llm_fn=server.call_llm_gateway,
                 max_concurrent=5,
             )
 
-            reviews = workflow.run(inputs)
+            today_hdr = date_type.today().strftime("%A, %B %d, %Y")
+            q = filters.get("quarter") or "Q2"
+            fy = filters.get("fy") or "FY2027"
+            filter_label = f"{detected_cloud} - {q} {fy}"
 
-            if not reviews:
+            out = workflow.run(
+                inputs,
+                cloud=detected_cloud,
+                filter_label=filter_label,
+                today=today_hdr,
+            )
+            reviews = out.get("reviews") or []
+            combined_canvas = (out.get("combined_canvas") or "").strip()
+
+            if not reviews or not combined_canvas:
                 say(
-                    ":x: No reviews generated. Please check account names/IDs and try again."
+                    ":x: No reviews generated. Check account names or IDs and try again."
                 )
                 return
 
-            for review in reviews:
-                canvas_content = review.get("canvas_content", "")
-                account_name = review.get("account_name", "Unknown")
+            user_id = command.get("user_id") or ""
+            title = f"{detected_cloud} GM Review — {today_hdr}"
+            canvas_url = create_canvas(
+                client, title=title, markdown=combined_canvas, user_id=user_id
+            )
 
-                if canvas_content:
+            if canvas_url:
+                say(
+                    f":white_check_mark: *GM Review canvas created!* {len(reviews)} account(s) | "
+                    f"{detected_cloud}\n"
+                    f":memo: <{canvas_url}|View Canvas>"
+                )
+            else:
+                say(
+                    text=(
+                        f":white_check_mark: Generated {len(reviews)} GM review(s) "
+                        f"for {detected_cloud}."
+                    ),
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": combined_canvas[:3000],
+                            },
+                        }
+                    ],
+                )
+
+            try:
+                gsheet_env = os.getenv("GSHEET_ID") or os.getenv("GOOGLE_SHEET_ID")
+                print(
+                    f"[gm-review-canvas] Sheets export start: "
+                    f"{len(reviews)} review(s), GSHEET_ID={'set' if gsheet_env else 'MISSING'}"
+                )
+                sheet_name = date_type.today().strftime("GM Review %Y-%m-%d")
+                sheet_url = export_to_gsheet(reviews, sheet_name=sheet_name)
+                if sheet_url:
+                    print(f"[gm-review-canvas] Sheets export OK: {sheet_url[:80]}...")
                     say(
-                        text=f":white_check_mark: GM Review: {account_name}",
-                        blocks=[
-                            {
-                                "type": "header",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": f"GM Review: {account_name}",
-                                },
-                            },
-                            {
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": canvas_content[:3000],
-                                },
-                            },
-                        ],
+                        f":bar_chart: *Exported to Google Sheets!*\n"
+                        f"<{sheet_url}|View Sheet>"
                     )
+                elif not gsheet_env:
+                    print("[gm-review-canvas] Sheets skipped: GSHEET_ID / GOOGLE_SHEET_ID not set")
+                    say(
+                        ":warning: Google Sheets export skipped "
+                        "(`GSHEET_ID` / `GOOGLE_SHEET_ID` not set)."
+                    )
+                else:
+                    print(
+                        "[gm-review-canvas] Sheets export returned empty URL — "
+                        "see gsheet_exporter logs above (often 403: share sheet with service account; "
+                        "or restart the bot after adding GSHEET_ID to .env)."
+                    )
+                    say(
+                        ":warning: Canvas created, but Google Sheets export did not return a link. "
+                        "Check the bot console for `❌ Google Sheets export` / tracebacks; share the "
+                        "spreadsheet with the service account from `./venv/bin/python get_sa_email.py`; "
+                        "if you just added `GSHEET_ID`, restart `slack_app.py`."
+                    )
+            except Exception as ex_sheet:
+                print(f"[gm-review-canvas] ❌ Sheets export error: {ex_sheet!r}")
+                import traceback as _tb
 
-            say(f":white_check_mark: Generated {len(reviews)} GM review(s)!")
+                _tb.print_exc()
+                say(
+                    f":warning: Canvas posted but Google Sheets export failed: {str(ex_sheet)[:200]}"
+                )
 
         except Exception as e:
             say(f":x: Error generating GM reviews: {str(e)}")
@@ -1418,7 +1490,9 @@ def at_risk_canvas(ack, say, command, client):
                     if risk_class == "High"
                     else ":large_orange_circle:"
                 )
-                display_name = account_name or f"Account {aid}"
+                display_name = (
+                    " ".join(str(account_name or "").split()) or f"Account {aid}"
+                )
 
                 result += f"{emoji} *<{sf_account_url}|{display_name}>*\n"
                 result += f"   _{product_path}_\n"
