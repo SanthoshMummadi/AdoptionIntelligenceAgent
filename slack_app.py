@@ -1098,8 +1098,14 @@ def at_risk_canvas(ack, say, command, client):
             if any(kw.lower() in text_lower for kw in CLOUD_KEYWORDS):
                 filters = parse_filters(text)
                 cloud = filters.get("cloud", "Commerce Cloud")
-                esc = cloud.replace("'", "''")
-                where_clauses.append(f"AND APM_LVL_2 = '{esc}'")
+                cloud_safe = cloud.replace("'", "''")
+                where_clauses.append(
+                    f"AND ("
+                    f"APM_LVL_1 LIKE '%{cloud_safe}%' OR "
+                    f"APM_LVL_2 LIKE '%{cloud_safe}%' OR "
+                    f"APM_LVL_3 LIKE '%{cloud_safe}%'"
+                    f")"
+                )
 
             if any(
                 threshold in text_lower
@@ -1118,7 +1124,9 @@ def at_risk_canvas(ack, say, command, client):
             query = f"""
                 SELECT DISTINCT
                     ACCOUNT_ID,
-                    APM_LVL_2 as PRODUCT,
+                    APM_LVL_1,
+                    APM_LVL_2,
+                    APM_LVL_3,
                     ATTRITION_PROBA as SCORE,
                     ATTRITION_PROBA_CATEGORY as RISK_CLASS
                 FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
@@ -1165,10 +1173,28 @@ def at_risk_canvas(ack, say, command, client):
                 print(f"Could not fetch account names: {e}")
 
             for row in top:
-                account_id, product, score, risk_class = row
+                (
+                    account_id,
+                    apm_l1,
+                    apm_l2,
+                    apm_l3,
+                    score,
+                    risk_class,
+                ) = row
                 aid = str(account_id).strip()
                 account_name = account_names.get(aid) or account_names.get(
                     aid[:15], f"Account {aid}"
+                )
+
+                segments: list[str] = []
+                for v in (apm_l1, apm_l2, apm_l3):
+                    if v is None or v == "":
+                        continue
+                    sv = str(v)
+                    if not segments or sv != segments[-1]:
+                        segments.append(sv)
+                product_path = (
+                    " > ".join(segments) if segments else "(no product path)"
                 )
 
                 emoji = (
@@ -1176,10 +1202,10 @@ def at_risk_canvas(ack, say, command, client):
                     if risk_class == "High"
                     else ":large_orange_circle:"
                 )
-                result += f"{emoji} *{account_name}* ({product})\n"
-                result += (
-                    f"   Score: {score:.3f} | Risk: {risk_class} | `{aid}`\n\n"
-                )
+                sf_url = f"https://org62.my.salesforce.com/{aid}"
+                result += f"{emoji} *<{sf_url}|{account_name}>*\n"
+                result += f"   {product_path}\n"
+                result += f"   Score: {score:.3f} | Risk: {risk_class}\n\n"
 
             if len(rows) > 20:
                 result += f"\n_...and {len(rows) - 20} more accounts_"
