@@ -3,6 +3,8 @@ snowflake_client.py
 Snowflake analytics client for Commerce Cloud data.
 """
 import os
+from typing import Any, Optional
+
 import snowflake.connector
 from log_utils import log_debug, log_error
 
@@ -10,29 +12,35 @@ _snowflake_conn = None
 
 
 def get_snowflake_connection():
-    """Get or create Snowflake connection."""
+    """Get or create Snowflake connection (browser SSO via externalbrowser)."""
     global _snowflake_conn
 
     if _snowflake_conn is None:
-        account = os.environ.get("SNOWFLAKE_ACCOUNT")
-        user = os.environ.get("SNOWFLAKE_USER")
-        password = os.environ.get("SNOWFLAKE_PASSWORD")
-        warehouse = os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+        user = os.getenv("SNOWFLAKE_USER")
+        account = os.getenv("SNOWFLAKE_ACCOUNT")
+        warehouse = os.getenv("SNOWFLAKE_WAREHOUSE") or "COMPUTE_WH"
+        database = os.getenv("SNOWFLAKE_DATABASE")
+        schema = os.getenv("SNOWFLAKE_SCHEMA")
+        role = os.getenv("SNOWFLAKE_ROLE")
 
-        if not all([account, user]):
-            raise Exception("Missing Snowflake credentials in .env")
+        if not account or not user:
+            raise Exception("Missing SNOWFLAKE_ACCOUNT or SNOWFLAKE_USER in .env")
 
-        connect_kwargs = {
-            "account": account,
+        # Triggers browser SSO on first connect (run scripts from a machine with a display / browser).
+        conn_params = {
             "user": user,
+            "account": account,
+            "authenticator": "externalbrowser",
             "warehouse": warehouse,
         }
-        if password:
-            connect_kwargs["password"] = password
-        else:
-            connect_kwargs["authenticator"] = "externalbrowser"
+        if database:
+            conn_params["database"] = database
+        if schema:
+            conn_params["schema"] = schema
+        if role:
+            conn_params["role"] = role
 
-        _snowflake_conn = snowflake.connector.connect(**connect_kwargs)
+        _snowflake_conn = snowflake.connector.connect(**conn_params)
         log_debug("✅ Connected to Snowflake")
 
     return _snowflake_conn
@@ -313,3 +321,171 @@ def get_account_attrition(account_id: str, cloud: str = "Commerce Cloud") -> lis
         return []
     finally:
         cursor.close()
+
+
+def _escape_sf_id(account_id: str) -> str:
+    """Sanitize account id for SQL string literals."""
+    return str(account_id).replace("'", "")
+
+
+class SnowflakeClient:
+    """OOP wrapper over a dedicated Snowflake connection (for adapters / tests)."""
+
+    def __init__(
+        self,
+        account: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        warehouse: Optional[str] = None,
+        database: Optional[str] = None,
+        schema: Optional[str] = None,
+        role: Optional[str] = None,
+        authenticator: Optional[str] = None,
+    ):
+        self._conn: Any = None
+        self._account = account or os.getenv("SNOWFLAKE_ACCOUNT")
+        self._user = user or os.getenv("SNOWFLAKE_USER")
+        self._password = password if password is not None else os.getenv("SNOWFLAKE_PASSWORD")
+        self._warehouse = warehouse or os.getenv("SNOWFLAKE_WAREHOUSE") or "COMPUTE_WH"
+        self._database = database if database is not None else os.getenv("SNOWFLAKE_DATABASE")
+        self._schema = schema if schema is not None else os.getenv("SNOWFLAKE_SCHEMA")
+        self._role = role if role is not None else os.getenv("SNOWFLAKE_ROLE")
+        self._authenticator = (
+            authenticator if authenticator is not None else os.getenv("SNOWFLAKE_AUTHENTICATOR")
+        )
+
+        if not self._account or not self._user:
+            raise ValueError("SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER are required")
+
+        conn_params: dict[str, Any] = {
+            "account": self._account,
+            "user": self._user,
+            "warehouse": self._warehouse,
+        }
+        if self._database:
+            conn_params["database"] = self._database
+        if self._schema:
+            conn_params["schema"] = self._schema
+        if self._role:
+            conn_params["role"] = self._role
+
+        if self._password:
+            conn_params["password"] = self._password
+        else:
+            conn_params["authenticator"] = self._authenticator or "externalbrowser"
+
+        self._conn = snowflake.connector.connect(**conn_params)
+        log_debug("✅ SnowflakeClient connected")
+
+    def _cursor(self):
+        return self._conn.cursor()
+
+    def get_account_usage(self, account_id: str) -> Optional[dict[str, Any]]:
+        """Latest ACCOUNT_METRICS row for account."""
+        aid = _escape_sf_id(account_id)
+        cursor = self._cursor()
+        try:
+            query = f"""
+            SELECT
+                UTILIZATION_RATE,
+                GMV_RATE,
+                BURN_RATE,
+                CC_AOV,
+                TERRITORY,
+                CSG_GEO
+            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ACCOUNT_METRICS
+            WHERE SF_ACCOUNT_ID = '{aid}'
+            AND SNAPSHOT_DT = (
+                SELECT MAX(SNAPSHOT_DT)
+                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ACCOUNT_METRICS
+            )
+            LIMIT 1
+            """
+            cursor.execute(query)
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "utilization_rate": float(row[0]) if row[0] is not None else None,
+                "gmv_rate": float(row[1]) if row[1] is not None else None,
+                "burn_rate": float(row[2]) if row[2] is not None else None,
+                "cc_aov": float(row[3]) if row[3] is not None else None,
+                "territory": row[4],
+                "csg_geo": row[5],
+            }
+        except Exception as e:
+            log_error(f"SnowflakeClient.get_account_usage error: {e}")
+            return None
+        finally:
+            cursor.close()
+
+    def get_ari_score(self, account_id: str) -> Optional[float]:
+        """Top ARI probability (0–100) for account, if any."""
+        aid = _escape_sf_id(account_id)
+        cursor = self._cursor()
+        try:
+            query = f"""
+            SELECT ATTRITION_PROBABILITY * 100 AS probability
+            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            WHERE SF_ACCOUNT_ID = '{aid}'
+            AND SNAPSHOT_DT = (
+                SELECT MAX(SNAPSHOT_DT)
+                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            )
+            ORDER BY ATTRITION_PROBABILITY DESC
+            LIMIT 1
+            """
+            cursor.execute(query)
+            row = cursor.fetchone()
+            if not row or row[0] is None:
+                return None
+            return round(float(row[0]), 1)
+        except Exception as e:
+            log_error(f"SnowflakeClient.get_ari_score error: {e}")
+            return None
+        finally:
+            cursor.close()
+
+    def get_attrition_signals(self, account_id: str) -> Optional[dict[str, Any]]:
+        """Product-level attrition rows and summary for account."""
+        aid = _escape_sf_id(account_id)
+        cursor = self._cursor()
+        try:
+            query = f"""
+            SELECT
+                APM_LVL_3 AS product,
+                ABS(ATTRITION_PIPELINE) AS attrition,
+                ATTRITION_PROBA_CATEGORY AS category
+            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            WHERE SF_ACCOUNT_ID = '{aid}'
+            AND SNAPSHOT_DT = (
+                SELECT MAX(SNAPSHOT_DT)
+                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+            )
+            ORDER BY ABS(ATTRITION_PIPELINE) DESC
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            products = [
+                {
+                    "product": r[0],
+                    "attrition": float(r[1]) if r[1] is not None else 0.0,
+                    "category": r[2],
+                }
+                for r in rows
+            ]
+            return {"account_id": account_id, "products": products, "count": len(products)}
+        except Exception as e:
+            log_error(f"SnowflakeClient.get_attrition_signals error: {e}")
+            return None
+        finally:
+            cursor.close()
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception as e:
+                log_error(f"SnowflakeClient.close error: {e}")
+            finally:
+                self._conn = None

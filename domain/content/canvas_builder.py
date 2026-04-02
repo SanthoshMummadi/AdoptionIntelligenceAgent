@@ -3,6 +3,9 @@ canvas_builder.py
 Canvas builder for account briefs and GM Review canvases.
 """
 import re
+from datetime import datetime, timezone
+from typing import Any, Dict
+
 from log_utils import log_debug
 
 
@@ -378,3 +381,93 @@ _Data: Salesforce org62 · Snowflake ARI · Claude AI_
 """
 
     return canvas
+
+
+class CanvasBuilder:
+    """OO facade over canvas markdown helpers for adapters / tests."""
+
+    def build_gm_review(self, account_data: Dict[str, Any]) -> str:
+        """Build GM review markdown from a structured payload.
+
+        **Table mode:** ``cloud``, ``today``, ``rows`` (list of table row dicts),
+        optional ``region``, ``fy``, ``quarter``.
+
+        **Workflow mode:** merged bundle with ``salesforce``, ``risk_analysis``,
+        ``adoption_pov`` — renders a single-account narrative (no ``rows``).
+        """
+        today = account_data.get("today") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        rows = account_data.get("rows")
+        if rows:
+            return build_gm_review_canvas(
+                cloud=account_data.get("cloud", "Commerce Cloud"),
+                today=today,
+                rows=rows,
+                region=account_data.get("region"),
+                fy=account_data.get("fy"),
+                quarter=account_data.get("quarter"),
+            )
+
+        acc = account_data.get("salesforce", {}).get("account") or {}
+        title = acc.get("Name") or account_data.get("account_id") or "Account"
+        parts = [
+            f"# GM Review — {_sanitize_cell(str(title))}",
+            f"### {today}",
+            "",
+            "---",
+            "",
+        ]
+        if account_data.get("risk_analysis"):
+            parts.append(self.format_risk_section(account_data["risk_analysis"]))
+            parts.append("")
+        if account_data.get("adoption_pov"):
+            parts.append(self.format_adoption_section(account_data["adoption_pov"]))
+        return "\n".join(parts).rstrip() + "\n"
+
+    def format_risk_section(self, risk_data: Dict[str, Any]) -> str:
+        """Format risk analysis as markdown (brief + stats)."""
+        parts = ["## Risk", ""]
+        if risk_data.get("summary"):
+            parts.append(str(risk_data["summary"]))
+            parts.append("")
+        if risk_data.get("risk_notes"):
+            parts.append(str(risk_data["risk_notes"]))
+            parts.append("")
+        if risk_data.get("recommendation"):
+            parts.append("**Recommended actions**")
+            parts.append(str(risk_data["recommendation"]))
+            parts.append("")
+        cat = risk_data.get("ari_category") or risk_data.get("category")
+        prob = risk_data.get("ari_probability") or risk_data.get("probability")
+        if cat is not None or prob is not None:
+            parts.append(f"**ARI:** {cat or 'N/A'} ({prob if prob is not None else 'N/A'})")
+        if risk_data.get("license_at_risk_reason"):
+            parts.append(f"**License at risk:** {_sanitize_cell(str(risk_data['license_at_risk_reason']))}")
+        return "\n".join(p for p in parts if p is not None).rstrip() + "\n"
+
+    def format_adoption_section(self, adoption_data: Dict[str, Any]) -> str:
+        """Format adoption / utilization POV as markdown."""
+        lines = ["## Adoption & usage", ""]
+        util = adoption_data.get("utilization_rate")
+        gmv = adoption_data.get("gmv_rate")
+        burn = adoption_data.get("burn_rate")
+        aov = adoption_data.get("cc_aov")
+        terr = adoption_data.get("territory")
+        geo = adoption_data.get("csg_geo")
+        if util is not None:
+            lines.append(f"- **Utilization:** {util}")
+        if gmv is not None:
+            lines.append(f"- **GMV rate:** {gmv}")
+        if burn is not None:
+            lines.append(f"- **Burn rate:** {burn}")
+        if aov is not None:
+            lines.append(f"- **CC AOV:** {aov}")
+        if terr is not None:
+            lines.append(f"- **Territory:** {terr}")
+        if geo is not None:
+            lines.append(f"- **CSG geo:** {geo}")
+        if adoption_data.get("narrative"):
+            lines.append("")
+            lines.append(str(adoption_data["narrative"]))
+        if len(lines) <= 2:
+            lines.append("_No adoption metrics provided._")
+        return "\n".join(lines) + "\n"

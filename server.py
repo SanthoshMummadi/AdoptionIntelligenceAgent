@@ -5,8 +5,19 @@ import requests
 import json
 import pickle
 import urllib3
+from dotenv import load_dotenv
 
-mcp = FastMCP("Product Brief MCP")
+# Load environment variables
+load_dotenv()
+
+# Import GM Review components
+from adapters.salesforce_adapter import SalesforceAdapter
+from adapters.snowflake_adapter import SnowflakeAdapter
+from adapters.canvas_adapter import CanvasAdapter
+from domain.intelligence.risk_engine import RiskEngine
+from services.parallel_gm_review_workflow import ParallelGMReviewWorkflow
+
+mcp = FastMCP("Product Adoption MCP")
 
 # Suppress SSL warnings for internal Salesforce endpoints
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -18,6 +29,10 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 BRIEFS_FILE = os.path.join(STORAGE_DIR, "user_briefs.pkl")
 
 
+# ============================================================================
+# PERSISTENT STORAGE HELPERS
+# ============================================================================
+
 def load_data():
     """Load user briefs from disk"""
     global user_briefs
@@ -25,7 +40,7 @@ def load_data():
         try:
             with open(BRIEFS_FILE, "rb") as f:
                 user_briefs = pickle.load(f)
-            print(f"✅ Loaded {len(user_briefs)} users' briefs from disk")
+            print(f"✓ Loaded {len(user_briefs)} users' briefs from disk")
         except Exception as e:
             print(f"⚠️  Could not load briefs: {e}")
             user_briefs = {}
@@ -52,6 +67,10 @@ def get_user_briefs(user_id: str):
         user_briefs[user_id] = {}
     return user_briefs[user_id]
 
+
+# ============================================================================
+# LLM GATEWAY
+# ============================================================================
 
 def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4000):
     """Call Salesforce LLM Gateway Express"""
@@ -92,7 +111,7 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
 
         data = response.json()
         content = data["choices"][0]["message"]["content"]
-        print(f"✅ LLM Gateway response received ({len(content)} chars)")
+        print(f"✓ LLM Gateway response received ({len(content)} chars)")
         return content
 
     except requests.exceptions.RequestException as e:
@@ -107,10 +126,44 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
         raise Exception(f"LLM Gateway error: {error_msg}")
 
 
+# ============================================================================
+# GM REVIEW WORKFLOW INITIALIZATION
+# ============================================================================
+
+def init_gm_workflow() -> ParallelGMReviewWorkflow:
+    """Initialize GM Review workflow with adapters"""
+
+    # Get Salesforce credentials from environment
+    sf_token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
+    sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
+
+    if not sf_token or not sf_instance:
+        raise ValueError("Salesforce credentials not found in environment")
+
+    # Initialize adapters
+    sf_adapter = SalesforceAdapter(sf_token, sf_instance)
+    snow_adapter = SnowflakeAdapter()
+    canvas_adapter = CanvasAdapter()
+    risk_engine = RiskEngine(call_llm_fn=call_llm_gateway)
+
+    # Create workflow
+    return ParallelGMReviewWorkflow(
+        salesforce_adapter=sf_adapter,
+        snowflake_adapter=snow_adapter,
+        canvas_adapter=canvas_adapter,
+        risk_engine=risk_engine,
+        max_concurrent=5,
+    )
+
+
+# ============================================================================
+# PRODUCT BRIEF TOOLS
+# ============================================================================
+
 @mcp.tool()
 def ping() -> str:
     """Check if MCP server is alive"""
-    return "✅ Product Brief MCP with persistent storage is running!"
+    return "✓ Product Adoption MCP with persistent storage is running!"
 
 
 @mcp.tool()
@@ -119,7 +172,7 @@ def upload_brief_text(brief_name: str, content: str, user_id: str = "default") -
     briefs = get_user_briefs(user_id)
     briefs[brief_name] = content
     save_data()
-    return f"✅ Product brief '{brief_name}' uploaded successfully! ({len(content):,} characters)"
+    return f"✓ Product brief '{brief_name}' uploaded successfully! ({len(content):,} characters)"
 
 
 @mcp.tool()
@@ -136,7 +189,10 @@ def upload_brief_pdf(brief_name: str, file_path: str, user_id: str = "default") 
         briefs[brief_name] = text.strip()
         save_data()
 
-        return f"✅ PDF brief '{brief_name}' uploaded! ({len(text):,} characters extracted from {len(reader.pages)} pages)"
+        return (
+            f"✓ PDF brief '{brief_name}' uploaded! "
+            f"({len(text):,} characters extracted from {len(reader.pages)} pages)"
+        )
 
     except FileNotFoundError:
         return f"❌ Error: File not found at {file_path}"
@@ -186,7 +242,7 @@ Be thorough and detailed - don't truncate your response."""
         system_prompt = """You are a helpful AI assistant analyzing product briefs for Salesforce teams.
 
 When summarizing adoption status, risks, or "what to focus on" for a product, use this style when appropriate:
-- Open with a brief greeting (e.g. "Hey [name] :wave:" if the context suggests it, or just "Here's where things stand").
+- Open with a brief greeting (e.g. "Hey [name] 👋" if the context suggests it, or just "Here's where things stand").
 - State what you're tracking (e.g. "I'm tracking [Product X] for you").
 - Use a "Right now:" section with bullets: adoption trends, attrition/renewal signals, key dates.
 - End with "What do you want to explore?" and offer options such as: Adoption risks, Renewal forecast, Feature usage gaps, V2MoM progress, Top accounts needing attention.
@@ -205,10 +261,10 @@ def list_briefs(user_id: str = "default") -> str:
     briefs = get_user_briefs(user_id)
 
     if not briefs:
-        return "📭 No briefs uploaded yet.\n\nUpload a PDF to get started!"
+        return "📪 No briefs uploaded yet.\n\nUpload a PDF to get started!"
 
     brief_list = "\n".join(
-        [f"• *{name}* ({len(content):,} chars)" for name, content in briefs.items()]
+        [f"- *{name}* ({len(content):,} chars)" for name, content in briefs.items()]
     )
     return f"*Your uploaded briefs:*\n{brief_list}\n\nJust ask me anything about them!"
 
@@ -229,9 +285,115 @@ def delete_brief(brief_name: str, user_id: str = "default") -> str:
 
     del briefs[actual_name]
     save_data()
-    return f"✅ Brief '{actual_name}' deleted successfully"
+    return f"✓ Brief '{actual_name}' deleted successfully"
+
+
+# ============================================================================
+# GM REVIEW TOOLS
+# ============================================================================
+
+@mcp.tool()
+def generate_gm_reviews(account_inputs: list[str]) -> str:
+    """
+    Generate GM reviews for at-risk Commerce Cloud renewals.
+
+    Args:
+        account_inputs: List of account names or opportunity IDs (e.g., ["Acme Corp", "006XXXXXXXXXXXX"])
+
+    Returns:
+        Formatted GM review results with risk analysis and adoption POV
+    """
+    try:
+        print("🚀 Initializing GM Review workflow...")
+        workflow = init_gm_workflow()
+
+        print(f"📊 Processing {len(account_inputs)} accounts...")
+        reviews = workflow.run(account_inputs)
+
+        if not reviews:
+            return "❌ No reviews generated. Check if account names/IDs are valid."
+
+        result = f"✓ Generated {len(reviews)} GM review(s):\n\n"
+
+        for review in reviews:
+            result += f"**{review['account_name']}** (ID: {review['account_id']})\n"
+            result += (
+                f"📋 Risk Analysis:\n"
+                f"{json.dumps(review['risk_analysis'], indent=2, default=str)}\n\n"
+            )
+            result += (
+                f"📈 Adoption POV:\n"
+                f"{json.dumps(review['adoption_pov'], indent=2, default=str)}\n\n"
+            )
+            result += "---\n\n"
+
+        return result
+
+    except Exception as e:
+        return f"❌ Error generating reviews: {str(e)}"
+
+
+@mcp.tool()
+def generate_gm_review_canvas(account_inputs: list[str]) -> str:
+    """
+    Generate GM reviews and return canvas-formatted content for at-risk Commerce renewals.
+
+    Args:
+        account_inputs: List of account names or opportunity IDs
+
+    Returns:
+        Canvas-formatted markdown content
+    """
+    try:
+        print("🚀 Initializing GM Review workflow...")
+        workflow = init_gm_workflow()
+
+        print(f"📊 Processing {len(account_inputs)} accounts...")
+        reviews = workflow.run(account_inputs)
+
+        if not reviews:
+            return "❌ No reviews generated."
+
+        if len(reviews) == 1:
+            return reviews[0]["canvas_content"]
+        combined = "# GM Reviews for At-Risk Renewals\n\n"
+        for review in reviews:
+            combined += f"## {review['account_name']}\n\n"
+            combined += review["canvas_content"] + "\n\n---\n\n"
+        return combined
+
+    except Exception as e:
+        return f"❌ Error generating canvas: {str(e)}"
+
+
+@mcp.tool()
+def test_snowflake_connection() -> str:
+    """Test Snowflake connection and credentials"""
+    try:
+        from adapters.snowflake_adapter import SnowflakeAdapter
+
+        adapter = SnowflakeAdapter()
+        adapter.close()
+        return "✓ Snowflake connection successful!"
+    except Exception as e:
+        return f"❌ Snowflake connection failed: {str(e)}"
+
+
+@mcp.tool()
+def test_salesforce_connection() -> str:
+    """Test Salesforce connection and credentials"""
+    try:
+        sf_token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
+        sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
+
+        if not sf_token or not sf_instance:
+            return "❌ Salesforce credentials not found in .env file"
+
+        SalesforceAdapter(sf_token, sf_instance)
+        return "✓ Salesforce adapter initialized successfully!"
+    except Exception as e:
+        return f"❌ Salesforce connection failed: {str(e)}"
 
 
 if __name__ == "__main__":
     mcp.run()
-

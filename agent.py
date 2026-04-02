@@ -3,8 +3,74 @@ agent.py
 Intent classification and routing using Claude.
 """
 import json
+from datetime import datetime
+
 from server import call_llm_gateway
 from log_utils import log_debug
+
+
+def build_home_view(_user_id: str, first_name: str) -> dict:
+    """
+    Full PM Intelligence Hub for App Home (onboarding / post-clear / no active session).
+    Returns a views.publish-compatible home view dict.
+    """
+    hour = datetime.now().hour
+    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{greeting}, {first_name} 👋"},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*PM Intelligence Hub*\n\nChoose a module to get started:",
+            },
+        },
+        {"type": "divider"},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "📋 Product Brief Analysis", "emoji": True},
+                    "action_id": "module_product_brief",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🎯 V2MoM Analysis", "emoji": True},
+                    "action_id": "module_v2mom",
+                },
+            ],
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "⚠️ Attrition Risk", "emoji": True},
+                    "action_id": "module_attrition",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "📊 Feature Usage Scorecard", "emoji": True},
+                    "action_id": "module_feature_usage",
+                },
+            ],
+        },
+        {"type": "divider"},
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "💡 _Upload a PDF in DM, or use slash commands where available._",
+                },
+            ],
+        },
+    ]
+    return {"type": "home", "blocks": blocks}
 
 
 def classify_with_claude(text: str, last_account: str, last_cloud: str, conversation_history: list) -> dict:

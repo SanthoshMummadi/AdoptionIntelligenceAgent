@@ -3,6 +3,7 @@ risk_engine.py
 Handles risk classification and AI analysis.
 """
 import os
+from typing import Any, Dict
 
 from dotenv import load_dotenv
 
@@ -349,3 +350,137 @@ def generate_risk_analysis(
         recommendation = "\n".join(f"- {r}" for r in recs[:2])
 
     return risk_notes.strip(), recommendation.strip()
+
+
+class RiskEngine:
+    """Structured risk + adoption analysis for workflow services."""
+
+    def __init__(self, call_llm_fn=None):
+        self.call_llm_fn = call_llm_fn
+
+    def _enrichment_from_analytics(self, analytics: Dict[str, Any]) -> Dict[str, Any]:
+        usage = analytics.get("usage") or {}
+        ari = analytics.get("ari_score")
+        attrition = analytics.get("attrition") or {}
+        products = attrition.get("products") or []
+        ari_scores = []
+        for p in products[:15]:
+            ari_scores.append({
+                "product": p.get("product"),
+                "category": p.get("category"),
+                "probability": None,
+                "reason": "",
+            })
+        if ari is not None:
+            if not any(s.get("probability") for s in ari_scores):
+                ari_scores.insert(0, {
+                    "product": "Portfolio",
+                    "category": "N/A",
+                    "probability": float(ari),
+                    "reason": "Snowflake aggregate ARI",
+                })
+        util_fmt = {}
+        utilization = usage.get("utilization_rate")
+        if utilization is not None:
+            util_fmt["utilization_rate"] = (
+                utilization if isinstance(utilization, str) else f"{float(utilization):.1f}%"
+            )
+        gmv = usage.get("gmv_rate")
+        if gmv is not None:
+            util_fmt["gmv_rate"] = gmv if isinstance(gmv, str) else f"{float(gmv):.1f}%"
+        burn = usage.get("burn_rate")
+        if burn is not None:
+            util_fmt["burn_rate"] = burn if isinstance(burn, str) else f"{float(burn):.1f}%"
+        cc_aov = usage.get("cc_aov")
+        if cc_aov is not None:
+            util_fmt["cc_aov"] = cc_aov if isinstance(cc_aov, str) else f"${float(cc_aov):,.0f}"
+        if usage.get("territory"):
+            util_fmt["territory"] = usage.get("territory")
+        if usage.get("csg_geo"):
+            util_fmt["csg_geo"] = usage.get("csg_geo")
+
+        return {"ari_scores": ari_scores, "usage": util_fmt, "degraded": []}
+
+    def analyze_risk(self, account_data: Dict[str, Any]) -> Dict[str, Any]:
+        sf = account_data.get("salesforce", {})
+        acc = sf.get("account") or {}
+        red = sf.get("red_account")
+        account_name = acc.get("Name") or str(account_data.get("account_id", "Account"))
+        analytics = account_data.get("analytics", {})
+        enr = self._enrichment_from_analytics(analytics)
+
+        risk_reason = "N/A"
+        risk_detail = ""
+        if red:
+            risk_reason = str(red.get("Issue_Product__c") or red.get("Stage__c") or "Red Account")
+            risk_detail = str(red.get("Latest_Updates__c") or red.get("Action_Plan__c") or "")[:500]
+
+        utilization = str((enr.get("usage") or {}).get("utilization_rate") or "")
+        classification = classify_risk(
+            risk_reason,
+            risk_detail,
+            str(acc.get("Industry") or acc.get("Type") or ""),
+            utilization,
+        )
+
+        risk_notes, recommendation = generate_risk_analysis(
+            account_name,
+            None,
+            red,
+            enr,
+            self.call_llm_fn,
+        )
+
+        top_cat = None
+        for s in enr.get("ari_scores") or []:
+            if s.get("category") and str(s.get("category")).upper() != "N/A":
+                top_cat = s.get("category")
+                break
+        if top_cat is None and enr.get("ari_scores"):
+            top_cat = (enr["ari_scores"][0] or {}).get("category")
+
+        return {
+            "summary": classification["theme"],
+            "risk_notes": risk_notes,
+            "recommendation": recommendation,
+            "ari_category": top_cat,
+            "ari_probability": analytics.get("ari_score"),
+            "confidence": classification["confidence"],
+            "license_at_risk_reason": risk_reason if risk_reason != "N/A" else None,
+        }
+
+    def generate_adoption_pov(self, account_data: Dict[str, Any]) -> Dict[str, Any]:
+        analytics = account_data.get("analytics", {})
+        usage = analytics.get("usage") or {}
+        attrition = analytics.get("attrition") or {}
+        products = attrition.get("products") or []
+
+        def fmt_pct(v):
+            if v is None:
+                return None
+            if isinstance(v, str):
+                return v
+            return f"{float(v):.1f}%"
+
+        def fmt_money(v):
+            if v is None:
+                return None
+            if isinstance(v, str):
+                return v
+            return f"${float(v):,.0f}"
+
+        narrative_parts = []
+        if products:
+            narrative_parts.append(
+                f"Snowflake attrition signals: **{len(products)}** product row(s) on latest snapshot."
+            )
+
+        return {
+            "utilization_rate": fmt_pct(usage.get("utilization_rate")),
+            "gmv_rate": fmt_pct(usage.get("gmv_rate")),
+            "burn_rate": fmt_pct(usage.get("burn_rate")),
+            "cc_aov": fmt_money(usage.get("cc_aov")),
+            "territory": usage.get("territory"),
+            "csg_geo": usage.get("csg_geo"),
+            "narrative": "\n".join(narrative_parts) if narrative_parts else None,
+        }

@@ -12,38 +12,13 @@ from datetime import datetime, timezone
 import PyPDF2
 import requests
 from slack_sdk.errors import SlackApiError
+from dotenv import load_dotenv
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+load_dotenv(os.path.join(_ROOT, ".env"))
 import server
 from log_utils import log_error
-
-def _load_dotenv_if_present() -> None:
-    """
-    Minimal .env loader (no external deps).
-    Loads KEY=VALUE lines into os.environ if not already set.
-    """
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.exists(env_path):
-        return
-
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip("'").strip('"')
-                if key and key not in os.environ:
-                    os.environ[key] = value
-    except Exception as e:
-        print(f"⚠️  Could not load .env: {e}")
-
-
-_load_dotenv_if_present()
 
 slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
 if not slack_bot_token:
@@ -297,7 +272,7 @@ def handle_file_upload(event, say, client):
 
 
 @app.event("message")
-def handle_message(event, say):
+def handle_message(event, say, client):
     if event.get("bot_id") or event.get("subtype"):
         return
 
@@ -309,10 +284,35 @@ def handle_message(event, say):
 
     if text.lower() in {"end session", "clear", "reset", "start over", "new session"}:
         clear_session(user)
-        say(
-            "✅ Session ended and archived.\n\n"
-            "You can upload a new product brief PDF or just start asking new questions."
-        )
+
+        try:
+            user_info = client.users_info(user=user)
+            first_name = user_info["user"]["profile"].get("first_name", "there")
+        except Exception:
+            first_name = "there"
+
+        from agent import build_home_view
+
+        hub_view = build_home_view(user, first_name)
+
+        try:
+            client.chat_postMessage(
+                channel=user,
+                text=":brain: PM Intelligence Hub",
+                blocks=hub_view["blocks"],
+            )
+        except Exception as e:
+            print(f"Error posting hub to DM: {e}")
+            say(
+                ":white_check_mark: Session ended and archived.\n\n"
+                "You can upload a new product brief PDF or just start asking new questions."
+            )
+
+        try:
+            update_home_tab(client=client, event={"user": user, "tab": "home"})
+        except Exception as e:
+            print(f"Could not refresh home tab: {e}")
+
         return
 
     if not text or text.lower() in {"help", "hi", "hello", "hey"}:
@@ -386,111 +386,151 @@ def handle_message(event, say):
 def update_home_tab(client, event, logger=None):
     user_id = event["user"]
 
+    if event.get("tab") == "messages":
+        return
+
     try:
         user_info = client.users_info(user=user_id)
         first_name = user_info["user"]["profile"].get("first_name", "there")
     except Exception:
         first_name = "there"
 
-    hour = datetime.now().hour
-    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
-
     briefs = server.get_user_briefs(user_id)
-    if briefs:
-        active_brief = user_last_brief.get(user_id, list(briefs.keys())[0])
+    sess = active_sessions.get(user_id) or {}
+    has_active_session = bool(sess.get("messages"))
 
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": f"{greeting}, {first_name} 👋"}},
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"I'm tracking *{len(briefs)} product brief(s)* for you.\n\n*Currently analyzing:* {active_brief}",
-                },
-            },
-            {"type": "divider"},
-            {"type": "section", "text": {"type": "mrkdwn", "text": "*What do you want to explore?*"}},
-            {
-                "type": "actions",
-                "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "📊 Adoption Risks", "emoji": True}, "action_id": "quick_adoption_risks", "value": active_brief},
-                    {"type": "button", "text": {"type": "plain_text", "text": "🎯 Big Rocks", "emoji": True}, "action_id": "quick_big_rocks", "value": active_brief},
-                ],
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "📈 Success Metrics", "emoji": True}, "action_id": "quick_metrics", "value": active_brief},
-                    {"type": "button", "text": {"type": "plain_text", "text": "👥 Target Audience", "emoji": True}, "action_id": "quick_audience", "value": active_brief},
-                ],
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "📝 Full Summary", "emoji": True}, "action_id": "quick_summary", "value": active_brief, "style": "primary"},
-                ],
-            },
-            {"type": "divider"},
-            {"type": "section", "text": {"type": "mrkdwn", "text": "*Your Product Briefs:*"}},
-        ]
-
-        for brief_name, content in briefs.items():
-            is_active = brief_name == active_brief
-            accessory = {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Switch" if not is_active else "Active", "emoji": True},
-                "action_id": f"switch_to_{brief_name}",
-                "value": brief_name,
-            }
-            if is_active:
-                accessory["style"] = "primary"
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"{'*→ ' if is_active else '   '}{brief_name}\n_{len(content):,} characters_"},
-                    "accessory": accessory,
-                }
-            )
-
-        blocks.extend(
-            [
-                {"type": "divider"},
-                {
-                    "type": "actions",
-                    "elements": [
-                        {"type": "button", "text": {"type": "plain_text", "text": "📄 Upload New Brief", "emoji": True}, "action_id": "upload_new_brief"},
-                    ],
-                },
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": "💡 _Tip: Just send me a message to ask anything about your briefs!_"}]},
-                {
-                    "type": "actions",
-                    "elements": [
-                        {"type": "button", "text": {"type": "plain_text", "text": "🔄 End Session & Clear"}, "action_id": "btn_end_session_home", "style": "danger"},
-                    ],
-                },
-            ]
-        )
-    else:
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": f"{greeting}, {first_name} 👋"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": "I'm your *Adoption Intelligence Bot* — powered by AI to help you analyze product briefs."}},
-            {"type": "divider"},
-            {"type": "section", "text": {"type": "mrkdwn", "text": "*Get started:*\n• Upload a product brief PDF\n• Ask me anything in natural language\n• Get AI-powered insights instantly"}},
-            {
-                "type": "actions",
-                "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "📄 Upload Product Brief", "emoji": True}, "action_id": "upload_product_brief", "style": "primary"},
-                ],
-            },
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": "💡 _Just drag and drop a PDF into our DM to get started!_"}]},
-        ]
+    # Hub: no briefs yet, or no active DM session (e.g. after clear)
+    show_hub = (not briefs) or (not has_active_session)
 
     try:
-        client.views_publish(user_id=user_id, view={"type": "home", "blocks": blocks})
+        if show_hub:
+            from agent import build_home_view
+
+            view = build_home_view(user_id, first_name)
+            client.views_publish(user_id=user_id, view=view)
+        else:
+            active_brief = user_last_brief.get(user_id, list(briefs.keys())[0])
+
+            hour = datetime.now().hour
+            greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+
+            blocks = [
+                {"type": "header", "text": {"type": "plain_text", "text": f"{greeting}, {first_name} 👋"}},
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"I'm tracking *{len(briefs)} product brief(s)* for you.\n\n"
+                            f"*Currently analyzing:* {active_brief}"
+                        ),
+                    },
+                },
+                {"type": "divider"},
+                {"type": "section", "text": {"type": "mrkdwn", "text": "*What do you want to explore?*"}},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "📊 Adoption Risks", "emoji": True},
+                            "action_id": "quick_adoption_risks",
+                            "value": active_brief,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "🎯 Big Rocks", "emoji": True},
+                            "action_id": "quick_big_rocks",
+                            "value": active_brief,
+                        },
+                    ],
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "📈 Success Metrics", "emoji": True},
+                            "action_id": "quick_metrics",
+                            "value": active_brief,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "👥 Target Audience", "emoji": True},
+                            "action_id": "quick_audience",
+                            "value": active_brief,
+                        },
+                    ],
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "📝 Full Summary", "emoji": True},
+                            "action_id": "quick_summary",
+                            "value": active_brief,
+                            "style": "primary",
+                        },
+                    ],
+                },
+                {"type": "divider"},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*Your Briefs ({len(briefs)}):*"},
+                },
+            ]
+
+            if len(briefs) > 1:
+                brief_buttons = []
+                for brief_name in list(briefs.keys())[:5]:
+                    is_active = brief_name == active_brief
+                    label = f"{'✓ ' if is_active else ''}{brief_name}"
+                    if len(label) > 75:
+                        label = label[:72] + "..."
+                    btn = {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": label, "emoji": True},
+                        "action_id": f"switch_to_{brief_name}",
+                        "value": brief_name,
+                    }
+                    if is_active:
+                        btn["style"] = "primary"
+                    brief_buttons.append(btn)
+                blocks.append({"type": "actions", "elements": brief_buttons})
+            else:
+                blocks.append({
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"• {active_brief}"}],
+                })
+
+            blocks.extend(
+                [
+                    {"type": "divider"},
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "📎 Upload New Brief", "emoji": True},
+                                "action_id": "upload_new_brief",
+                            },
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "⛔ End Session", "emoji": True},
+                                "action_id": "btn_end_session_home",
+                                "style": "danger",
+                            },
+                        ],
+                    },
+                ]
+            )
+
+            client.views_publish(user_id=user_id, view={"type": "home", "blocks": blocks})
+
     except SlackApiError as e:
         err = e.response.get("error") if getattr(e, "response", None) else None
         if err == "not_enabled":
-            # Slack returns this when App Home is not turned on for the app, or scopes are missing.
             msg = (
                 "App Home is not available for this app (views.publish: not_enabled). "
                 "In api.slack.com: App → App Home → enable a Home tab, Bot Token Scopes → add "
@@ -532,12 +572,89 @@ def handle_upload_new_button(ack, body, client):
     )
 
 
+@app.action("module_product_brief")
+def handle_module_product_brief(ack, body, client):
+    """Handle Product Brief Analysis module selection."""
+    ack()
+    user_id = body["user"]["id"]
+    client.chat_postMessage(
+        channel=user_id,
+        text=(
+            ":brain: *Product Brief Analysis Module*\n\n"
+            "Upload a product brief PDF and ask me things like:\n"
+            "- What are the key adoption risks?\n"
+            "- Summarize the success metrics\n"
+            "- What are the big rocks for this quarter?\n"
+            "- Who is the target audience?\n\n"
+            "Just send me a PDF to get started!"
+        ),
+    )
+
+
+@app.action("module_v2mom")
+def handle_module_v2mom(ack, body, client):
+    """Handle V2MoM Analysis module selection."""
+    ack()
+    user_id = body["user"]["id"]
+    client.chat_postMessage(
+        channel=user_id,
+        text=(
+            ":dart: *V2MoM Analysis Module*\n\n"
+            "I'll help align your product brief with V2MoM framework:\n"
+            "- Vision alignment\n"
+            "- Value proposition mapping\n"
+            "- Obstacle identification\n"
+            "- Method validation\n\n"
+            "Upload a brief and ask: _'How does this align with our V2MoM?'_"
+        ),
+    )
+
+
+@app.action("module_attrition")
+def handle_module_attrition(ack, body, client):
+    """Handle Attrition Risk Predictor module selection."""
+    ack()
+    user_id = body["user"]["id"]
+    client.chat_postMessage(
+        channel=user_id,
+        text=(
+            ":chart_with_upwards_trend: *Attrition Risk Predictor Module*\n\n"
+            "Look up churn risk by account and product line.\n\n"
+            "*Available Commands:*\n"
+            "- `/attrition-risk` — Analyze specific accounts\n"
+            "- `/attrition-clouds` — View product-level risk patterns\n"
+            "- `/gm-review-canvas` — GM review for at-risk renewals\n"
+            "- `/at-risk-canvas` — At-risk account canvas\n\n"
+            "Try: `/attrition-risk Acme Corp`"
+        ),
+    )
+
+
+@app.action("module_feature_usage")
+def handle_module_feature_usage(ack, body, client):
+    """Handle Feature Usage Scorecard module selection."""
+    ack()
+    user_id = body["user"]["id"]
+    client.chat_postMessage(
+        channel=user_id,
+        text=(
+            ":chart_with_upwards_trend: *Feature Usage Scorecard Module*\n\n"
+            "Score feature adoption across your customer base.\n\n"
+            "Ask me things like:\n"
+            "- What's the adoption rate for [feature]?\n"
+            "- Which accounts have low usage?\n"
+            "- Show me feature usage trends\n\n"
+            "This module integrates with your Snowflake analytics data!"
+        ),
+    )
+
+
 @app.action("btn_end_session_home")
 def handle_end_session_home(ack, body, client):
     ack()
     user_id = body["user"]["id"]
     clear_session(user_id)
-    update_home_tab(client, {"user": user_id}, logger=None)
+    update_home_tab(client, {"user": user_id, "tab": "home"}, logger=None)
     client.chat_postMessage(
         channel=user_id,
         text="✅ Session ended and archived.\n\nYou can upload a new product brief PDF or just start asking new questions.",
@@ -861,10 +978,97 @@ def attrition_clouds(ack, say):
 def gm_review_canvas(ack, say, command, client):
     """
     Generate GM Review canvas for at-risk renewals.
-    Usage: /gm-review-canvas Commerce Cloud, Account1, Account2
+    Usage: /gm-review-canvas Account1, Account2, 006xxxxx
     """
     ack()
-    say(":soon: GM Review canvas is being restored - check back in 10 minutes!")
+
+    text = command.get("text", "").strip()
+
+    if not text:
+        say(
+            ":warning: *Usage:*\n"
+            "`/gm-review-canvas <Account Names or Opp IDs>`\n\n"
+            "*Examples:*\n"
+            "- `/gm-review-canvas Acme Corp, Wayne Enterprises`\n"
+            "- `/gm-review-canvas 006XXXXXXXXXXXX`\n"
+            "- `/gm-review-canvas Commerce Cloud, Acme Corp`\n\n"
+            ":bulb: Tip: You can mix account names and opportunity IDs!"
+        )
+        return
+
+    inputs = [item.strip() for item in text.split(",") if item.strip()]
+
+    say(
+        f":hourglass_flowing_sand: Generating GM reviews for {len(inputs)} account(s)...\n"
+        "_This may take 30-60 seconds..._"
+    )
+
+    def process():
+        try:
+            from adapters.canvas_adapter import CanvasAdapter
+            from adapters.salesforce_adapter import SalesforceAdapter
+            from adapters.snowflake_adapter import SnowflakeAdapter
+            from domain.intelligence.risk_engine import RiskEngine
+            from services.parallel_gm_review_workflow import ParallelGMReviewWorkflow
+
+            sf_token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
+            sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv(
+                "SALESFORCE_INSTANCE_URL"
+            )
+
+            workflow = ParallelGMReviewWorkflow(
+                salesforce_adapter=SalesforceAdapter(sf_token, sf_instance),
+                snowflake_adapter=SnowflakeAdapter(),
+                canvas_adapter=CanvasAdapter(),
+                risk_engine=RiskEngine(call_llm_fn=server.call_llm_gateway),
+                max_concurrent=5,
+            )
+
+            reviews = workflow.run(inputs)
+
+            if not reviews:
+                say(
+                    ":x: No reviews generated. Please check account names/IDs and try again."
+                )
+                return
+
+            for review in reviews:
+                canvas_content = review.get("canvas_content", "")
+                account_name = review.get("account_name", "Unknown")
+
+                if canvas_content:
+                    say(
+                        text=f":white_check_mark: GM Review: {account_name}",
+                        blocks=[
+                            {
+                                "type": "header",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": f"GM Review: {account_name}",
+                                },
+                            },
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": canvas_content[:3000],
+                                },
+                            },
+                        ],
+                    )
+
+            say(f":white_check_mark: Generated {len(reviews)} GM review(s)!")
+
+        except Exception as e:
+            say(f":x: Error generating GM reviews: {str(e)}")
+            print(f"GM Review error: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    import threading
+
+    threading.Thread(target=process).start()
 
 
 @app.command("/at-risk-canvas")
@@ -872,9 +1076,102 @@ def at_risk_canvas(ack, say, command, client):
     """
     Generate at-risk renewals canvas.
     Usage: /at-risk-canvas >500k FY27
+           /at-risk-canvas Commerce Cloud
     """
     ack()
-    say(":soon: At-risk canvas is being restored - check back in 10 minutes!")
+
+    text = command.get("text", "").strip()
+
+    say(
+        f":hourglass_flowing_sand: Generating at-risk renewals canvas...\n"
+        f"_Analyzing accounts matching: {text or 'all'}_"
+    )
+
+    def process():
+        try:
+            from domain.analytics.snowflake_client import get_snowflake_connection
+            from filter_parser import parse_filters, CLOUD_KEYWORDS
+
+            where_clauses = []
+
+            text_lower = text.lower()
+            if any(kw.lower() in text_lower for kw in CLOUD_KEYWORDS):
+                filters = parse_filters(text)
+                cloud = filters.get("cloud", "Commerce Cloud")
+                esc = cloud.replace("'", "''")
+                where_clauses.append(f"AND APM_LVL_2 = '{esc}'")
+
+            if any(
+                threshold in text_lower
+                for threshold in [">1m", ">500k", ">400k", ">200k"]
+            ):
+                filters = parse_filters(text)
+                min_arr = filters.get("min_attrition")
+                if min_arr:
+                    where_clauses.append(f"AND ARR_AMOUNT > {min_arr}")
+
+            where_sql = " ".join(where_clauses)
+
+            conn = get_snowflake_connection()
+            cursor = conn.cursor()
+
+            query = f"""
+                SELECT DISTINCT
+                    SF_ACCOUNT_ID,
+                    ACCOUNT_NAME,
+                    APM_LVL_2 as PRODUCT,
+                    ATTRITION_PROBABILITY as SCORE,
+                    ATTRITION_PROBA_CATEGORY as RISK_CLASS
+                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+                WHERE SNAPSHOT_DT = (
+                    SELECT MAX(SNAPSHOT_DT)
+                    FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ATTRITION_PREDICTION_ACCT_PRODUCT
+                )
+                AND ATTRITION_PROBA_CATEGORY IN ('High', 'Medium')
+                AND SF_ACCOUNT_ID IS NOT NULL
+                AND ACCOUNT_NAME IS NOT NULL
+                {where_sql}
+                ORDER BY ATTRITION_PROBABILITY DESC
+                LIMIT 50
+            """
+
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            cursor.close()  # only cursor; keep shared Snowflake connection open
+
+            if not rows:
+                say(":x: No at-risk accounts found matching your criteria.")
+                return
+
+            result = f":warning: *At-Risk Renewals* ({len(rows)} accounts)\n\n"
+
+            for row in rows[:20]:
+                account_id, account_name, product, score, risk_class = row
+                emoji = (
+                    ":red_circle:"
+                    if risk_class == "High"
+                    else ":large_orange_circle:"
+                )
+                result += f"{emoji} *{account_name}* ({product})\n"
+                result += (
+                    f"   Score: {score:.3f} | Risk: {risk_class} | `{account_id}`\n\n"
+                )
+
+            if len(rows) > 20:
+                result += f"\n_...and {len(rows) - 20} more accounts_"
+
+            say(result)
+
+        except Exception as e:
+            say(f":x: Error: {str(e)}")
+            print(f"At-risk canvas error: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    import threading
+
+    threading.Thread(target=process).start()
 
 
 if __name__ == "__main__":
