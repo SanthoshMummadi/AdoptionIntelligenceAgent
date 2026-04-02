@@ -316,6 +316,9 @@ def build_account_brief_blocks(
             prod_name = p.get("product", "Unknown")
             attrition_amt = fmt_amount(p.get("attrition", 0))
             category = p.get("category", "N/A")
+            reason = p.get("reason", "")
+            factors_incr = p.get("factors_incr", "")
+            factors_decr = p.get("factors_decr", "")
 
             prod_emoji_map = {
                 "High": ":red_circle:",
@@ -325,6 +328,13 @@ def build_account_brief_blocks(
             prod_emoji = prod_emoji_map.get(category, ":white_circle:")
 
             product_text += f"{prod_emoji} {prod_name} | {category} | AOV: {attrition_amt}\n"
+
+            if reason:
+                product_text += f"   _Reason: {reason}_\n"
+            if factors_incr:
+                product_text += f"   _Risk Factors: {factors_incr}_\n"
+            if factors_decr:
+                product_text += f"   _Mitigating Factors: {factors_decr}_\n"
 
         blocks.append({
             "type": "section",
