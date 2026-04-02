@@ -805,8 +805,18 @@ def attrition_risk_cmd(ack, say, command, client):
             text_clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text_clean)
             text_clean = text_clean.strip("_* ")
 
+            filters = parse_filters(text_clean)
+            detected_cloud = filters.get("cloud", "Commerce Cloud")
+
+            account_parts = filters.get("manual_account_parts", [])
+            account_search = (
+                " ".join(account_parts) if account_parts else text_clean
+            )
+
             # Check if input is Opportunity ID
-            opp_id_match = re.match(r"^(006[a-zA-Z0-9]{12,15})$", text_clean.strip())
+            opp_id_match = re.match(
+                r"^(006[a-zA-Z0-9]{12,15})$", account_search.strip()
+            )
 
             if opp_id_match:
                 # Mode 1: Direct Opp ID lookup
@@ -866,17 +876,18 @@ def attrition_risk_cmd(ack, say, command, client):
                     return
 
             else:
-                # Mode 2: Account name lookup
-                f = parse_filters(text_clean)
-                account_name_input = f["manual_account_parts"][0] if f["manual_account_parts"] else text_clean
-                detected_cloud = f["cloud"]
+                # Mode 2: Account name lookup (manual_account_parts drops cloud, etc.)
+                account_search = account_search.strip() or text_clean.strip()
 
-                say(":mag: Looking up *" + account_name_input + "*...")
-                acct = resolve_account(account_name_input, cloud=detected_cloud)
+                say(
+                    f":mag: Looking up account *{account_search}* "
+                    f"({detected_cloud})..."
+                )
+                acct = resolve_account(account_search, cloud=detected_cloud)
 
                 if not acct:
                     say(
-                        ":x: Could not find account: *" + account_name_input + "*\n\n"
+                        ":x: Could not find account: *" + account_search + "*\n\n"
                         "*Suggestions:*\n"
                         "- Check spelling\n"
                         "- Try a shorter name\n"
