@@ -209,11 +209,11 @@ def enrich_account(account_id: str, opp_id: str, cloud: str) -> dict:
             CC_AOV,
             TERRITORY,
             CSG_GEO
-        FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ACCOUNT_METRICS
+        FROM CIDM.WV_AV_USAGE_EXTRACT_VW
         WHERE SF_ACCOUNT_ID = '{account_id}'
         AND SNAPSHOT_DT = (
             SELECT MAX(SNAPSHOT_DT)
-            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ACCOUNT_METRICS
+            FROM CIDM.WV_AV_USAGE_EXTRACT_VW
         )
         LIMIT 1
         """
@@ -393,11 +393,11 @@ class SnowflakeClient:
                 CC_AOV,
                 TERRITORY,
                 CSG_GEO
-            FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ACCOUNT_METRICS
+            FROM CIDM.WV_AV_USAGE_EXTRACT_VW
             WHERE SF_ACCOUNT_ID = '{aid}'
             AND SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
-                FROM SSE_DM_CSG_RPT_PRD.CI_DS_OUT.ACCOUNT_METRICS
+                FROM CIDM.WV_AV_USAGE_EXTRACT_VW
             )
             LIMIT 1
             """
