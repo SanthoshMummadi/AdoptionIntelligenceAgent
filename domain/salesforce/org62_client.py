@@ -2,6 +2,10 @@
 domain/salesforce/org62_client.py
 Salesforce org62 operations: account lookup, opportunities, team, red accounts.
 
+Shared by every entrypoint (e.g. ``slack_app.py``, ``server.py``, ``gm_review_workflow``):
+SOQL/SOSL and the REST client go through ``sf_query`` / ``sf_search`` so ``SF_MAX_CONCURRENT``
+applies process-wide.
+
 Loads `.env` from the repository root (not only CWD). Accepts SF_* and SALESFORCE_* tokens.
 """
 import os
@@ -26,7 +30,7 @@ _sf_client = None
 def _sf_max_concurrent() -> int:
     try:
         return max(1, int(os.getenv("SF_MAX_CONCURRENT", "10")))
-    except ValueError:
+    except (TypeError, ValueError):
         return 10
 
 
@@ -55,7 +59,7 @@ def _sf_call_with_limit_logging(
 
 
 def _sf_call_guarded(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Acquire global SF concurrency slot, then run with limit logging."""
+    """Acquire semaphore before SF call — enforced for all traffic through this module."""
     with _SF_SEMAPHORE:
         return _sf_call_with_limit_logging(fn, *args, **kwargs)
 
@@ -111,6 +115,24 @@ def _soql_line(soql: str) -> str:
     return " ".join(str(soql).split())
 
 
+def sf_query(soql: str, client: Optional[Any] = None) -> Dict[str, Any]:
+    """
+    Single choke point for SOQL: semaphore + limit logging.
+
+    Returns the same dict shape as ``Salesforce.query_all`` (``records``, ``totalSize``, …),
+    not a bare list — callers typically use ``.get("records", [])``.
+    Multi-line SOQL is collapsed via ``_soql_line`` for REST compatibility.
+    """
+    sf = client or get_sf_client()
+    return _sf_call_guarded(sf.query_all, _soql_line(soql))
+
+
+def sf_search(sosl: str, client: Optional[Any] = None) -> Any:
+    """Run SOSL with global concurrency limit and limit/timeout logging."""
+    sf = client or get_sf_client()
+    return _sf_call_guarded(sf.search, sosl)
+
+
 def clean_html(text: str) -> str:
     """Strip HTML tags and normalize whitespace for Latest Updates and similar fields."""
     if not text:
@@ -139,7 +161,7 @@ def resolve_account(account_name: str, cloud: str = "Commerce Cloud") -> dict:
             f"RETURNING Account(Id, Name, BillingCountry)"
         )
         try:
-            results = sf.search(sosl)
+            results = sf_search(sosl, client=sf)
             if results and results.get("searchRecords"):
                 acct = results["searchRecords"][0]
                 if acct.get("Id"):
@@ -160,7 +182,7 @@ def resolve_account(account_name: str, cloud: str = "Commerce Cloud") -> dict:
         WHERE Name = '{_escape(account_name)}'
         LIMIT 1
         """
-        result = sf.query(_soql_line(query))
+        result = sf_query(query, client=sf)
 
         if not result.get("records"):
             # Try LIKE search
@@ -170,7 +192,7 @@ def resolve_account(account_name: str, cloud: str = "Commerce Cloud") -> dict:
             WHERE Name LIKE '%{_escape(account_name)}%'
             LIMIT 5
             """
-            result = sf.query(_soql_line(query))
+            result = sf_query(query, client=sf)
 
         if not result.get("records"):
             return None
@@ -211,11 +233,11 @@ def resolve_account_enhanced(name: str, cloud: str = "Commerce Cloud") -> Option
             return None
 
         sf = get_sf_client()
-        sf_query = (
+        acc_soql = (
             f"SELECT Id, Name, BillingCountry FROM Account "
             f"WHERE Id = '{_escape(account_id)}' LIMIT 1"
         )
-        records = sf.query(sf_query).get("records", [])
+        records = sf_query(acc_soql, client=sf).get("records", [])
         if records:
             bc = records[0].get("BillingCountry") or ""
             return {
@@ -254,7 +276,7 @@ def get_renewal_opportunities(account_id: str, cloud: str = "Commerce Cloud") ->
         f"ORDER BY Forecasted_Attrition__c DESC LIMIT 10"
     )
     try:
-        return sf.query(_soql_line(query)).get("records", [])
+        return sf_query(query, client=sf).get("records", [])
     except Exception as e:
         log_debug(f"Error fetching opportunities: {str(e)[:100]}")
         return []
@@ -283,7 +305,7 @@ def get_renewal_opportunities_any_cloud(account_id: str) -> list:
         f"ORDER BY Forecasted_Attrition__c DESC LIMIT 10"
     )
     try:
-        return sf.query(_soql_line(query)).get("records", [])
+        return sf_query(query, client=sf).get("records", [])
     except Exception as e:
         log_debug(f"Error fetching opportunities (any cloud): {str(e)[:100]}")
         return []
@@ -339,7 +361,7 @@ def get_red_account(account_id: str) -> Optional[dict]:
     """
 
     try:
-        result = sf.query(_soql_line(query))
+        result = sf_query(query, client=sf)
         if result.get("records"):
             red = result["records"][0]
             _finalize_red_account_record(red)
@@ -354,7 +376,7 @@ def get_red_account(account_id: str) -> Optional[dict]:
             ORDER BY CreatedDate DESC
             LIMIT 1
         """
-        result_historical = sf.query(_soql_line(query_historical))
+        result_historical = sf_query(query_historical, client=sf)
         if result_historical.get("records"):
             historical = result_historical["records"][0]
             _finalize_red_account_record(historical)
@@ -378,7 +400,7 @@ def get_account_team(account_id: str) -> dict:
         FROM Account
         WHERE Id = '{_escape(account_id)}'
         """
-        result = sf.query(_soql_line(acc_query)).get("records", [])
+        result = sf_query(acc_query, client=sf).get("records", [])
         if not result:
             return {}
 
@@ -391,7 +413,7 @@ def get_account_team(account_id: str) -> dict:
         WHERE AccountId = '{_escape(account_id)}'
         AND (TeamMemberRole = 'Renewal Manager' OR TeamMemberRole = 'CSM')
         """
-        team_members = sf.query(_soql_line(team_query)).get("records", [])
+        team_members = sf_query(team_query, client=sf).get("records", [])
         renewal_mgr = ""
         csm = ""
         for member in team_members:
@@ -461,14 +483,14 @@ class Org62Client:
             WHERE Name = '{_escape(account_name)}'
             LIMIT 1
             """
-            result = self._sf.query(_soql_line(q))
+            result = sf_query(q, client=self._sf)
             if not result.get("records"):
                 q = f"""
                 SELECT Id FROM Account
                 WHERE Name LIKE '%{_escape(account_name)}%'
                 LIMIT 5
                 """
-                result = self._sf.query(_soql_line(q))
+                result = sf_query(q, client=self._sf)
             if result.get("records"):
                 return result["records"][0]["Id"]
             return None
@@ -484,7 +506,7 @@ class Org62Client:
             WHERE Name = '{_escape(opp_name)}' AND IsClosed = false
             LIMIT 1
             """
-            result = self._sf.query(_soql_line(q))
+            result = sf_query(q, client=self._sf)
             if result.get("records"):
                 return result["records"][0]["Id"]
             q2 = f"""
@@ -493,7 +515,7 @@ class Org62Client:
             ORDER BY CloseDate ASC
             LIMIT 1
             """
-            result2 = self._sf.query(_soql_line(q2))
+            result2 = sf_query(q2, client=self._sf)
             if result2.get("records"):
                 return result2["records"][0]["Id"]
             return None
@@ -511,7 +533,7 @@ class Org62Client:
             WHERE Id = '{_escape(account_id)}'
             LIMIT 1
             """
-            result = self._sf.query(_soql_line(q))
+            result = sf_query(q, client=self._sf)
             if not result.get("records"):
                 return None
             return result["records"][0]
@@ -534,7 +556,7 @@ class Org62Client:
             WHERE Id = '{_escape(opp_id)}'
             LIMIT 1
             """
-            result = self._sf.query(_soql_line(q))
+            result = sf_query(q, client=self._sf)
             if not result.get("records"):
                 return None
             return result["records"][0]
@@ -550,7 +572,7 @@ class Org62Client:
             FROM AccountTeamMember
             WHERE AccountId = '{_escape(account_id)}'
             """
-            result = self._sf.query(_soql_line(q))
+            result = sf_query(q, client=self._sf)
             out: List[Dict[str, Any]] = []
             for row in result.get("records", []):
                 out.append({

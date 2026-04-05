@@ -99,10 +99,9 @@ print("\n📦 SECTION 1: Salesforce Connection & Account Resolution")
 
 @test("SF-001: Salesforce connection via session token")
 def test_sf_connection():
-    from domain.salesforce.org62_client import get_sf_client
+    from domain.salesforce.org62_client import sf_query
 
-    sf = get_sf_client()
-    result = sf.query("SELECT Id FROM User LIMIT 1")
+    result = sf_query("SELECT Id FROM User LIMIT 1")
     assert result.get("records"), "No records returned"
 
 

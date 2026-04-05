@@ -17,19 +17,18 @@ _OPP_ID_RE = re.compile(r"^006[A-Za-z0-9]{12,18}$")
 
 def _resolve_open_opportunity_id(name: str) -> str | None:
     """First open Opportunity Id matching name (exact then LIKE)."""
-    from domain.salesforce.org62_client import _escape, _soql_line, get_sf_client
+    from domain.salesforce.org62_client import _escape, sf_query
 
     raw = (name or "").strip()
     if not raw:
         return None
-    sf = get_sf_client()
     try:
         q = f"""
             SELECT Id FROM Opportunity
             WHERE Name = '{_escape(raw)}' AND IsClosed = false
             LIMIT 1
             """
-        res = sf.query(_soql_line(q))
+        res = sf_query(q)
         if res.get("records"):
             return res["records"][0]["Id"]
         q2 = f"""
@@ -38,7 +37,7 @@ def _resolve_open_opportunity_id(name: str) -> str | None:
             ORDER BY CloseDate ASC
             LIMIT 1
             """
-        res2 = sf.query(_soql_line(q2))
+        res2 = sf_query(q2)
         if res2.get("records"):
             return res2["records"][0]["Id"]
     except Exception as e:
@@ -48,7 +47,7 @@ def _resolve_open_opportunity_id(name: str) -> str | None:
 
 def _fetch_opportunity_record(opp_id: str) -> dict | None:
     """Single Opportunity row with Account sub-query fields (renewal SOQL shape)."""
-    from domain.salesforce.org62_client import _escape, _soql_line, get_sf_client
+    from domain.salesforce.org62_client import _escape, sf_query
 
     oid = _escape(opp_id)
     fields = (
@@ -60,9 +59,8 @@ def _fetch_opportunity_record(opp_id: str) -> dict | None:
         "Manager_Forecast_Judgement__c"
     )
     q = f"SELECT {fields} FROM Opportunity WHERE Id = '{oid}' LIMIT 1"
-    sf = get_sf_client()
     try:
-        result = sf.query(_soql_line(q))
+        result = sf_query(q)
         records = result.get("records", [])
         return records[0] if records else None
     except Exception as e:
@@ -188,7 +186,6 @@ class GMReviewWorkflow:
         from domain.content.canvas_builder import build_adoption_pov
         from domain.intelligence.risk_engine import generate_risk_analysis
         from domain.salesforce.org62_client import (
-            _sf_call_guarded,
             get_account_team,
             get_red_account,
             get_renewal_opportunities,
@@ -196,7 +193,8 @@ class GMReviewWorkflow:
             resolve_account_enhanced,
         )
 
-        start = time.time()
+        t0 = time.time()
+        t_resolve_start = t0
         raw_in = (account_input or "").strip()
 
         opp: dict = {}
@@ -235,20 +233,18 @@ class GMReviewWorkflow:
             return None
 
         account_id_15 = to_15_char_id(account_id)
+        log_debug(f"  [timing] resolve: {time.time() - t_resolve_start:.2f}s")
 
         red: dict = {}
         team: dict | list = {}
 
+        t_sf_start = time.time()
         if needs_renewal_lookup:
             # Case 1: account resolved by name — parallel SF before Snowflake
             with ThreadPoolExecutor(max_workers=3) as sf_ex:
-                fut_opps = sf_ex.submit(
-                    _sf_call_guarded, get_renewal_opportunities, account_id, cloud
-                )
-                fut_red = sf_ex.submit(_sf_call_guarded, get_red_account, account_id)
-                fut_team = sf_ex.submit(
-                    _sf_call_guarded, get_account_team, account_id
-                )
+                fut_opps = sf_ex.submit(get_renewal_opportunities, account_id, cloud)
+                fut_red = sf_ex.submit(get_red_account, account_id)
+                fut_team = sf_ex.submit(get_account_team, account_id)
 
                 try:
                     opps = fut_opps.result(timeout=15)
@@ -269,17 +265,22 @@ class GMReviewWorkflow:
                     team = []
 
             if not opps:
-                opps = _sf_call_guarded(
-                    get_renewal_opportunities_any_cloud, account_id
-                )
+                opps = get_renewal_opportunities_any_cloud(account_id)
             if not opps:
                 opps = []
             opp = opps[0] if opps else {}
+            log_debug(f"  [timing] SF parallel: {time.time() - t_sf_start:.2f}s")
+        else:
+            log_debug(
+                "  [timing] SF parallel: 0.00s (overlapped with Snowflake pool)"
+            )
 
         opty_id = str(opp.get("Id", "") or "") if opp else ""
 
         _enrich_fn = enrich_account_fn or enrich_account
 
+        t_snow_start = time.time()
+        snow_note = "" if needs_renewal_lookup else " (incl. overlapped SF)"
         if needs_renewal_lookup:
             with ThreadPoolExecutor(max_workers=3) as ex:
                 fut_enrich = ex.submit(
@@ -306,6 +307,9 @@ class GMReviewWorkflow:
                     log_debug(f"get_account_attrition (all) error: {str(e)[:60]}")
                     all_products = []
 
+            log_debug(
+                f"  [timing] Snowflake: {time.time() - t_snow_start:.2f}s{snow_note}"
+            )
         else:
             # Case 2: opp already known — enrich + attrition + red + team in one pool
             with ThreadPoolExecutor(max_workers=5) as ex:
@@ -314,10 +318,8 @@ class GMReviewWorkflow:
                 )
                 fut_products = ex.submit(get_account_attrition, account_id_15, cloud)
                 fut_all_prod = ex.submit(get_account_attrition, account_id_15, None)
-                fut_red = ex.submit(_sf_call_guarded, get_red_account, account_id)
-                fut_team = ex.submit(
-                    _sf_call_guarded, get_account_team, account_id
-                )
+                fut_red = ex.submit(get_red_account, account_id)
+                fut_team = ex.submit(get_account_team, account_id)
 
                 try:
                     enrichment = fut_enrich.result(timeout=30)
@@ -350,6 +352,9 @@ class GMReviewWorkflow:
                     team = []
 
             product_attrition = products
+            log_debug(
+                f"  [timing] Snowflake: {time.time() - t_snow_start:.2f}s{snow_note}"
+            )
 
         if not isinstance(enrichment, dict):
             enrichment = {}
@@ -358,6 +363,7 @@ class GMReviewWorkflow:
         display = format_enrichment_for_display(enrichment)
         adoption_pov = build_adoption_pov(usage_raw, cloud=cloud)
 
+        t_llm_start = time.time()
         risk_notes, recommendation = generate_risk_analysis(
             account_name=account_name,
             opp=opp,
@@ -365,8 +371,8 @@ class GMReviewWorkflow:
             snowflake_enrichment=enrichment,
             call_llm_fn=self.call_llm_fn,
         )
-
-        log_debug(f"✓ {account_name} done in {time.time() - start:.1f}s")
+        log_debug(f"  [timing] LLM: {time.time() - t_llm_start:.2f}s")
+        log_debug(f"  [timing] total: {time.time() - t0:.2f}s — {account_name}")
 
         return {
             "account_id": account_id,

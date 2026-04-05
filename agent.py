@@ -127,6 +127,12 @@ Classify this and return JSON:"""
         response = call_llm_gateway_with_retry(
             prompt, system_prompt=system_prompt, max_tokens=200
         )
+        if not (response and str(response).strip()):
+            log_debug("Agent: LLM empty or circuit open — defaulting to account lookup")
+            return {
+                "tool": "get_account_brief",
+                "params": {"account_name": text, "cloud": last_cloud},
+            }
 
         # Extract JSON from response
         response = response.strip()

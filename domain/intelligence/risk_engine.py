@@ -211,16 +211,19 @@ Risk Reason: {risk_reason}
 Risk Detail: {risk_detail}
 """
 
+    fallback_notes = (
+        f"- Forecasted attrition: ${atr_fmt:,.0f}\n"
+        f"- Risk theme: {theme}\n"
+        f"- ARI category: {ari.get('category', 'Unknown')}"
+    )
+    fallback_recommendation = (
+        "\n".join(f"- {r}" for r in recs[:2])
+        if recs
+        else "- Executive engagement recommended\n- Review adoption metrics"
+    )
+
     if not call_llm_fn:
-        risk_notes = (
-            f"- Forecasted attrition: ${atr_fmt:,.0f}\n"
-            f"- Risk theme: {theme}\n"
-            f"- ARI category: {ari.get('category', 'Unknown')}"
-        )
-        recommendation = "\n".join(f"- {r}" for r in recs[:2]) if recs else (
-            "- Executive engagement recommended\n- Review adoption metrics"
-        )
-        return risk_notes.strip(), recommendation.strip()
+        return fallback_notes.strip(), fallback_recommendation.strip()
 
     try:
         risk_notes = call_llm_fn(
@@ -239,11 +242,9 @@ Risk Detail: {risk_detail}
         )
     except Exception as e:
         log_debug(f"Risk notes generation error: {str(e)[:100]}")
-        risk_notes = (
-            f"- Forecasted attrition: ${atr_fmt:,.0f}\n"
-            f"- Risk theme: {theme}\n"
-            f"- ARI category: {ari.get('category', 'Unknown')}"
-        )
+        risk_notes = ""
+    if not (risk_notes and str(risk_notes).strip()):
+        risk_notes = fallback_notes
 
     rec_context = f"""
 Account: {account_name}
@@ -272,11 +273,9 @@ Account context:
         )
     except Exception as e:
         log_debug(f"Recommendation generation error: {str(e)[:100]}")
-        recommendation = (
-            "\n".join(f"- {r}" for r in recs[:2])
-            if recs
-            else "- Executive engagement recommended\n- Review adoption metrics"
-        )
+        recommendation = ""
+    if not (recommendation and str(recommendation).strip()):
+        recommendation = fallback_recommendation
 
     return risk_notes.strip(), recommendation.strip()
 

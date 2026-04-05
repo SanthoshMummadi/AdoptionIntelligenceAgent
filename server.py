@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from log_utils import log_debug
+from log_utils import log_debug, log_error
 
 # Load environment variables
 load_dotenv()
@@ -27,6 +27,52 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Shared LLM Gateway HTTP session (connection pooling; retries via call_llm_gateway_with_retry)
 _llm_session: requests.Session | None = None
 _llm_session_lock = threading.Lock()
+
+_llm_failure_count = 0
+_llm_circuit_open_until = 0.0
+_llm_cb_lock = threading.Lock()
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+LLM_CIRCUIT_THRESHOLD = _env_int("LLM_CIRCUIT_THRESHOLD", 3)
+LLM_CIRCUIT_COOLDOWN = _env_int("LLM_CIRCUIT_COOLDOWN", 300)
+
+
+def _llm_circuit_is_open() -> bool:
+    global _llm_circuit_open_until, _llm_failure_count
+    if _llm_circuit_open_until == 0.0:
+        return False
+    if time.time() > _llm_circuit_open_until:
+        with _llm_cb_lock:
+            _llm_circuit_open_until = 0.0
+            _llm_failure_count = 0
+        log_debug("LLM circuit breaker RESET — resuming normal mode")
+        return False
+    return True
+
+
+def _llm_record_failure() -> None:
+    global _llm_failure_count, _llm_circuit_open_until
+    with _llm_cb_lock:
+        _llm_failure_count += 1
+        if _llm_failure_count >= LLM_CIRCUIT_THRESHOLD:
+            _llm_circuit_open_until = time.time() + LLM_CIRCUIT_COOLDOWN
+            log_error(
+                f"LLM circuit breaker OPEN — {_llm_failure_count} consecutive failures. "
+                f"Degraded mode for {LLM_CIRCUIT_COOLDOWN}s."
+            )
+
+
+def _llm_record_success() -> None:
+    global _llm_failure_count
+    with _llm_cb_lock:
+        _llm_failure_count = 0
 
 
 def _get_llm_session() -> requests.Session:
@@ -157,32 +203,44 @@ def call_llm_gateway_with_retry(
     max_tokens: int = 4000,
     max_retries: int = 2,
     backoff: float = 2.0,
-):
-    """Call LLM Gateway with retry on timeout / rate limit / overload."""
+) -> str:
+    """
+    LLM call with circuit breaker + retry. Returns '' in degraded mode (circuit open).
+
+    Transient errors (timeout, 429, 503, overload, rate) increment the failure counter
+    and retry; non-transient errors re-raise without opening the circuit.
+    """
+    if _llm_circuit_is_open():
+        log_debug("LLM circuit breaker OPEN — skipping LLM (degraded mode)")
+        return ""
+
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return call_llm_gateway(
+            result = call_llm_gateway(
                 prompt, system_prompt=system_prompt, max_tokens=max_tokens
             )
+            _llm_record_success()
+            return result
         except Exception as e:
             last_error = e
             err_str = str(e).lower()
-            if any(
+            is_transient = any(
                 kw in err_str
-                for kw in ("timeout", "rate", "429", "503", "overload")
-            ):
+                for kw in ("timeout", "429", "503", "overload", "rate")
+            )
+            if is_transient:
+                _llm_record_failure()
                 if attempt < max_retries:
                     wait = backoff * (2**attempt)
                     log_debug(
-                        f"LLM Gateway error (attempt {attempt + 1}), "
+                        f"LLM transient error (attempt {attempt + 1}), "
                         f"retrying in {wait:.0f}s: {str(e)[:60]}"
                     )
                     time.sleep(wait)
                     continue
+                raise last_error
             raise
-    assert last_error is not None
-    raise last_error
 
 
 # ============================================================================
@@ -290,7 +348,12 @@ When summarizing adoption status, risks, or "what to focus on" for a product, us
 Keep the tone concise and actionable."""
 
         answer = call_llm_gateway_with_retry(llm_prompt, system_prompt, max_tokens=4000)
-        return answer
+        if answer and str(answer).strip():
+            return answer
+        return (
+            "⚠️ AI is temporarily unavailable (LLM circuit open or empty response). "
+            "Try again in a few minutes, or use the non-LLM views in the app."
+        )
 
     except Exception as e:
         return f"❌ Error calling LLM: {str(e)}"
@@ -412,10 +475,9 @@ def test_snowflake_connection() -> str:
 def test_salesforce_connection() -> str:
     """Test Salesforce connection and credentials"""
     try:
-        from domain.salesforce.org62_client import get_sf_client
+        from domain.salesforce.org62_client import sf_query
 
-        sf = get_sf_client()
-        sf.query("SELECT Id FROM User LIMIT 1")
+        sf_query("SELECT Id FROM User LIMIT 1")
         return "✓ Salesforce session successful!"
     except Exception as e:
         return f"❌ Salesforce connection failed: {str(e)}"

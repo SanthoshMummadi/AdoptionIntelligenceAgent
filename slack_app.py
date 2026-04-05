@@ -785,7 +785,7 @@ def smart_title_case(name: str) -> str:
 def handle_list_query(text: str, user_id: str, say) -> None:
     """Show a Snowflake at-risk account list when a single-account lookup has no match."""
     from domain.analytics.snowflake_client import get_at_risk_accounts_snowflake
-    from domain.salesforce.org62_client import get_sf_client
+    from domain.salesforce.org62_client import sf_query
     from filter_parser import parse_filters
 
     f = parse_filters(text)
@@ -853,14 +853,13 @@ def handle_list_query(text: str, user_id: str, say) -> None:
         )
         return
 
-    sf = get_sf_client()
     id_to_name: dict[str, str] = {}
     ids = list({r["account_id"] for r in records})
     try:
         for i in range(0, len(ids), 50):
             batch = ids[i : i + 50]
             id_list = "','".join(str(b) for b in batch)
-            result = sf.query(
+            result = sf_query(
                 "SELECT Id, Name FROM Account WHERE Id IN ('" + id_list + "')"
             )
             for rec in result.get("records", []):
@@ -957,12 +956,11 @@ def attrition_risk_cmd(ack, say, command, client):
             from domain.intelligence.risk_engine import generate_risk_analysis
             from domain.salesforce.org62_client import (
                 _escape,
-                _soql_line,
                 get_red_account,
                 get_renewal_opportunities,
                 get_renewal_opportunities_any_cloud,
-                get_sf_client,
                 resolve_account_enhanced,
+                sf_query,
             )
             from filter_parser import parse_filters
 
@@ -990,11 +988,9 @@ def attrition_risk_cmd(ack, say, command, client):
                 opp_id = opp_id_match.group(1)
                 say(":mag: Looking up opportunity *" + opp_id + "*...")
 
-                sf = get_sf_client()
                 try:
-                    result = sf.query(
-                        _soql_line(
-                            f"""
+                    result = sf_query(
+                        f"""
                         SELECT
                             Id, Name, StageName, Amount, CloseDate,
                             Account.Id, Account.Name,
@@ -1009,7 +1005,6 @@ def attrition_risk_cmd(ack, say, command, client):
                         WHERE Id = '{_escape(opp_id)}'
                         LIMIT 1
                     """
-                        )
                     )
                     if not result.get("records"):
                         say(":x: Opportunity *" + opp_id + "* not found in org62.")
@@ -1132,6 +1127,8 @@ def attrition_risk_cmd(ack, say, command, client):
                     ),
                     max_tokens=100,
                 )
+                if not (tldr and str(tldr).strip()):
+                    tldr = None
             except Exception:
                 tldr = None
 
