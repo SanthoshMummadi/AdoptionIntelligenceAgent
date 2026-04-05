@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from log_utils import log_debug
+from log_utils import log_debug, log_structured
 
 _OPP_ID_RE = re.compile(r"^006[A-Za-z0-9]{12,18}$")
 
@@ -97,6 +98,7 @@ class GMReviewWorkflow:
         from domain.salesforce.org62_client import resolve_account_enhanced
 
         log_debug(f"GMReviewWorkflow: {len(account_inputs)} inputs, cloud={cloud}")
+        run_id = str(uuid.uuid4())
 
         _resolution_cache: dict[str, dict] = {}
         _enrichment_cache: dict[str, dict] = {}
@@ -130,6 +132,7 @@ class GMReviewWorkflow:
                     cloud,
                     _resolve_with_cache,
                     _enrich_with_cache,
+                    run_id,
                 ): inp
                 for inp in account_inputs
             }
@@ -175,6 +178,7 @@ class GMReviewWorkflow:
         cloud: str,
         resolve_account_fn: Callable[[str], dict | None] | None = None,
         enrich_account_fn: Callable[..., dict] | None = None,
+        run_id: str | None = None,
     ) -> dict | None:
         """Generate a single account review — all direct domain calls."""
         from domain.analytics.snowflake_client import (
@@ -233,12 +237,14 @@ class GMReviewWorkflow:
             return None
 
         account_id_15 = to_15_char_id(account_id)
-        log_debug(f"  [timing] resolve: {time.time() - t_resolve_start:.2f}s")
+        t_resolve = time.time() - t_resolve_start
+        log_debug(f"  [timing] resolve: {t_resolve:.2f}s")
 
         red: dict = {}
         team: dict | list = {}
 
         t_sf_start = time.time()
+        t_sf = 0.0
         if needs_renewal_lookup:
             # Case 1: account resolved by name — parallel SF before Snowflake
             with ThreadPoolExecutor(max_workers=3) as sf_ex:
@@ -269,7 +275,8 @@ class GMReviewWorkflow:
             if not opps:
                 opps = []
             opp = opps[0] if opps else {}
-            log_debug(f"  [timing] SF parallel: {time.time() - t_sf_start:.2f}s")
+            t_sf = time.time() - t_sf_start
+            log_debug(f"  [timing] SF parallel: {t_sf:.2f}s")
         else:
             log_debug(
                 "  [timing] SF parallel: 0.00s (overlapped with Snowflake pool)"
@@ -307,8 +314,9 @@ class GMReviewWorkflow:
                     log_debug(f"get_account_attrition (all) error: {str(e)[:60]}")
                     all_products = []
 
+            t_snow = time.time() - t_snow_start
             log_debug(
-                f"  [timing] Snowflake: {time.time() - t_snow_start:.2f}s{snow_note}"
+                f"  [timing] Snowflake: {t_snow:.2f}s{snow_note}"
             )
         else:
             # Case 2: opp already known — enrich + attrition + red + team in one pool
@@ -352,8 +360,9 @@ class GMReviewWorkflow:
                     team = []
 
             product_attrition = products
+            t_snow = time.time() - t_snow_start
             log_debug(
-                f"  [timing] Snowflake: {time.time() - t_snow_start:.2f}s{snow_note}"
+                f"  [timing] Snowflake: {t_snow:.2f}s{snow_note}"
             )
 
         if not isinstance(enrichment, dict):
@@ -371,8 +380,20 @@ class GMReviewWorkflow:
             snowflake_enrichment=enrichment,
             call_llm_fn=self.call_llm_fn,
         )
-        log_debug(f"  [timing] LLM: {time.time() - t_llm_start:.2f}s")
+        t_llm = time.time() - t_llm_start
+        log_debug(f"  [timing] LLM: {t_llm:.2f}s")
         log_debug(f"  [timing] total: {time.time() - t0:.2f}s — {account_name}")
+        log_structured(
+            "account_review",
+            account=account_name,
+            run_id=run_id or "",
+            resolve_ms=round(t_resolve * 1000),
+            sf_ms=round(t_sf * 1000),
+            snowflake_ms=round(t_snow * 1000),
+            llm_ms=round(t_llm * 1000),
+            total_ms=round((time.time() - t0) * 1000),
+            status="ok",
+        )
 
         return {
             "account_id": account_id,

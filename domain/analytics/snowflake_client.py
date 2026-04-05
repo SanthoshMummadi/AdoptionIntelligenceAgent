@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 import snowflake.connector
 from dotenv import load_dotenv
-from log_utils import log_debug, log_error
+from log_utils import log_debug, log_error, log_structured
 
 load_dotenv()
 
@@ -233,12 +233,21 @@ def run_query(sql: str, params: Optional[list] = None) -> list[dict]:
     def _execute(conn: Any) -> list[dict]:
         cursor = conn.cursor()
         try:
+            t_query_start = time.time()
             statement_timeout = _env_int("SNOWFLAKE_STATEMENT_TIMEOUT", 30)
             cursor.execute(
                 f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {statement_timeout}"
             )
             cursor.execute(sql, params or [])
             rows = cursor.fetchall()
+            elapsed = time.time() - t_query_start
+            if elapsed > 10:
+                log_structured(
+                    "snowflake_slow_query",
+                    level="warning",
+                    latency_s=round(elapsed, 2),
+                    sql_preview=str(sql)[:80],
+                )
             if not cursor.description:
                 return []
             columns = [d[0] for d in cursor.description]

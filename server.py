@@ -3,18 +3,83 @@ import PyPDF2
 import json
 import os
 import pickle
+import sys
 import threading
 import time
 import urllib3
+import certifi
 import requests
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from log_utils import log_debug, log_error
+from log_utils import log_debug, log_error, log_structured
 
 # Load environment variables
 load_dotenv()
+
+
+def _validate_required_env() -> None:
+    """Validate required env vars at startup — fail fast with clear error."""
+    required = {
+        "SNOWFLAKE_USER": "Snowflake username",
+        "SNOWFLAKE_ACCOUNT": "Snowflake account identifier",
+        "LLM_GATEWAY_API_KEY": "LLM Gateway API key",
+    }
+
+    # Salesforce: either session token + instance, or username + password
+    sf_valid = (
+        (os.getenv("SALESFORCE_SESSION_ID") and os.getenv("SALESFORCE_INSTANCE_URL"))
+        or (os.getenv("SALESFORCE_USERNAME") and os.getenv("SALESFORCE_PASSWORD"))
+    )
+
+    missing: list[str] = []
+    for key, description in required.items():
+        if not os.getenv(key):
+            missing.append(f"  - {key} ({description})")
+
+    if not sf_valid:
+        missing.append(
+            "  - Salesforce auth: need either (SALESFORCE_SESSION_ID + SALESFORCE_INSTANCE_URL) "
+            "or (SALESFORCE_USERNAME + SALESFORCE_PASSWORD)"
+        )
+
+    if missing:
+        error_msg = "❌ Missing required environment variables:\n" + "\n".join(missing)
+        error_msg += "\n\nCheck your .env file and ensure all required vars are set."
+        log_error(error_msg)
+        raise RuntimeError(error_msg)
+
+    if os.getenv("LLM_GATEWAY_VERIFY", "").strip().lower() == "false":
+        log_error(
+            "⚠️ WARNING: LLM_GATEWAY_VERIFY=false detected — ignored; "
+            "LLM gateway always verifies TLS (certifi, LLM_GATEWAY_CA_BUNDLE, or system CAs)."
+        )
+
+    log_debug("✓ All required environment variables present")
+
+
+def _should_run_startup_env_validation() -> bool:
+    """Skip when tests import this module without full .env (pytest or scripts under tests/)."""
+    if os.getenv("PRODUCT_ADOPTION_SKIP_ENV_VALIDATION", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    if "pytest" in sys.modules:
+        return False
+    main = sys.modules.get("__main__")
+    main_file = getattr(main, "__file__", None) if main else None
+    if main_file:
+        parts = os.path.normpath(os.path.abspath(main_file)).split(os.sep)
+        if "tests" in parts:
+            return False
+    return True
+
+
+if _should_run_startup_env_validation():
+    _validate_required_env()
 
 # Import GM Review components
 from services.gm_review_workflow import GMReviewWorkflow
@@ -53,6 +118,7 @@ def _llm_circuit_is_open() -> bool:
             _llm_circuit_open_until = 0.0
             _llm_failure_count = 0
         log_debug("LLM circuit breaker RESET — resuming normal mode")
+        log_structured("llm_circuit_reset")
         return False
     return True
 
@@ -66,6 +132,12 @@ def _llm_record_failure() -> None:
             log_error(
                 f"LLM circuit breaker OPEN — {_llm_failure_count} consecutive failures. "
                 f"Degraded mode for {LLM_CIRCUIT_COOLDOWN}s."
+            )
+            log_structured(
+                "llm_circuit_open",
+                level="error",
+                failure_count=_llm_failure_count,
+                cooldown_s=LLM_CIRCUIT_COOLDOWN,
             )
 
 
@@ -142,6 +214,41 @@ def get_user_briefs(user_id: str):
 # LLM GATEWAY
 # ============================================================================
 
+_llm_verify_resolved: str | bool | None = None
+
+
+def _get_llm_verify_config() -> str | bool:
+    """
+    TLS verification for LLM gateway requests.
+
+    Priority: custom CA bundle (LLM_GATEWAY_CA_BUNDLE) > certifi > system default.
+    verify=False is not used; LLM_GATEWAY_VERIFY=false is warned at startup only.
+    """
+    global _llm_verify_resolved
+    if _llm_verify_resolved is not None:
+        return _llm_verify_resolved
+
+    custom_ca = os.getenv("LLM_GATEWAY_CA_BUNDLE")
+    if custom_ca:
+        if os.path.isfile(custom_ca):
+            log_debug(f"Using custom CA bundle for LLM gateway: {custom_ca}")
+            _llm_verify_resolved = custom_ca
+            return _llm_verify_resolved
+        log_error(f"Custom CA bundle not found: {custom_ca}")
+
+    try:
+        ca_path = certifi.where()
+        log_debug(f"Using certifi CA bundle for LLM gateway: {ca_path}")
+        _llm_verify_resolved = ca_path
+        return _llm_verify_resolved
+    except Exception:
+        pass
+
+    log_debug("Using system default CA bundle for LLM gateway")
+    _llm_verify_resolved = True
+    return _llm_verify_resolved
+
+
 def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4000):
     """Call Salesforce LLM Gateway Express"""
 
@@ -168,21 +275,29 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
         "temperature": 0.7,
     }
 
+    t_llm = time.time()
+    model = payload["model"]
     try:
-        print(f"🔄 Calling LLM Gateway... (model: {payload['model']})")
+        print(f"🔄 Calling LLM Gateway... (model: {model})")
         session = _get_llm_session()
         response = session.post(
             gateway_url,
             headers=headers,
             json=payload,
             timeout=180,
-            verify=False,
+            verify=_get_llm_verify_config(),
         )
         response.raise_for_status()
 
         data = response.json()
         content = data["choices"][0]["message"]["content"]
         print(f"✓ LLM Gateway response received ({len(content)} chars)")
+        log_structured(
+            "llm_call",
+            status="ok",
+            latency_ms=round((time.time() - t_llm) * 1000),
+            model=model,
+        )
         return content
 
     except requests.exceptions.RequestException as e:
@@ -195,6 +310,16 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
                 error_msg = f"{error_msg}\nResponse: {e.response.text}"
         print(f"❌ LLM Gateway error: {error_msg}")
         raise Exception(f"LLM Gateway error: {error_msg}")
+
+    except Exception as e:
+        log_structured(
+            "llm_call",
+            level="error",
+            status="error",
+            error=str(e)[:80],
+            model=model,
+        )
+        raise
 
 
 def call_llm_gateway_with_retry(
@@ -224,6 +349,13 @@ def call_llm_gateway_with_retry(
             return result
         except Exception as e:
             last_error = e
+            log_structured(
+                "llm_call",
+                level="error",
+                status="error",
+                error=str(e)[:80],
+                attempt=attempt + 1,
+            )
             err_str = str(e).lower()
             is_transient = any(
                 kw in err_str
@@ -261,8 +393,100 @@ def init_gm_workflow() -> GMReviewWorkflow:
 
 @mcp.tool()
 def ping() -> str:
-    """Check if MCP server is alive"""
-    return "✓ Product Adoption MCP with persistent storage is running!"
+    """Minimal liveness check — no I/O."""
+    return "pong"
+
+
+def _health_salesforce_env_ok() -> tuple[bool, list[str]]:
+    """True if token+instance or username+password are set (matches org62_client)."""
+    token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
+    inst = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
+    user = os.getenv("SF_USERNAME")
+    password = os.getenv("SF_PASSWORD")
+    if token and inst:
+        return True, []
+    if user and password:
+        return True, []
+    hints: list[str] = []
+    if token and not inst:
+        hints.append("SF_INSTANCE_URL or SALESFORCE_INSTANCE_URL")
+    elif user and not password:
+        hints.append("SF_PASSWORD (with SF_USERNAME)")
+    elif not token and not user:
+        hints.append(
+            "SF_ACCESS_TOKEN+SF_INSTANCE_URL (or SALESFORCE_*), or SF_USERNAME+SF_PASSWORD"
+        )
+    else:
+        hints.append("Salesforce credentials incomplete (see org62_client)")
+    return False, hints
+
+
+@mcp.tool()
+def health_check() -> dict:
+    """
+    Lightweight readiness: env vars, Snowflake pool state, Salesforce ping, LLM circuit.
+    No heavy Snowflake queries — safe to call frequently.
+    """
+    results: dict = {}
+    overall = "ok"
+
+    # 1. Env vars
+    required_snowflake = ["SNOWFLAKE_USER", "SNOWFLAKE_ACCOUNT"]
+    missing = [k for k in required_snowflake if not os.getenv(k)]
+    if not os.getenv("LLM_GATEWAY_API_KEY"):
+        missing.append("LLM_GATEWAY_API_KEY")
+    sf_ok, sf_missing = _health_salesforce_env_ok()
+    if not sf_ok:
+        missing.extend(sf_missing)
+    if missing:
+        results["env"] = {"status": "error", "missing": list(dict.fromkeys(missing))}
+        overall = "degraded"
+    else:
+        results["env"] = {"status": "ok"}
+
+    # 2. Snowflake pool (no query — pool may be lazy until first use)
+    try:
+        from domain.analytics.snowflake_client import POOL_SIZE, _pool, _pool_initialized
+
+        if not _pool_initialized:
+            results["snowflake"] = {
+                "status": "not_initialized",
+                "pool_total": POOL_SIZE,
+            }
+        else:
+            results["snowflake"] = {
+                "status": "ok",
+                "pool_available": _pool.qsize(),
+                "pool_total": POOL_SIZE,
+            }
+    except Exception as e:
+        results["snowflake"] = {"status": "error", "error": str(e)[:80]}
+        overall = "degraded"
+
+    # 3. Salesforce — lightweight ping (sf_query is semaphore-guarded)
+    try:
+        from domain.salesforce.org62_client import sf_query
+
+        t0 = time.time()
+        sf_query("SELECT Id FROM User LIMIT 1")
+        results["salesforce"] = {
+            "status": "ok",
+            "latency_ms": round((time.time() - t0) * 1000),
+        }
+    except Exception as e:
+        results["salesforce"] = {"status": "error", "error": str(e)[:80]}
+        overall = "degraded"
+
+    # 4. LLM circuit breaker (process-local)
+    with _llm_cb_lock:
+        fc = _llm_failure_count
+    results["llm_circuit"] = {
+        "status": "open" if _llm_circuit_is_open() else "closed",
+        "failure_count": fc,
+    }
+
+    results["overall"] = overall
+    return results
 
 
 @mcp.tool()

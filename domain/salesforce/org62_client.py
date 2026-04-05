@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 from simple_salesforce import Salesforce
 from simple_salesforce.exceptions import SalesforceError
-from log_utils import log_debug, log_error
+from log_utils import log_debug, log_error, log_structured
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
@@ -47,8 +47,18 @@ def _sf_call_with_limit_logging(
         err_str = str(e)
         if "REQUEST_LIMIT_EXCEEDED" in err_str:
             log_error(f"SF REQUEST_LIMIT_EXCEEDED: {err_str[:120]}")
+            log_structured(
+                "sf_limit_exceeded",
+                level="error",
+                error=err_str[:120],
+            )
         elif "QUERY_TIMEOUT" in err_str:
             log_debug(f"SF QUERY_TIMEOUT: {err_str[:120]}")
+            log_structured(
+                "sf_query_timeout",
+                level="warning",
+                error=err_str[:120],
+            )
         else:
             log_debug(f"SF error: {err_str[:120]}")
         raise

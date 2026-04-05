@@ -80,10 +80,14 @@ A Slack-native “PM Intelligence Hub” that helps product teams analyze briefs
 - `.env` – runtime configuration (see **`.env.example`** for keys; never commit `.env`).
   - `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
   - `LLM_GATEWAY_API_KEY`, `LLM_MODEL=claude-3-7-sonnet`
-  - Optional: `LLM_GATEWAY_VERIFY_SSL=false` only if the internal gateway needs disabled TLS verify (default is **on**).
+  - TLS: LLM calls use **certifi** (or **`LLM_GATEWAY_CA_BUNDLE`** for a custom CA). `LLM_GATEWAY_VERIFY=false` is ignored with a startup warning.
   - `TABLEAU_*` credentials (for Tableau integrations).
 - `project_paths.py` – `PROJECT_ROOT` for portable `load_dotenv(PROJECT_ROOT / ".env")` (no hardcoded home paths).
-- `docs/REPO_LAYOUT.md` – what’s main vs legacy vs experimental scripts.
+- **Architecture docs**
+  - `docs/ARCHITECTURE.md` — components and data paths
+  - `docs/ARCHITECTURE_DIAGRAM.md` — Mermaid + ASCII diagrams (Slack, MCP, GM Review)
+  - `docs/AI_COUNCIL_GM_REVIEW.md` — **AI Council Review** (= GM Review): flow, AI behavior, entry points, ops
+  - `docs/REPO_LAYOUT.md` — file index and entrypoints
 
 ### Security & portability notes
 

@@ -19,7 +19,10 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 load_dotenv(os.path.join(_ROOT, ".env"))
 import server
+from server import _validate_required_env
 from log_utils import log_error
+
+_validate_required_env()
 
 slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
 if not slack_bot_token:
