@@ -197,8 +197,15 @@ def export_to_gsheet(reviews: list, sheet_name: str | None = None) -> str:
             red_flag = "No"
             if red:
                 red_stage = red.get("Stage__c", "")
-                days_red = red.get("Days_Red__c", "")
-                red_flag = f"Yes - {red_stage} ({days_red} days)"
+                days_red = red.get("days_red")
+                if days_red is None:
+                    days_red = red.get("Days_Red__c") or 0
+                try:
+                    days_red = int(days_red) if days_red is not None else 0
+                except (TypeError, ValueError):
+                    days_red = 0
+                days_red_str = f"{days_red} days" if days_red > 0 else "N/A"
+                red_flag = f"Yes - {red_stage} ({days_red_str})"
 
             close_date = opp.get("CloseDate", "") or ""
             renewal_month = close_date[:7] if close_date else "N/A"

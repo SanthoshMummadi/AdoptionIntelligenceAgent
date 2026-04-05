@@ -5,7 +5,7 @@ Intent classification and routing using Claude.
 import json
 from datetime import datetime
 
-from server import call_llm_gateway
+from server import call_llm_gateway_with_retry
 from log_utils import log_debug
 
 
@@ -124,7 +124,9 @@ User message: "{text}"
 Classify this and return JSON:"""
 
     try:
-        response = call_llm_gateway(prompt, system_prompt=system_prompt, max_tokens=200)
+        response = call_llm_gateway_with_retry(
+            prompt, system_prompt=system_prompt, max_tokens=200
+        )
 
         # Extract JSON from response
         response = response.strip()

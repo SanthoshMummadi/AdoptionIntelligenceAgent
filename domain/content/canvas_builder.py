@@ -397,12 +397,19 @@ def build_account_brief_blocks(
 
     if red_account:
         stage = red_account.get("Stage__c", "")
-        days_red = red_account.get("Days_Red__c", "")
+        days_red = red_account.get("days_red")
+        if days_red is None:
+            days_red = red_account.get("Days_Red__c") or 0
+        try:
+            days_red = int(days_red) if days_red is not None else 0
+        except (TypeError, ValueError):
+            days_red = 0
+        days_red_str = f"{days_red} days" if days_red > 0 else "N/A"
         latest = (red_account.get("Latest_Updates__c") or "")[:150]
 
         if stage:
             manager_notes_parts.append(
-                f"*Red Account:* :red_circle: {stage} ({days_red} days)"
+                f"*Red Account:* :red_circle: {stage} ({days_red_str})"
             )
         if latest:
             manager_notes_parts.append(f"*Latest Update:* {clean_html(latest)}")

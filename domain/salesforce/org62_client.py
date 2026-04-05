@@ -6,12 +6,14 @@ Loads `.env` from the repository root (not only CWD). Accepts SF_* and SALESFORC
 """
 import os
 import re
+import threading
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
 from simple_salesforce import Salesforce
+from simple_salesforce.exceptions import SalesforceError
 from log_utils import log_debug, log_error
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -19,6 +21,43 @@ load_dotenv(_REPO_ROOT / ".env")
 load_dotenv()
 
 _sf_client = None
+
+
+def _sf_max_concurrent() -> int:
+    try:
+        return max(1, int(os.getenv("SF_MAX_CONCURRENT", "10")))
+    except ValueError:
+        return 10
+
+
+_SF_SEMAPHORE = threading.Semaphore(_sf_max_concurrent())
+
+
+def _sf_call_with_limit_logging(
+    fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Run ``fn``; log Salesforce limit / timeout errors for monitoring."""
+    try:
+        return fn(*args, **kwargs)
+    except SalesforceError as e:
+        err_str = str(e)
+        if "REQUEST_LIMIT_EXCEEDED" in err_str:
+            log_error(f"SF REQUEST_LIMIT_EXCEEDED: {err_str[:120]}")
+        elif "QUERY_TIMEOUT" in err_str:
+            log_debug(f"SF QUERY_TIMEOUT: {err_str[:120]}")
+        else:
+            log_debug(f"SF error: {err_str[:120]}")
+        raise
+    except Exception as e:
+        if "timeout" in str(e).lower():
+            log_debug(f"SF timeout: {str(e)[:120]}")
+        raise
+
+
+def _sf_call_guarded(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Acquire global SF concurrency slot, then run with limit logging."""
+    with _SF_SEMAPHORE:
+        return _sf_call_with_limit_logging(fn, *args, **kwargs)
 
 
 def get_sf_client():
@@ -275,6 +314,10 @@ def _finalize_red_account_record(red: dict) -> None:
     lu = red.get("Latest_Updates__c")
     if lu:
         red["Latest_Updates__c"] = clean_html(str(lu))
+    try:
+        red["days_red"] = int(red.get("Days_Red__c") or 0)
+    except (TypeError, ValueError):
+        red["days_red"] = 0
 
 
 def get_red_account(account_id: str) -> Optional[dict]:

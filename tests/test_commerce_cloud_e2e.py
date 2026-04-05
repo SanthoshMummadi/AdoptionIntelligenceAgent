@@ -989,15 +989,21 @@ def test_fmt_amount_edge():
     assert fmt_amount("") == "N/A"
 
 
-@test("EC-005: Snowflake reconnects on lost connection")
+@test("EC-005: Snowflake pool re-inits after reset")
 def test_snow_reconnect():
-    import domain.analytics.snowflake_client as sc
-    from domain.analytics.snowflake_client import get_snowflake_connection
+    from domain.analytics.snowflake_client import (
+        get_snowflake_connection,
+        reset_snowflake_pool,
+        return_connection,
+    )
 
-    sc._sf_connection = None
+    reset_snowflake_pool()
     conn = get_snowflake_connection()
-    assert conn is not None
-    assert not conn.is_closed()
+    try:
+        assert conn is not None
+        assert not conn.is_closed()
+    finally:
+        return_connection(conn)
 
 
 @test("EC-006: is_success_plan identifies correctly")

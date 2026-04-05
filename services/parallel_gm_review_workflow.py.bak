@@ -1,0 +1,252 @@
+"""Parallel GM Review Workflow Service."""
+import asyncio
+import re
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+from functools import partial
+from typing import Any, Dict, List, Optional
+
+from adapters.canvas_adapter import CanvasAdapter
+from adapters.salesforce_adapter import SalesforceAdapter
+from adapters.snowflake_adapter import SnowflakeAdapter
+from domain.analytics.snowflake_client import (
+    enrich_account,
+    format_enrichment_for_display,
+    get_account_attrition,
+    get_usage_raw_data,
+    to_15_char_id,
+)
+from domain.content.canvas_builder import (
+    build_adoption_pov,
+    build_gm_review_canvas_markdown,
+)
+from domain.intelligence.risk_engine import RiskEngine
+
+_OPP_ID_RE = re.compile(r"^006[A-Za-z0-9]{12,15}$")
+
+
+class ParallelGMReviewWorkflow:
+    """Orchestrates parallel GM review generation."""
+
+    def __init__(
+        self,
+        salesforce_adapter: SalesforceAdapter,
+        snowflake_adapter: SnowflakeAdapter,
+        canvas_adapter: CanvasAdapter,
+        risk_engine: RiskEngine,
+        max_concurrent: int = 5,
+    ):
+        """Initialize workflow with adapters."""
+        self.sf = salesforce_adapter
+        self.snow = snowflake_adapter
+        self.canvas = canvas_adapter
+        self.risk_engine = risk_engine
+        self.max_concurrent = max_concurrent
+
+    def resolve_inputs(
+        self, inputs: List[str], cloud: str = "Commerce Cloud"
+    ) -> List[str]:
+        """
+        Resolve account names or opportunity IDs to account IDs.
+
+        Args:
+            inputs: List of account names or opportunity IDs (006…)
+
+        Returns:
+            List of resolved account IDs (deduplicated, order preserved)
+        """
+        account_ids: List[str] = []
+        for input_val in inputs:
+            raw = (input_val or "").strip()
+            if not raw:
+                continue
+
+            account_id = None
+            if _OPP_ID_RE.match(raw):
+                opp_details = self.sf.get_opportunity_details(raw)
+                if opp_details:
+                    account_id = opp_details.get("AccountId")
+            else:
+                account_id = self.sf.resolve_account_id(raw, cloud=cloud)
+                if not account_id:
+                    opp_id = self.sf.resolve_opportunity_id(raw)
+                    if opp_id:
+                        od = self.sf.get_opportunity_details(opp_id)
+                        if od:
+                            account_id = od.get("AccountId")
+
+            if account_id:
+                account_ids.append(account_id)
+
+        seen = set()
+        unique: List[str] = []
+        for aid in account_ids:
+            if aid not in seen:
+                seen.add(aid)
+                unique.append(aid)
+        return unique
+
+    def _resolve_display_name(self, account_data: Dict[str, Any]) -> str:
+        """Ensure Salesforce account Name is loaded and normalize whitespace."""
+        aid = str(account_data.get("account_id") or "").strip()
+        sf = account_data.get("salesforce") or {}
+        acc = sf.get("account")
+        name = (acc or {}).get("Name") if acc else None
+        if name and str(name).strip():
+            return " ".join(str(name).split())
+        details = self.sf.get_account_details(aid)
+        if details and details.get("Name"):
+            account_data.setdefault("salesforce", {})["account"] = details
+            return " ".join(str(details["Name"]).split())
+        return " ".join(aid.split()) if aid else "Account"
+
+    def fetch_account_data(self, account_id: str) -> Dict[str, Any]:
+        """
+        Fetch all data for a single account (Salesforce + Snowflake).
+
+        Args:
+            account_id: Salesforce account ID
+
+        Returns:
+            Merged account data dictionary
+        """
+        sf_data = {
+            "account": self.sf.get_account_details(account_id),
+            "team": self.sf.get_account_team(account_id),
+            "red_account": self.sf.get_red_account_info(account_id),
+        }
+
+        snow_data = {
+            "usage": self.snow.get_account_usage(account_id),
+            "ari_score": self.snow.get_ari_score(account_id),
+            "attrition": self.snow.get_attrition_signals(account_id),
+        }
+
+        return {
+            "account_id": account_id,
+            "salesforce": sf_data,
+            "analytics": snow_data,
+        }
+
+    def generate_review(
+        self, account_data: Dict[str, Any], cloud: str = "Commerce Cloud"
+    ) -> Dict[str, Any]:
+        """
+        Generate GM review for account.
+
+        Args:
+            account_data: Merged account data
+
+        Returns:
+            Review data with risk analysis and adoption POV
+        """
+        account_name = self._resolve_display_name(account_data)
+        risk_analysis = self.risk_engine.analyze_risk(account_data)
+
+        aid = account_data["account_id"]
+        opp = self.sf.get_renewal_opportunity(aid, cloud) or {}
+        opty_id = opp.get("Id", "") if opp else ""
+        enrichment = enrich_account(aid, opty_id or None, cloud)
+        display = format_enrichment_for_display(enrichment)
+        account_id_15 = to_15_char_id(aid)
+        usage_raw = get_usage_raw_data(account_id_15, cloud=cloud)
+        adoption_pov = build_adoption_pov(usage_raw, cloud=cloud)
+        product_attrition = get_account_attrition(account_id_15, cloud)
+        all_products_attrition = get_account_attrition(account_id_15, None)
+        red = (account_data.get("salesforce") or {}).get("red_account")
+
+        return {
+            "account_id": account_data["account_id"],
+            "account_name": account_name,
+            "risk_analysis": risk_analysis,
+            "adoption_pov": adoption_pov,
+            "usage_raw": usage_raw,
+            "opp": opp,
+            "enrichment": enrichment,
+            "snowflake_display": display,
+            "product_attrition": product_attrition or [],
+            "all_products_attrition": all_products_attrition or [],
+            "red_account": red,
+            "risk_notes": str(risk_analysis.get("risk_notes") or ""),
+            "recommendation": str(risk_analysis.get("recommendation") or ""),
+        }
+
+    async def process_accounts_parallel(
+        self, account_ids: List[str], cloud: str = "Commerce Cloud"
+    ) -> List[Dict[str, Any]]:
+        """
+        Process multiple accounts in parallel.
+
+        Args:
+            account_ids: List of account IDs to process
+
+        Returns:
+            List of review results
+        """
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+            fetch_tasks = [
+                loop.run_in_executor(executor, self.fetch_account_data, account_id)
+                for account_id in account_ids
+            ]
+            account_data_list = await asyncio.gather(*fetch_tasks)
+
+            review_tasks = [
+                loop.run_in_executor(
+                    executor,
+                    partial(self.generate_review, account_data, cloud),
+                )
+                for account_data in account_data_list
+            ]
+            reviews = await asyncio.gather(*review_tasks)
+
+        return reviews
+
+    def run(
+        self,
+        inputs: List[str],
+        cloud: str = "Commerce Cloud",
+        filter_label: str = "",
+        today: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Main entry point - run the full workflow.
+
+        Returns:
+            ``{"reviews": [...], "combined_canvas": markdown}``
+        """
+        account_ids = self.resolve_inputs(inputs, cloud)
+
+        if not account_ids:
+            return {"reviews": [], "combined_canvas": ""}
+
+        reviews = asyncio.run(self.process_accounts_parallel(account_ids, cloud))
+
+        canvas_today = today or date.today().strftime("%A, %B %d, %Y")
+        canvas_filter = filter_label or f"{cloud} - Q2 FY2027"
+        canvas_reviews = [
+            {
+                "account_name": r["account_name"],
+                "account_id": r["account_id"],
+                "opp": r.get("opp") or {},
+                "snowflake_display": r.get("snowflake_display") or {},
+                "enrichment": r.get("enrichment") or {},
+                "red_account": r.get("red_account"),
+                "risk_notes": r.get("risk_notes", ""),
+                "recommendation": r.get("recommendation", ""),
+                "product_attrition": r.get("product_attrition") or [],
+                "all_products_attrition": r.get("all_products_attrition") or [],
+            }
+            for r in reviews
+        ]
+        combined_canvas = build_gm_review_canvas_markdown(
+            reviews=canvas_reviews,
+            cloud=cloud,
+            filter_label=canvas_filter,
+            today=canvas_today,
+        )
+
+        return {
+            "reviews": reviews,
+            "combined_canvas": combined_canvas,
+        }

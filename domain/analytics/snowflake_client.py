@@ -4,8 +4,10 @@ Snowflake enrichment — CSS attrition uses MAX(SNAPSHOT_DT) (no CURR_SNAP) + re
 """
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Empty, Queue
 from typing import Any, Optional
 
 import snowflake.connector
@@ -13,6 +15,14 @@ from dotenv import load_dotenv
 from log_utils import log_debug, log_error
 
 load_dotenv()
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except ValueError:
+        return default
+
 
 # Corporate suffix patterns for account-name stripping (fuzzy resolution)
 CORPORATE_SUFFIXES = (
@@ -29,7 +39,108 @@ SUCCESS_PLAN_KEYWORDS = [
     "- standard",
 ]
 
-_sf_connection: Any = None
+POOL_SIZE = 8
+_pool: Queue = Queue(maxsize=POOL_SIZE)
+_pool_initialized = False
+_pool_lock = threading.Lock()
+
+
+def _snowflake_conn_params() -> dict[str, Any]:
+    user = os.getenv("SNOWFLAKE_USER")
+    account = os.getenv("SNOWFLAKE_ACCOUNT")
+    warehouse = os.getenv("SNOWFLAKE_WAREHOUSE") or "COMPUTE_WH"
+    database = os.getenv("SNOWFLAKE_DATABASE") or "SSE_DM_CSG_RPT_PRD"
+    schema = os.getenv("SNOWFLAKE_SCHEMA") or "RENEWALS"
+    role = os.getenv("SNOWFLAKE_ROLE")
+    password = os.getenv("SNOWFLAKE_PASSWORD")
+
+    if not account or not user:
+        raise Exception("Missing SNOWFLAKE_ACCOUNT or SNOWFLAKE_USER in .env")
+
+    params: dict[str, Any] = {
+        "user": user,
+        "account": account,
+        "warehouse": warehouse,
+        "database": database,
+        "client_session_keep_alive": True,
+    }
+    if schema:
+        params["schema"] = schema
+    if role:
+        params["role"] = role
+    if password:
+        params["password"] = password
+    else:
+        params["authenticator"] = os.getenv(
+            "SNOWFLAKE_AUTHENTICATOR", "externalbrowser"
+        )
+    params["network_timeout"] = _env_int("SNOWFLAKE_NETWORK_TIMEOUT", 30)
+    params["login_timeout"] = _env_int("SNOWFLAKE_LOGIN_TIMEOUT", 60)
+    return params
+
+
+def _create_snowflake_connection() -> Any:
+    return snowflake.connector.connect(**_snowflake_conn_params())
+
+
+def _init_pool() -> None:
+    """Initialize pool of ``POOL_SIZE`` connections (thread-safe, once)."""
+    global _pool_initialized
+    if _pool_initialized:
+        return
+    with _pool_lock:
+        if _pool_initialized:
+            return
+        log_debug(f"Initializing Snowflake connection pool ({POOL_SIZE} connections)...")
+        for _ in range(POOL_SIZE):
+            _pool.put(_create_snowflake_connection())
+        _pool_initialized = True
+        log_debug(f"✓ Snowflake pool ready ({POOL_SIZE} connections)")
+
+
+def return_connection(conn: Any) -> None:
+    """Return a live connection to the pool, or replace it if dead."""
+    if conn is None:
+        return
+    try:
+        if not conn.is_closed():
+            _pool.put_nowait(conn)
+            return
+    except Exception:
+        pass
+    log_debug("Replacing dead connection in pool")
+    try:
+        new_conn = _create_snowflake_connection()
+        _pool.put_nowait(new_conn)
+    except Exception as e:
+        log_debug(f"Error replacing dead pool connection: {str(e)[:60]}")
+
+
+def reset_snowflake_pool() -> None:
+    """Drain pool, close connections, allow re-init (tests / hard recovery)."""
+    global _pool_initialized
+    with _pool_lock:
+        _pool_initialized = False
+        while True:
+            try:
+                c = _pool.get_nowait()
+            except Empty:
+                break
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+def get_snowflake_connection() -> Any:
+    """Borrow a connection from the pool (blocks up to 30s if all are in use)."""
+    _init_pool()
+    try:
+        return _pool.get(timeout=30)
+    except Empty as e:
+        raise RuntimeError(
+            "Snowflake pool exhausted: no connection available within 30s"
+        ) from e
 
 
 def _product_atr_amount(p: dict) -> float:
@@ -116,67 +227,16 @@ def split_products_by_type(products: list) -> dict:
     return {"core": core, "success_plans": success_plans}
 
 
-def get_snowflake_connection():
-    """
-    Singleton Snowflake connection (password or externalbrowser).
-    Reconnects if the session is closed or unhealthy.
-    """
-    global _sf_connection
-
-    if _sf_connection is not None:
-        try:
-            if not _sf_connection.is_closed():
-                return _sf_connection
-        except Exception:
-            pass
-        log_debug("Snowflake connection lost — reconnecting...")
-        try:
-            _sf_connection.close()
-        except Exception:
-            pass
-        _sf_connection = None
-
-    user = os.getenv("SNOWFLAKE_USER")
-    account = os.getenv("SNOWFLAKE_ACCOUNT")
-    warehouse = os.getenv("SNOWFLAKE_WAREHOUSE") or "COMPUTE_WH"
-    database = os.getenv("SNOWFLAKE_DATABASE") or "SSE_DM_CSG_RPT_PRD"
-    schema = os.getenv("SNOWFLAKE_SCHEMA") or "RENEWALS"
-    role = os.getenv("SNOWFLAKE_ROLE")
-    password = os.getenv("SNOWFLAKE_PASSWORD")
-
-    if not account or not user:
-        raise Exception("Missing SNOWFLAKE_ACCOUNT or SNOWFLAKE_USER in .env")
-
-    conn_params: dict[str, Any] = {
-        "user": user,
-        "account": account,
-        "warehouse": warehouse,
-        "database": database,
-        "client_session_keep_alive": True,
-    }
-    if schema:
-        conn_params["schema"] = schema
-    if role:
-        conn_params["role"] = role
-
-    if password:
-        conn_params["password"] = password
-    else:
-        conn_params["authenticator"] = os.getenv(
-            "SNOWFLAKE_AUTHENTICATOR", "externalbrowser"
-        )
-
-    _sf_connection = snowflake.connector.connect(**conn_params)
-    log_debug("✓ Connected to Snowflake")
-    return _sf_connection
-
-
 def run_query(sql: str, params: Optional[list] = None) -> list[dict]:
-    """Execute Snowflake query; return list of row dicts (singleton connection)."""
+    """Execute Snowflake query using the connection pool; always returns the connection."""
 
     def _execute(conn: Any) -> list[dict]:
         cursor = conn.cursor()
         try:
+            statement_timeout = _env_int("SNOWFLAKE_STATEMENT_TIMEOUT", 30)
+            cursor.execute(
+                f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {statement_timeout}"
+            )
             cursor.execute(sql, params or [])
             rows = cursor.fetchall()
             if not cursor.description:
@@ -186,15 +246,10 @@ def run_query(sql: str, params: Optional[list] = None) -> list[dict]:
         finally:
             cursor.close()
 
-    global _sf_connection
-    conn = get_snowflake_connection()
-    try:
-        return _execute(conn)
-    except Exception as e:
-        error_str = str(e)
-        log_debug(f"Snowflake query error: {error_str[:100]}")
-        if any(
-            kw in error_str.lower()
+    def _is_connection_error(msg: str) -> bool:
+        m = msg.lower()
+        return any(
+            kw in m
             for kw in (
                 "connection",
                 "session",
@@ -204,14 +259,32 @@ def run_query(sql: str, params: Optional[list] = None) -> list[dict]:
                 "390114",
                 "250002",
             )
-        ):
-            _sf_connection = None
-            log_debug("Retrying Snowflake query with fresh connection...")
+        )
+
+    conn = get_snowflake_connection()
+    try:
+        out = _execute(conn)
+        return_connection(conn)
+        return out
+    except Exception as e:
+        error_str = str(e)
+        log_debug(f"Snowflake query error: {error_str[:100]}")
+        if _is_connection_error(error_str):
             try:
-                return _execute(get_snowflake_connection())
+                conn.close()
+            except Exception:
+                pass
+            log_debug("Retrying Snowflake query with fresh connection...")
+            conn2 = get_snowflake_connection()
+            try:
+                out = _execute(conn2)
+                return_connection(conn2)
+                return out
             except Exception as retry_e:
                 log_debug(f"Snowflake retry failed: {str(retry_e)[:100]}")
+                return_connection(conn2)
                 raise
+        return_connection(conn)
         raise
 
 
@@ -269,10 +342,13 @@ def fmt_amount(val) -> str:
         return str(val) if val else "N/A"
 
 
-def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
+def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
     """
-    Get usage from CIDM.WV_AV_USAGE_EXTRACT_VW.
-    Priority: GMV row → Commerce L1/L2 → all products.
+    Unified usage fetch: one query pass returns summary stats and raw rows.
+
+    Returns:
+        ``{"summary": {...}, "raw_rows": [...]}`` — summary matches ``get_usage_summary`` shape;
+        raw rows match ``get_usage_raw_data`` (for ``build_adoption_pov``).
     """
     CLOUD_L1_MAP = {
         "Commerce Cloud": "Commerce",
@@ -289,10 +365,8 @@ def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
     def _build_cloud_filter(cloud_val: str | None) -> str:
         if not cloud_val or cloud_val == "All Clouds":
             return ""
-
         l1_value = CLOUD_L1_MAP.get(str(cloud_val).strip(), cloud_val)
         l1_safe = str(l1_value).replace("'", "''").replace("%", "%%")
-
         return f"""
             AND (
                 DRVD_APM_LVL_1 LIKE '%%{l1_safe}%%'
@@ -302,78 +376,75 @@ def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
 
     cloud_filter = _build_cloud_filter(cloud)
 
-    def _run_usage_query(snap_filter: str, params: list) -> list:
+    def _run(snap_filter: str, params: list) -> list:
         sql = f"""
             SELECT
                 DRVD_APM_LVL_1,
                 DRVD_APM_LVL_2,
                 GRP,
                 TYPE,
-                SUM(PROVISIONED) as TOTAL_PROV,
-                SUM(ACTIVATED) as TOTAL_ACTIVATED,
-                SUM(USED) as TOTAL_USED
+                PROVISIONED,
+                ACTIVATED,
+                USED
             FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
             WHERE ACCOUNT_ID = %s
             {snap_filter}
             {cloud_filter}
             AND PROVISIONED > 0
-            GROUP BY DRVD_APM_LVL_1, DRVD_APM_LVL_2, GRP, TYPE
-            ORDER BY TOTAL_PROV DESC
+            ORDER BY PROVISIONED DESC
         """
         try:
             return run_query(sql, params)
         except Exception as e:
-            log_debug(f"get_usage_summary query error: {str(e)[:100]}")
+            log_debug(f"get_usage_unified error: {str(e)[:100]}")
             return []
 
-    rows = _run_usage_query("AND CURR_SNAP_FLG = 'Y'", [account_id])
+    rows = _run("AND CURR_SNAP_FLG = 'Y'", [account_id])
 
     if not rows:
         log_debug(
-            "get_usage_summary: CURR_SNAP_FLG=Y returned nothing, trying MAX(SNAPSHOT_DT)"
+            "get_usage_unified: CURR_SNAP_FLG=Y returned nothing, trying MAX(SNAPSHOT_DT)"
         )
-        rows = _run_usage_query(
+        rows = _run(
             """
             AND SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
                 FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
                 WHERE ACCOUNT_ID = %s
             )
-        """,
+            """,
             [account_id, account_id],
         )
 
     if not rows:
-        log_debug("get_usage_summary: trying without cloud filter, GMV only")
+        log_debug("get_usage_unified: trying without cloud filter, GMV only")
         try:
             rows = run_query(
                 """
                 SELECT
                     DRVD_APM_LVL_1, DRVD_APM_LVL_2,
                     GRP, TYPE,
-                    SUM(PROVISIONED) as TOTAL_PROV,
-                    SUM(ACTIVATED) as TOTAL_ACTIVATED,
-                    SUM(USED) as TOTAL_USED
+                    PROVISIONED, ACTIVATED, USED
                 FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
                 WHERE ACCOUNT_ID = %s
                 AND CURR_SNAP_FLG = 'Y'
                 AND GRP = 'GMV'
                 AND PROVISIONED > 0
-                GROUP BY DRVD_APM_LVL_1, DRVD_APM_LVL_2, GRP, TYPE
-            """,
+                ORDER BY PROVISIONED DESC
+                """,
                 [account_id],
             )
         except Exception as e:
             log_debug(f"GMV fallback error: {str(e)[:100]}")
 
     if not rows:
-        return {}
+        return {"summary": {}, "raw_rows": []}
 
     gmv_rows = [r for r in rows if str(r.get("GRP", "")).upper() == "GMV"]
 
     if gmv_rows:
-        total_prov = sum(float(r.get("TOTAL_PROV") or 0) for r in gmv_rows)
-        total_used = sum(float(r.get("TOTAL_USED") or 0) for r in gmv_rows)
+        total_prov = sum(float(r.get("PROVISIONED") or 0) for r in gmv_rows)
+        total_used = sum(float(r.get("USED") or 0) for r in gmv_rows)
         source = "GMV"
     else:
         commerce_rows = [
@@ -383,8 +454,8 @@ def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
             or "commerce" in str(r.get("DRVD_APM_LVL_2", "")).lower()
         ]
         target_rows = commerce_rows if commerce_rows else rows
-        total_prov = sum(float(r.get("TOTAL_PROV") or 0) for r in target_rows)
-        total_used = sum(float(r.get("TOTAL_USED") or 0) for r in target_rows)
+        total_prov = sum(float(r.get("PROVISIONED") or 0) for r in target_rows)
+        total_used = sum(float(r.get("USED") or 0) for r in target_rows)
         source = "Commerce aggregate" if commerce_rows else "All products"
 
     if total_prov > 0:
@@ -407,7 +478,7 @@ def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
     else:
         util_emoji = ":white_circle:"
 
-    return {
+    summary = {
         "utilization_rate": util_str,
         "util_emoji": util_emoji,
         "cloud_aov": "Unknown",
@@ -415,48 +486,26 @@ def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
         "source": source,
     }
 
+    return {"summary": summary, "raw_rows": rows}
+
+
+def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
+    """
+    DEPRECATED: Prefer ``get_usage_unified()`` (one round-trip: summary + raw rows).
+
+    Returns only the summary dict for backward compatibility.
+    """
+    u = get_usage_unified(account_id, cloud)
+    return u.get("summary") or {}
+
 
 def get_usage_raw_data(account_id: str, cloud: str | None = None) -> list:
     """
-    Raw usage rows from CIDM.WV_AV_USAGE_EXTRACT_VW for build_adoption_pov().
+    DEPRECATED: Prefer ``get_usage_unified()`` (one round-trip: summary + raw rows).
+
+    Raw usage rows from CIDM.WV_AV_USAGE_EXTRACT_VW for ``build_adoption_pov()``.
     """
-    def _run(snap_filter: str, params: list) -> list:
-        sql = f"""
-            SELECT
-                DRVD_APM_LVL_1,
-                DRVD_APM_LVL_2,
-                GRP,
-                TYPE,
-                PROVISIONED,
-                ACTIVATED,
-                USED
-            FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
-            WHERE ACCOUNT_ID = %s
-            {snap_filter}
-            AND PROVISIONED > 0
-            ORDER BY PROVISIONED DESC
-        """
-        try:
-            return run_query(sql, params)
-        except Exception as e:
-            log_debug(f"get_usage_raw_data error: {str(e)[:100]}")
-            return []
-
-    rows = _run("AND CURR_SNAP_FLG = 'Y'", [account_id])
-
-    if not rows:
-        rows = _run(
-            """
-            AND SNAPSHOT_DT = (
-                SELECT MAX(SNAPSHOT_DT)
-                FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
-                WHERE ACCOUNT_ID = %s
-            )
-            """,
-            [account_id, account_id],
-        )
-
-    return rows
+    return get_usage_unified(account_id, cloud).get("raw_rows") or []
 
 
 def extract_usd(value) -> float:
@@ -530,6 +579,7 @@ def enrich_account(account_id, opty_id=None, cloud=None):
             "gmv_util": None,
             "source": "",
         },
+        "usage_raw_rows": [],
     }
 
     if opty_id:
@@ -540,10 +590,11 @@ def enrich_account(account_id, opty_id=None, cloud=None):
         except Exception as e:
             log_debug(f"Renewal AOV error: {str(e)[:60]}")
 
-    # 4. Usage summary (CIDM.WV_AV_USAGE_EXTRACT_VW)
+    # 4. Usage summary + raw data (unified fetch, CIDM.WV_AV_USAGE_EXTRACT_VW)
     try:
-        usage_data = get_usage_summary(account_id_15, cloud)
-        if usage_data:
+        usage_unified = get_usage_unified(account_id_15, cloud)
+        if usage_unified and usage_unified.get("summary"):
+            usage_data = usage_unified["summary"]
             result["usage"] = {
                 "utilization_rate": usage_data.get("utilization_rate", "N/A"),
                 "util_emoji": usage_data.get("util_emoji", ":white_circle:"),
@@ -551,6 +602,7 @@ def enrich_account(account_id, opty_id=None, cloud=None):
                 "gmv_util": usage_data.get("gmv_util"),
                 "source": usage_data.get("source", ""),
             }
+            result["usage_raw_rows"] = usage_unified.get("raw_rows", [])
             if (
                 result["usage"].get("cloud_aov") == "Unknown"
                 and result.get("renewal_aov")
@@ -877,22 +929,22 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
     health = enrichment.get("health", {})
     health_score = health.get("overall_score")
     health_literal = health.get("overall_literal", "Unknown")
-    score_val = None
-    if health_literal not in (None, "", "Unknown"):
-        if isinstance(health_literal, (int, float)):
-            try:
-                score_val = float(health_literal)
-            except (TypeError, ValueError):
-                pass
-        elif str(health_literal).isdigit():
-            score_val = float(health_literal)
-    if score_val is not None:
+    if health_literal in (None, ""):
+        health_literal = "Unknown"
+
+    # Normalize numeric health_literal → Green/Yellow/Red (e.g. "75" from Snowflake)
+    try:
+        score_val = float(health_literal)
         if score_val >= 70:
             health_literal = "Green"
         elif score_val >= 40:
             health_literal = "Yellow"
         else:
             health_literal = "Red"
+    except (TypeError, ValueError):
+        pass  # Already a string label like "Green", keep as-is
+
+    # Build health_display from health_score
     if health_score:
         try:
             hs = float(health_score)
@@ -1151,7 +1203,7 @@ def _escape_sf_id(account_id: str) -> str:
 
 
 class SnowflakeClient:
-    """Singleton OOP wrapper; always uses module-level get_snowflake_connection()."""
+    """Singleton OOP wrapper over the module connection pool (borrow/return per query)."""
 
     _instance: Optional["SnowflakeClient"] = None
 
@@ -1180,16 +1232,8 @@ class SnowflakeClient:
         self._user = user or os.getenv("SNOWFLAKE_USER")
         if not self._account or not self._user:
             raise ValueError("SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER are required")
-        get_snowflake_connection()
+        _init_pool()
         self._initialized = True
-
-    @property
-    def conn(self) -> Any:
-        """Always the current module singleton (stays valid after reconnect)."""
-        return get_snowflake_connection()
-
-    def _cursor(self):
-        return self.conn.cursor()
 
     def get_account_usage(
         self, account_id: str, cloud: str = "Commerce Cloud"
@@ -1209,66 +1253,78 @@ class SnowflakeClient:
 
     def get_ari_score(self, account_id: str) -> Optional[float]:
         aid = _escape_sf_id(account_id)
-        cursor = self._cursor()
+        conn = get_snowflake_connection()
         try:
-            query = f"""
-            SELECT ATTRITION_PROBA * 100 AS probability
-            FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-            WHERE ACCOUNT_ID = '{aid}'
-            AND SNAPSHOT_DT = (
-                SELECT MAX(SNAPSHOT_DT)
+            cursor = conn.cursor()
+            try:
+                query = f"""
+                SELECT ATTRITION_PROBA * 100 AS probability
                 FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-            )
-            ORDER BY ATTRITION_PROBA DESC
-            LIMIT 1
-            """
-            cursor.execute(query)
-            row = cursor.fetchone()
-            if not row or row[0] is None:
-                return None
-            return round(float(row[0]), 1)
+                WHERE ACCOUNT_ID = '{aid}'
+                AND SNAPSHOT_DT = (
+                    SELECT MAX(SNAPSHOT_DT)
+                    FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
+                )
+                ORDER BY ATTRITION_PROBA DESC
+                LIMIT 1
+                """
+                cursor.execute(query)
+                row = cursor.fetchone()
+                if not row or row[0] is None:
+                    return None
+                return round(float(row[0]), 1)
+            finally:
+                cursor.close()
         except Exception as e:
             log_error(f"SnowflakeClient.get_ari_score error: {e}")
             return None
         finally:
-            cursor.close()
+            return_connection(conn)
 
     def get_attrition_signals(self, account_id: str) -> Optional[dict[str, Any]]:
         aid = _escape_sf_id(account_id)
-        cursor = self._cursor()
+        conn = get_snowflake_connection()
         try:
-            query = f"""
-            SELECT
-                APM_LVL_3 AS product,
-                ABS(ATTRITION_PIPELINE) AS attrition,
-                ATTRITION_PROBA_CATEGORY AS category
-            FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-            WHERE ACCOUNT_ID = '{aid}'
-            AND SNAPSHOT_DT = (
-                SELECT MAX(SNAPSHOT_DT)
+            cursor = conn.cursor()
+            try:
+                query = f"""
+                SELECT
+                    APM_LVL_3 AS product,
+                    ABS(ATTRITION_PIPELINE) AS attrition,
+                    ATTRITION_PROBA_CATEGORY AS category
                 FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-            )
-            ORDER BY ABS(ATTRITION_PIPELINE) DESC
-            """
-            cursor.execute(query)
-            rows = cursor.fetchall()
-            products = [
-                {
-                    "product": r[0],
-                    "attrition": float(r[1]) if r[1] is not None else 0.0,
-                    "category": r[2],
+                WHERE ACCOUNT_ID = '{aid}'
+                AND SNAPSHOT_DT = (
+                    SELECT MAX(SNAPSHOT_DT)
+                    FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
+                )
+                ORDER BY ABS(ATTRITION_PIPELINE) DESC
+                """
+                cursor.execute(query)
+                rows = cursor.fetchall()
+                products = [
+                    {
+                        "product": r[0],
+                        "attrition": float(r[1]) if r[1] is not None else 0.0,
+                        "category": r[2],
+                    }
+                    for r in rows
+                ]
+                return {
+                    "account_id": account_id,
+                    "products": products,
+                    "count": len(products),
                 }
-                for r in rows
-            ]
-            return {"account_id": account_id, "products": products, "count": len(products)}
+            finally:
+                cursor.close()
         except Exception as e:
             log_error(f"SnowflakeClient.get_attrition_signals error: {e}")
             return None
         finally:
-            cursor.close()
+            return_connection(conn)
 
     def close(self) -> None:
-        """No-op: singleton connection is shared; do not close from here."""
+        """No-op: connections are pooled; callers use return_connection via run_query."""
         pass
 
 

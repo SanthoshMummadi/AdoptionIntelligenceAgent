@@ -1099,14 +1099,14 @@ def attrition_risk_cmd(ack, say, command, client):
                 opp=opp,
                 red_account=red,
                 snowflake_enrichment=enrichment,
-                call_llm_fn=server.call_llm_gateway,
+                call_llm_fn=server.call_llm_gateway_with_retry,
             )
 
             health_for_tldr = display.get("health_display") or display.get(
                 "ari_category", "N/A"
             )
             try:
-                tldr = server.call_llm_gateway(
+                tldr = server.call_llm_gateway_with_retry(
                     "Summarize in 2 sentences for a PM: "
                     + "Account: "
                     + account_name
@@ -1208,7 +1208,8 @@ def gm_review_canvas(ack, say, command, client):
             "- `/gm-review-canvas Adidas AG, Oxford Industries`\n"
             "- `/gm-review-canvas Commerce Cloud, Adidas AG, Oxford Industries`\n"
             "- `/gm-review-canvas 006XXXXXXXXXXXX`\n\n"
-            ":bulb: Tip: Cloud name is optional; it defaults to *Commerce Cloud*."
+            ":bulb: Tip: Cloud name is optional; it defaults to *Commerce Cloud*.\n"
+            "_You can list *up to ~15 accounts* per command (parallel batches of up to 8)._"
         )
         return
 
@@ -1248,8 +1249,8 @@ def gm_review_canvas(ack, say, command, client):
             from services.gm_review_workflow import GMReviewWorkflow
 
             workflow = GMReviewWorkflow(
-                call_llm_fn=server.call_llm_gateway,
-                max_concurrent=5,
+                call_llm_fn=server.call_llm_gateway_with_retry,
+                max_concurrent=8,
             )
 
             today_hdr = date_type.today().strftime("%A, %B %d, %Y")

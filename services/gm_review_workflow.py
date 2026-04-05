@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -75,7 +76,7 @@ class GMReviewWorkflow:
     No adapter layer — calls domain functions directly.
     """
 
-    def __init__(self, call_llm_fn, max_concurrent: int = 5):
+    def __init__(self, call_llm_fn, max_concurrent: int = 8):
         self.call_llm_fn = call_llm_fn
         self.max_concurrent = max_concurrent
 
@@ -93,14 +94,45 @@ class GMReviewWorkflow:
         """
         from datetime import date
 
+        from domain.analytics.snowflake_client import enrich_account
         from domain.content.canvas_builder import build_gm_review_canvas_markdown
+        from domain.salesforce.org62_client import resolve_account_enhanced
 
         log_debug(f"GMReviewWorkflow: {len(account_inputs)} inputs, cloud={cloud}")
+
+        _resolution_cache: dict[str, dict] = {}
+        _enrichment_cache: dict[str, dict] = {}
+
+        def _resolve_with_cache(name: str) -> dict | None:
+            key = name.strip().lower()
+            if key in _resolution_cache:
+                log_debug(f"Cache hit for account: {name}")
+                return _resolution_cache[key]
+            result = resolve_account_enhanced(name, cloud=cloud)
+            if result:
+                _resolution_cache[key] = result
+            return result
+
+        def _enrich_with_cache(account_id_15: str, opty_id=None, cloud=cloud) -> dict:
+            key = account_id_15.strip().lower()
+            if key in _enrichment_cache:
+                log_debug(f"Enrichment cache hit for account_id: {account_id_15}")
+                return _enrichment_cache[key]
+            result = enrich_account(account_id_15, opty_id=opty_id, cloud=cloud)
+            if result:
+                _enrichment_cache[key] = result
+            return result
 
         reviews: list = []
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
             futures = {
-                executor.submit(self._generate_review, inp, cloud): inp
+                executor.submit(
+                    self._generate_review,
+                    inp,
+                    cloud,
+                    _resolve_with_cache,
+                    _enrich_with_cache,
+                ): inp
                 for inp in account_inputs
             }
             for future in as_completed(futures, timeout=120):
@@ -139,18 +171,24 @@ class GMReviewWorkflow:
 
         return {"reviews": reviews, "combined_canvas": combined_canvas}
 
-    def _generate_review(self, account_input: str, cloud: str) -> dict | None:
+    def _generate_review(
+        self,
+        account_input: str,
+        cloud: str,
+        resolve_account_fn: Callable[[str], dict | None] | None = None,
+        enrich_account_fn: Callable[..., dict] | None = None,
+    ) -> dict | None:
         """Generate a single account review — all direct domain calls."""
         from domain.analytics.snowflake_client import (
             enrich_account,
             format_enrichment_for_display,
             get_account_attrition,
-            get_usage_raw_data,
             to_15_char_id,
         )
         from domain.content.canvas_builder import build_adoption_pov
         from domain.intelligence.risk_engine import generate_risk_analysis
         from domain.salesforce.org62_client import (
+            _sf_call_guarded,
             get_account_team,
             get_red_account,
             get_renewal_opportunities,
@@ -162,6 +200,7 @@ class GMReviewWorkflow:
         raw_in = (account_input or "").strip()
 
         opp: dict = {}
+        needs_renewal_lookup = False
         if _OPP_ID_RE.match(raw_in):
             rec = _fetch_opportunity_record(raw_in)
             if not rec:
@@ -181,43 +220,143 @@ class GMReviewWorkflow:
                 account_id = str(acct_data.get("Id") or "")
                 account_name = " ".join((acct_data.get("Name") or "Unknown").split())
             else:
-                acct = resolve_account_enhanced(raw_in, cloud=cloud)
+                if resolve_account_fn is not None:
+                    acct = resolve_account_fn(raw_in)
+                else:
+                    acct = resolve_account_enhanced(raw_in, cloud=cloud)
                 if not acct:
                     log_debug(f"⚠️ Could not resolve: {raw_in}")
                     return None
                 account_id = str(acct["id"])
                 account_name = " ".join(str(acct["name"]).split())
-                opps = get_renewal_opportunities(account_id, cloud)
-                if not opps:
-                    opps = get_renewal_opportunities_any_cloud(account_id)
-                opp = opps[0] if opps else {}
+                needs_renewal_lookup = True
 
         if not account_id:
             return None
 
         account_id_15 = to_15_char_id(account_id)
+
+        red: dict = {}
+        team: dict | list = {}
+
+        if needs_renewal_lookup:
+            # Case 1: account resolved by name — parallel SF before Snowflake
+            with ThreadPoolExecutor(max_workers=3) as sf_ex:
+                fut_opps = sf_ex.submit(
+                    _sf_call_guarded, get_renewal_opportunities, account_id, cloud
+                )
+                fut_red = sf_ex.submit(_sf_call_guarded, get_red_account, account_id)
+                fut_team = sf_ex.submit(
+                    _sf_call_guarded, get_account_team, account_id
+                )
+
+                try:
+                    opps = fut_opps.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_renewal_opportunities error: {str(e)[:60]}")
+                    opps = []
+
+                try:
+                    red = fut_red.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_red_account error: {str(e)[:60]}")
+                    red = {}
+
+                try:
+                    team = fut_team.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_account_team error: {str(e)[:60]}")
+                    team = []
+
+            if not opps:
+                opps = _sf_call_guarded(
+                    get_renewal_opportunities_any_cloud, account_id
+                )
+            if not opps:
+                opps = []
+            opp = opps[0] if opps else {}
+
         opty_id = str(opp.get("Id", "") or "") if opp else ""
 
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            fut_enrich = ex.submit(enrich_account, account_id, opty_id or None, cloud)
-            fut_products = ex.submit(get_account_attrition, account_id_15, cloud)
-            fut_all_prod = ex.submit(get_account_attrition, account_id_15, None)
-            fut_usage = ex.submit(get_usage_raw_data, account_id_15, cloud)
+        _enrich_fn = enrich_account_fn or enrich_account
 
-            enrichment = fut_enrich.result()
-            product_attrition = fut_products.result()
-            all_products = fut_all_prod.result()
-            usage_raw = fut_usage.result()
+        if needs_renewal_lookup:
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                fut_enrich = ex.submit(
+                    _enrich_fn, account_id_15, opty_id or None, cloud
+                )
+                fut_products = ex.submit(get_account_attrition, account_id_15, cloud)
+                fut_all_prod = ex.submit(get_account_attrition, account_id_15, None)
+
+                try:
+                    enrichment = fut_enrich.result(timeout=30)
+                except Exception as e:
+                    log_debug(f"enrich_account error: {str(e)[:60]}")
+                    enrichment = {}
+
+                try:
+                    product_attrition = fut_products.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_account_attrition error: {str(e)[:60]}")
+                    product_attrition = []
+
+                try:
+                    all_products = fut_all_prod.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_account_attrition (all) error: {str(e)[:60]}")
+                    all_products = []
+
+        else:
+            # Case 2: opp already known — enrich + attrition + red + team in one pool
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                fut_enrich = ex.submit(
+                    _enrich_fn, account_id_15, opty_id or None, cloud
+                )
+                fut_products = ex.submit(get_account_attrition, account_id_15, cloud)
+                fut_all_prod = ex.submit(get_account_attrition, account_id_15, None)
+                fut_red = ex.submit(_sf_call_guarded, get_red_account, account_id)
+                fut_team = ex.submit(
+                    _sf_call_guarded, get_account_team, account_id
+                )
+
+                try:
+                    enrichment = fut_enrich.result(timeout=30)
+                except Exception as e:
+                    log_debug(f"enrich_account error: {str(e)[:60]}")
+                    enrichment = {}
+
+                try:
+                    products = fut_products.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_account_attrition error: {str(e)[:60]}")
+                    products = []
+
+                try:
+                    all_products = fut_all_prod.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_account_attrition (all) error: {str(e)[:60]}")
+                    all_products = []
+
+                try:
+                    red = fut_red.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_red_account error: {str(e)[:60]}")
+                    red = {}
+
+                try:
+                    team = fut_team.result(timeout=15)
+                except Exception as e:
+                    log_debug(f"get_account_team error: {str(e)[:60]}")
+                    team = []
+
+            product_attrition = products
+
+        if not isinstance(enrichment, dict):
+            enrichment = {}
+        usage_raw = enrichment.get("usage_raw_rows", [])
 
         display = format_enrichment_for_display(enrichment)
         adoption_pov = build_adoption_pov(usage_raw, cloud=cloud)
-
-        red = get_red_account(account_id)
-        team: dict = {}
-        try:
-            team = get_account_team(account_id) or {}
-        except Exception:
-            pass
 
         risk_notes, recommendation = generate_risk_analysis(
             account_name=account_name,

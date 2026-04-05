@@ -1,11 +1,17 @@
 from mcp.server.fastmcp import FastMCP
 import PyPDF2
-import os
-import requests
 import json
+import os
 import pickle
+import threading
+import time
 import urllib3
+import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from log_utils import log_debug
 
 # Load environment variables
 load_dotenv()
@@ -17,6 +23,28 @@ mcp = FastMCP("Product Adoption MCP")
 
 # Suppress SSL warnings for internal Salesforce endpoints
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Shared LLM Gateway HTTP session (connection pooling; retries via call_llm_gateway_with_retry)
+_llm_session: requests.Session | None = None
+_llm_session_lock = threading.Lock()
+
+
+def _get_llm_session() -> requests.Session:
+    global _llm_session
+    if _llm_session is None:
+        with _llm_session_lock:
+            if _llm_session is None:
+                session = requests.Session()
+                adapter = HTTPAdapter(
+                    pool_connections=4,
+                    pool_maxsize=8,
+                    max_retries=Retry(total=0),
+                )
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+                _llm_session = session
+    return _llm_session
+
 
 # Persistent storage directory
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "storage")
@@ -96,7 +124,8 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
 
     try:
         print(f"🔄 Calling LLM Gateway... (model: {payload['model']})")
-        response = requests.post(
+        session = _get_llm_session()
+        response = session.post(
             gateway_url,
             headers=headers,
             json=payload,
@@ -122,6 +151,40 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
         raise Exception(f"LLM Gateway error: {error_msg}")
 
 
+def call_llm_gateway_with_retry(
+    prompt: str,
+    system_prompt: str = None,
+    max_tokens: int = 4000,
+    max_retries: int = 2,
+    backoff: float = 2.0,
+):
+    """Call LLM Gateway with retry on timeout / rate limit / overload."""
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return call_llm_gateway(
+                prompt, system_prompt=system_prompt, max_tokens=max_tokens
+            )
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if any(
+                kw in err_str
+                for kw in ("timeout", "rate", "429", "503", "overload")
+            ):
+                if attempt < max_retries:
+                    wait = backoff * (2**attempt)
+                    log_debug(
+                        f"LLM Gateway error (attempt {attempt + 1}), "
+                        f"retrying in {wait:.0f}s: {str(e)[:60]}"
+                    )
+                    time.sleep(wait)
+                    continue
+            raise
+    assert last_error is not None
+    raise last_error
+
+
 # ============================================================================
 # GM REVIEW WORKFLOW INITIALIZATION
 # ============================================================================
@@ -129,8 +192,8 @@ def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4
 def init_gm_workflow() -> GMReviewWorkflow:
     """Initialize GM Review workflow (domain calls + LLM gateway)."""
     return GMReviewWorkflow(
-        call_llm_fn=call_llm_gateway,
-        max_concurrent=5,
+        call_llm_fn=call_llm_gateway_with_retry,
+        max_concurrent=8,
     )
 
 
@@ -226,7 +289,7 @@ When summarizing adoption status, risks, or "what to focus on" for a product, us
 - End with "What do you want to explore?" and offer options such as: Adoption risks, Renewal forecast, Feature usage gaps, V2MoM progress, Top accounts needing attention.
 Keep the tone concise and actionable."""
 
-        answer = call_llm_gateway(llm_prompt, system_prompt, max_tokens=4000)
+        answer = call_llm_gateway_with_retry(llm_prompt, system_prompt, max_tokens=4000)
         return answer
 
     except Exception as e:

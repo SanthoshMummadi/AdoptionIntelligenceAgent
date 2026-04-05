@@ -20,7 +20,7 @@ print('2. Testing GMReviewWorkflow import...')
 try:
     from services.gm_review_workflow import GMReviewWorkflow
     from server import call_llm_gateway
-    wf = GMReviewWorkflow(call_llm_fn=call_llm_gateway, max_concurrent=5)
+    wf = GMReviewWorkflow(call_llm_fn=call_llm_gateway, max_concurrent=8)
     print(f'  ✓ GMReviewWorkflow created: {wf}')
 except Exception as e:
     import traceback

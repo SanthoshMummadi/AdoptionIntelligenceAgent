@@ -114,3 +114,7 @@ dmypy.json
 
 # MCP specific
 .mcp/
+
+# Root-level scratch / debug scripts (avoid re-cluttering project root)
+/debug_*.py
+/scratch_*.py
