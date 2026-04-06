@@ -47,8 +47,9 @@ print(f"\n1. ARI:              {ari_cat} ({ari_prob})")
 renewal_aov = float(enrichment.get("renewal_aov", {}).get("renewal_aov", 0) or 0)
 print(f"2. CC AOV:           ${renewal_aov:,.0f}  →  {fmt_amount(renewal_aov)}")
 
-renewal_atr = float(enrichment.get("renewal_aov", {}).get("renewal_atr", 0) or 0)
-print(f"3. ATR:              ${renewal_atr:,.0f}  →  {fmt_amount(renewal_atr)}")
+_ren = enrichment.get("renewal_aov", {}) or {}
+renewal_atr = float(_ren.get("renewal_atr_snow", 0) or _ren.get("renewal_atr", 0) or 0)
+print(f"3. ATR (Snow FCAST): ${renewal_atr:,.0f}  →  {fmt_amount(renewal_atr)}")
 
 forecasted_atr = (
     abs(float(opp.get("Forecasted_Attrition__c", 0) or 0)) if opp else 0

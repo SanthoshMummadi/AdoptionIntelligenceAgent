@@ -77,8 +77,11 @@ def get_gm_row(account_search: str):
     renewal_aov = float(enrichment.get("renewal_aov", {}).get("renewal_aov", 0) or 0)
     print(f"CC AOV:          ${renewal_aov:,.0f}  →  {fmt_amount(renewal_aov)}")
 
-    renewal_atr = float(enrichment.get("renewal_aov", {}).get("renewal_atr", 0) or 0)
-    print(f"ATR:             {fmt_amount(renewal_atr)}")
+    ren = enrichment.get("renewal_aov", {}) or {}
+    renewal_atr = float(
+        ren.get("renewal_atr_snow", 0) or ren.get("renewal_atr", 0) or 0
+    )
+    print(f"ATR (Snow FCAST): {fmt_amount(renewal_atr)}")
 
     forecasted_atr = (
         abs(float(opp.get("Forecasted_Attrition__c", 0) or 0)) if opp else 0

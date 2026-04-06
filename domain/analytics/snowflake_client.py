@@ -666,11 +666,15 @@ def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
     field: one of "atr", "attrition", "aov", "swing".
     """
     if field == "atr":
-        val = (snowflake_display or {}).get("renewal_aov", {}).get("renewal_atr")
+        if opp:
+            val = extract_usd(opp.get("Forecasted_Attrition__c"))
+        else:
+            val = None
+        if not val:
+            ren = (snowflake_display or {}).get("renewal_aov") or {}
+            val = ren.get("renewal_atr_snow") or ren.get("renewal_atr")
         if not val:
             val = (snowflake_display or {}).get("renewal_atr")
-        if not val and opp:
-            val = extract_usd(opp.get("Forecasted_Attrition__c"))
         return fmt_amount(val) if val else "N/A"
 
     if field == "attrition":
@@ -1023,7 +1027,12 @@ def _gmv_rate_pct_from_renewal_row(row: dict) -> Optional[str]:
 
 
 def get_renewal_aov(opty_id):
-    """Renewal row from WV_CI_RENEWAL_OPTY_VW (AOV, ATR, CSG_TERRITORY, CSG_GEO, GMV rate)."""
+    """
+    Renewal row from ``WV_CI_RENEWAL_OPTY_VW``.
+
+    Static / slow-changing fields only — dynamic values (manager notes, next steps,
+    swing, live forecasted attrition) come from org62 on the Opportunity.
+    """
     if not opty_id:
         return {}
     opty_id_15 = to_15_char_id(opty_id)
@@ -1036,13 +1045,42 @@ def get_renewal_aov(opty_id):
     rows = run_query(sql, [opty_id_15])
     if rows:
         r = rows[0]
+        fcast = (
+            r.get("RENEWAL_FCAST_ATTRITION_CONV")
+            if r.get("RENEWAL_FCAST_ATTRITION_CONV") is not None
+            else r.get("RENEWAL_FCAST_ATTRITION")
+        )
+        fcast_atr = abs(float(fcast or 0))
+        stg = r.get("RENEWAL_STATUS") or r.get("RENEWAL_STG_NM") or ""
+
         out: dict[str, Any] = {
+            "renewal_aov": float(
+                r.get("RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV") or 0
+            ),
+            "renewal_amt": float(r.get("RENEWAL_AMT_CONV") or 0),
+            "renewal_atr_snow": fcast_atr,
             "account_name": r.get("ACCOUNT_NM"),
-            "target_cloud": r.get("TARGET_CLOUD"),
-            "renewal_aov": float(r.get("RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV") or 0),
-            "renewal_atr": abs(float(r.get("RENEWAL_FCAST_ATTRITION_CONV") or 0)),
-            "csg_geo": r.get("CSG_GEO") or "",
+            "account_sector": r.get("ACCOUNT_SECTOR_NM") or "",
+            "account_industry": r.get("ACCOUNT_INDUSTRY_NM") or "",
+            "target_cloud": r.get("TARGET_CLOUD") or "",
             "csg_territory": r.get("CSG_TERRITORY") or "",
+            "csg_area": r.get("CSG_AREA") or "",
+            "csg_geo": r.get("CSG_GEO") or "",
+            "ae_name": r.get("AE_FULL_NM") or "",
+            "ae_role": r.get("AE_ROLE_NM") or "",
+            "csm_name": r.get("ACCT_CSM") or "",
+            "renewal_manager": r.get("RENEWAL_OPTY_OWNR_NM") or "",
+            "renewal_status": str(stg or ""),
+            "risk_category": r.get("RENEWAL_KEY_RISK_CAT") or "",
+            "risk_detail": r.get("RENEWAL_RISK_DETAIL") or "",
+            "sem_notes": r.get("SEM_NT") or "",
+            "specialist_notes": r.get("SPECIALIST_SL_NT") or "",
+            "renewal_close_date": str(r.get("RENEWAL_CLSD_DT") or ""),
+            "renewal_close_month": str(r.get("RENEWAL_CLOSE_MONTH") or ""),
+            "renewal_fiscal_qtr": r.get("RENEWAL_FISCAL_QTR") or "",
+            "acct_aov_band": r.get("ACCT_AOV_BAND") or "",
+            "cntr_aov_band": r.get("CNTR_AOV_BAND") or "",
+            "success_segment": r.get("SUCCESS_SEGMENT") or "",
         }
         gmv = _gmv_rate_pct_from_renewal_row(r)
         if gmv:
@@ -1059,8 +1097,8 @@ def get_open_renewal_from_snowflake(
     Snowflake-first: best open renewal row from ``WV_CI_RENEWAL_OPTY_VW`` (excludes
     Closed/Dead stages; latest ``AS_OF_DATE``; highest prior ACV).
 
-    Returns keys: ``opty_id`` (15-char), ``account_id``, ``account_name``,
-    ``renewal_aov``, ``renewal_atr``, ``csg_territory``, ``csg_geo``, ``target_cloud``.
+    Returns keys aligned with ``get_renewal_aov`` (static fields; Snowflake FCAST as
+    ``renewal_atr_snow`` baseline only).
     """
     is_fsc = (
         "financial services" in str(cloud).lower()
@@ -1092,10 +1130,19 @@ def get_open_renewal_from_snowflake(
             ACCOUNT_18_ID                            AS ACCOUNT_ID,
             ACCOUNT_NM                               AS ACCOUNT_NAME,
             RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
-            RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR,
+            RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_FCAST_ATTRITION_CONV,
+            AE_FULL_NM,
+            ACCT_CSM,
+            RENEWAL_OPTY_OWNR_NM,
+            RENEWAL_STG_NM,
+            RENEWAL_KEY_RISK_CAT,
+            RENEWAL_RISK_DETAIL,
             CSG_TERRITORY,
             CSG_GEO,
-            TARGET_CLOUD
+            TARGET_CLOUD,
+            ACCOUNT_SECTOR_NM,
+            RENEWAL_CLOSE_MONTH,
+            RENEWAL_CLSD_DT
         FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
         WHERE {cloud_filter}
         AND (
@@ -1116,15 +1163,30 @@ def get_open_renewal_from_snowflake(
         rows = run_query(sql, [opty_bind])
         if rows:
             r = rows[0]
+            fcast = (
+                r.get("RENEWAL_FCAST_ATTRITION_CONV")
+                if r.get("RENEWAL_FCAST_ATTRITION_CONV") is not None
+                else r.get("RENEWAL_FCAST_ATTRITION")
+            )
+            stg = r.get("RENEWAL_STATUS") or r.get("RENEWAL_STG_NM") or ""
             return {
                 "opty_id": to_15_char_id(str(r.get("RENEWAL_OPTY_ID") or "")),
                 "account_id": str(r.get("ACCOUNT_ID") or ""),
                 "account_name": r.get("ACCOUNT_NAME") or "",
                 "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
-                "renewal_atr": abs(float(r.get("RENEWAL_ATR") or 0)),
+                "renewal_atr_snow": abs(float(fcast or 0)),
+                "ae_name": r.get("AE_FULL_NM") or "",
+                "csm_name": r.get("ACCT_CSM") or "",
+                "renewal_manager": r.get("RENEWAL_OPTY_OWNR_NM") or "",
+                "renewal_status": str(stg or ""),
+                "risk_category": r.get("RENEWAL_KEY_RISK_CAT") or "",
+                "risk_detail": r.get("RENEWAL_RISK_DETAIL") or "",
                 "csg_territory": r.get("CSG_TERRITORY") or "",
                 "csg_geo": r.get("CSG_GEO") or "",
                 "target_cloud": r.get("TARGET_CLOUD") or "",
+                "account_sector": r.get("ACCOUNT_SECTOR_NM") or "",
+                "renewal_close_month": str(r.get("RENEWAL_CLOSE_MONTH") or ""),
+                "renewal_close_date": str(r.get("RENEWAL_CLSD_DT") or ""),
             }
     except Exception as e:
         log_debug(f"get_open_renewal_from_snowflake error: {str(e)[:80]}")
@@ -1372,8 +1434,11 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
     renewal = enrichment.get("renewal_aov") or {}
     if renewal:
         result["renewal_aov"] = renewal
-        if renewal.get("renewal_atr") is not None:
-            result["renewal_atr"] = renewal.get("renewal_atr")
+        atr_snow = renewal.get("renewal_atr_snow")
+        if atr_snow is None and renewal.get("renewal_atr") is not None:
+            atr_snow = renewal.get("renewal_atr")
+        if atr_snow is not None:
+            result["renewal_atr"] = atr_snow
         if renewal.get("gmv_rate_pct") is not None:
             result["gmv_rate"] = renewal.get("gmv_rate_pct")
         result["csg_geo"] = renewal.get("csg_geo", "N/A")
@@ -1448,7 +1513,7 @@ def resolve_account_from_snowflake(
     Resolve account from Snowflake renewal view using parallel fuzzy LIKE patterns.
 
     Returns ``account_id``, ``account_name``, plus open-renewal row fields when matched:
-    ``opty_id`` (15-char), ``renewal_aov``, ``renewal_atr``, ``csg_territory``,
+    ``opty_id`` (15-char), ``renewal_aov``, ``renewal_atr_snow``, ``csg_territory``,
     ``csg_geo``, ``target_cloud``.
 
     Each pattern uses the latest ``AS_OF_DATE`` snapshot, excludes closed/dead stages,
@@ -1502,7 +1567,7 @@ def resolve_account_from_snowflake(
                     ren.ACCOUNT_NM                               AS ACCOUNT_NAME,
                     ren.RENEWAL_OPTY_ID,
                     ren.RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
-                    ren.RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR,
+                    ren.RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR_SNOW,
                     ren.CSG_TERRITORY,
                     ren.CSG_GEO,
                     ren.TARGET_CLOUD
@@ -1526,7 +1591,7 @@ def resolve_account_from_snowflake(
                     "account_name": r.get("ACCOUNT_NAME"),
                     "opty_id": to_15_char_id(str(r.get("RENEWAL_OPTY_ID") or "")),
                     "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
-                    "renewal_atr": abs(float(r.get("RENEWAL_ATR") or 0)),
+                    "renewal_atr_snow": abs(float(r.get("RENEWAL_ATR_SNOW") or 0)),
                     "csg_territory": r.get("CSG_TERRITORY") or "",
                     "csg_geo": r.get("CSG_GEO") or "",
                     "target_cloud": r.get("TARGET_CLOUD") or "",
@@ -1560,7 +1625,7 @@ def resolve_account_from_snowflake(
             "account_name": best["account_name"],
             "opty_id": best.get("opty_id") or "",
             "renewal_aov": float(best.get("renewal_aov") or 0),
-            "renewal_atr": float(best.get("renewal_atr") or 0),
+            "renewal_atr_snow": float(best.get("renewal_atr_snow") or 0),
             "csg_territory": best.get("csg_territory") or "",
             "csg_geo": best.get("csg_geo") or "",
             "target_cloud": best.get("target_cloud") or "",

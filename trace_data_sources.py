@@ -137,7 +137,10 @@ if opp_id_15:
         print(f"  Account Name: {renewal.get('account_name')}")
         print(f"  Target Cloud: {renewal.get('target_cloud')}")
         print(f"  Renewal AOV: ${renewal.get('renewal_aov', 0):,.0f}")
-        print(f"  Renewal ATR: ${renewal.get('renewal_atr', 0):,.0f}")
+        print(
+            f"  Renewal ATR (Snow baseline): "
+            f"${renewal.get('renewal_atr_snow', renewal.get('renewal_atr', 0) or 0):,.0f}"
+        )
     else:
         print("  ⚠️ No renewal data in RENEWALS view")
 else:

@@ -253,7 +253,7 @@ def test_renewal_aov():
     renewal = get_renewal_aov(opp_id_15)
     assert renewal, "No renewal data"
     assert float(renewal.get("renewal_aov", 0) or 0) > 0, "AOV is 0"
-    assert float(renewal.get("renewal_atr", 0) or 0) >= 0, "ATR missing"
+    assert float(renewal.get("renewal_atr_snow", 0) or 0) >= 0, "ATR_SNOW missing"
     assert renewal.get("csg_geo") is not None, "csg_geo key missing"
 
 
@@ -575,7 +575,7 @@ def test_gm_review_markdown():
             "enrichment": {
                 "renewal_aov": {
                     "renewal_aov": 1608311,
-                    "renewal_atr": 810000,
+                    "renewal_atr_snow": 810000,
                     "csg_geo": "EMEA",
                 }
             },
@@ -806,7 +806,7 @@ def test_gs_export():
             "enrichment": {
                 "renewal_aov": {
                     "renewal_aov": 1608311,
-                    "renewal_atr": 810000,
+                    "renewal_atr_snow": 810000,
                     "csg_geo": "EMEA",
                 }
             },
@@ -833,11 +833,11 @@ def test_gs_export():
     assert "spreadsheets" in url
 
 
-@test("GS-005: HEADERS_22 has exactly 22 columns")
+@test("GS-005: HEADERS_22 has expected column count")
 def test_gs_headers():
     from domain.integrations.gsheet_exporter import HEADERS_22
 
-    assert len(HEADERS_22) == 22, f"Expected 22 headers, got {len(HEADERS_22)}"
+    assert len(HEADERS_22) == 24, f"Expected 24 headers, got {len(HEADERS_22)}"
 
 
 for fn in [

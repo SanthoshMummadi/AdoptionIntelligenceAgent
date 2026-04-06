@@ -48,23 +48,11 @@ def _resolve_open_opportunity_id(name: str) -> str | None:
 
 
 def _fetch_opportunity_record(opp_id: str) -> dict | None:
-    """Single Opportunity row with Account sub-query fields (renewal SOQL shape)."""
-    from domain.salesforce.org62_client import _escape, sf_query
+    """Single Opportunity row — dynamic $ / notes from org62 (DYNAMIC_OPP_FIELDS)."""
+    from domain.salesforce.org62_client import get_opportunity_by_id
 
-    oid = _escape(opp_id)
-    fields = (
-        "Id, Name, StageName, Amount, CloseDate, "
-        "Account.Id, Account.Name, Account.BillingCountry, "
-        "ForecastCategoryName, Forecasted_Attrition__c, Swing__c, "
-        "License_At_Risk_Reason__c, ACV_Reason_Detail__c, NextStep, "
-        "Description, Specialist_Sales_Notes__c, "
-        "Manager_Forecast_Judgement__c"
-    )
-    q = f"SELECT {fields} FROM Opportunity WHERE Id = '{oid}' LIMIT 1"
     try:
-        result = sf_query(q)
-        records = result.get("records", [])
-        return records[0] if records else None
+        return get_opportunity_by_id(opp_id)
     except Exception as e:
         log_debug(f"_fetch_opportunity_record: {str(e)[:80]}")
         return None
@@ -234,14 +222,13 @@ class GMReviewWorkflow:
             account_name = " ".join(str(snow_opp.get("account_name") or "").split())
             opty_id_from_snow = str(snow_opp.get("opty_id") or "")
             if str(snow_opp.get("opty_id") or "").strip():
+                # Same field names as get_renewal_aov(); skip ids handled at workflow level.
                 renewal_prefetch_for_enrich = {
-                    "account_name": account_name,
-                    "target_cloud": snow_opp.get("target_cloud") or "",
-                    "renewal_aov": float(snow_opp.get("renewal_aov") or 0),
-                    "renewal_atr": abs(float(snow_opp.get("renewal_atr") or 0)),
-                    "csg_territory": snow_opp.get("csg_territory") or "",
-                    "csg_geo": snow_opp.get("csg_geo") or "",
+                    k: v
+                    for k, v in snow_opp.items()
+                    if k not in ("opty_id", "account_id")
                 }
+                renewal_prefetch_for_enrich["account_name"] = account_name
         elif _OPP_ID_RE.match(raw_in):
             rec = _fetch_opportunity_record(raw_in)
             if not rec:

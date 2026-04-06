@@ -78,7 +78,10 @@ if opps:
     print(f'  CC AOV:    {display.get("cc_aov")}')
     print(f'  Util:      {display.get("utilization_rate")}')
     print(f'  Renewal AOV: {enrichment.get("renewal_aov", {}).get("renewal_aov")}')
-    print(f'  Renewal ATR: {enrichment.get("renewal_aov", {}).get("renewal_atr")}')
+    _r = enrichment.get("renewal_aov", {}) or {}
+    print(
+        f'  Renewal ATR (snow): {_r.get("renewal_atr_snow", _r.get("renewal_atr"))}'
+    )
     print(f'  CSG GEO:   {enrichment.get("renewal_aov", {}).get("csg_geo")}')
 else:
     print("❌ NO OPPS FOUND - This is why values are Unknown/NA!")

@@ -26,6 +26,51 @@ load_dotenv()
 
 _sf_client = None
 
+# Opportunity fields: org62 is source of truth for frequently updated $ / notes fields.
+DYNAMIC_OPP_FIELDS = [
+    "Id",
+    "Name",
+    "Amount",
+    "Forecasted_Attrition__c",
+    "Swing__c",
+    "NextStep",
+    "PAM_Comment__c",
+    "Manager_Notes_Last_Update__c",
+    "StageName",
+    "CloseDate",
+    "OwnerId",
+    "Owner.Name",
+    "AccountId",
+    "Account.Id",
+    "Account.Name",
+    "Account.BillingCountry",
+    "Probability",
+    "ForecastCategoryName",
+    "License_At_Risk_Reason__c",
+    "ACV_Reason_Detail__c",
+    "Description",
+    "Specialist_Sales_Notes__c",
+    "Manager_Forecast_Judgement__c",
+]
+
+OPPORTUNITY_RENEWAL_SOQL_FIELDS = ", ".join(DYNAMIC_OPP_FIELDS)
+
+
+def get_opportunity_by_id(opp_id: str) -> Optional[Dict[str, Any]]:
+    """Single open-renewal Opportunity row (dynamic fields from org62)."""
+    if not (opp_id or "").strip():
+        return None
+    q = (
+        f"SELECT {OPPORTUNITY_RENEWAL_SOQL_FIELDS} "
+        f"FROM Opportunity WHERE Id = '{_escape(opp_id)}' LIMIT 1"
+    )
+    try:
+        recs = sf_query(q).get("records", [])
+        return recs[0] if recs else None
+    except Exception as e:
+        log_debug(f"get_opportunity_by_id error: {str(e)[:100]}")
+        return None
+
 
 def _sf_max_concurrent() -> int:
     try:
@@ -265,11 +310,14 @@ def resolve_account_enhanced(name: str, cloud: str = "Commerce Cloud") -> Option
             oid = str((snow or {}).get("opty_id") or "").strip()
             if oid:
                 out["opty_id"] = oid
+                ra_snow = (snow or {}).get("renewal_atr_snow")
+                if ra_snow is None:
+                    ra_snow = (snow or {}).get("renewal_atr")
                 out["renewal_prefetch"] = {
                     "account_name": out["name"],
                     "target_cloud": (snow or {}).get("target_cloud") or "",
                     "renewal_aov": float((snow or {}).get("renewal_aov") or 0),
-                    "renewal_atr": abs(float((snow or {}).get("renewal_atr") or 0)),
+                    "renewal_atr_snow": abs(float(ra_snow or 0)),
                     "csg_territory": (snow or {}).get("csg_territory") or "",
                     "csg_geo": (snow or {}).get("csg_geo") or "",
                 }
@@ -284,14 +332,7 @@ def get_renewal_opportunities(account_id: str, cloud: str = "Commerce Cloud") ->
     """Renewal opps for account, filtered by cloud name in Opportunity Name."""
     sf = get_sf_client()
     aid = _escape(account_id)
-    fields = (
-        "Id, Name, StageName, Amount, CloseDate, "
-        "Account.Id, Account.Name, Account.BillingCountry, "
-        "ForecastCategoryName, Forecasted_Attrition__c, Swing__c, "
-        "License_At_Risk_Reason__c, ACV_Reason_Detail__c, NextStep, "
-        "Description, Specialist_Sales_Notes__c, "
-        "Manager_Forecast_Judgement__c"
-    )
+    fields = OPPORTUNITY_RENEWAL_SOQL_FIELDS
     where = (
         f"AccountId = '{aid}' "
         f"AND Name LIKE '%{_escape(cloud)}%' "
@@ -314,14 +355,7 @@ def get_renewal_opportunities_any_cloud(account_id: str) -> list:
     """Open renewal opps without filtering Opportunity Name by cloud (enrichment fallback)."""
     sf = get_sf_client()
     aid = _escape(account_id)
-    fields = (
-        "Id, Name, StageName, Amount, CloseDate, "
-        "Account.Id, Account.Name, Account.BillingCountry, "
-        "ForecastCategoryName, Forecasted_Attrition__c, Swing__c, "
-        "License_At_Risk_Reason__c, ACV_Reason_Detail__c, NextStep, "
-        "Description, Specialist_Sales_Notes__c, "
-        "Manager_Forecast_Judgement__c"
-    )
+    fields = OPPORTUNITY_RENEWAL_SOQL_FIELDS
     where = (
         f"AccountId = '{aid}' "
         f"AND Name LIKE '%Renewal%' "
@@ -573,13 +607,7 @@ class Org62Client:
         """Return Opportunity record with common renewal fields."""
         try:
             q = f"""
-            SELECT
-                Id, Name, StageName, Amount, CloseDate, AccountId,
-                Account.Id, Account.Name, Account.BillingCountry,
-                ForecastCategoryName,
-                Forecasted_Attrition__c, Swing__c,
-                License_At_Risk_Reason__c, ACV_Reason_Detail__c, NextStep,
-                Description, Specialist_Sales_Notes__c, Manager_Forecast_Judgement__c
+            SELECT {OPPORTUNITY_RENEWAL_SOQL_FIELDS}
             FROM Opportunity
             WHERE Id = '{_escape(opp_id)}'
             LIMIT 1

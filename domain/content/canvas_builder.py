@@ -286,15 +286,17 @@ def build_account_brief_blocks(
     if fin_fields:
         blocks.append({"type": "section", "fields": fin_fields})
 
-    renewal_atr_raw = snowflake_display.get("renewal_atr", 0)
     try:
-        renewal_atr = float(renewal_atr_raw or 0)
+        atr_org62 = (
+            abs(float(opp.get("Forecasted_Attrition__c", 0) or 0)) if opp else 0.0
+        )
     except (TypeError, ValueError):
-        renewal_atr = 0.0
+        atr_org62 = 0.0
     try:
-        forecasted_atr = abs(float(opp.get("Forecasted_Attrition__c", 0) or 0)) if opp else 0.0
+        atr_snow = float(snowflake_display.get("renewal_atr", 0) or 0)
     except (TypeError, ValueError):
-        forecasted_atr = 0.0
+        atr_snow = 0.0
+    atr_shown = atr_org62 or atr_snow
     try:
         swing = abs(float(opp.get("Swing__c", 0) or 0)) if opp else 0.0
     except (TypeError, ValueError):
@@ -302,15 +304,10 @@ def build_account_brief_blocks(
     forecast_judgement = opp.get("Manager_Forecast_Judgement__c", "") if opp else ""
 
     atr_fields = []
-    if renewal_atr > 0:
+    if atr_shown > 0:
         atr_fields.append({
             "type": "mrkdwn",
-            "text": f"*ATR:*\n:chart_with_downwards_trend: {fmt_amount(renewal_atr)}",
-        })
-    if forecasted_atr > 0:
-        atr_fields.append({
-            "type": "mrkdwn",
-            "text": f"*Forecasted Attrition:*\n:chart_with_downwards_trend: {fmt_amount(forecasted_atr)}",
+            "text": f"*ATR:*\n:chart_with_downwards_trend: {fmt_amount(atr_shown)}",
         })
     if atr_fields:
         blocks.append({"type": "section", "fields": atr_fields})
@@ -597,14 +594,16 @@ def build_gm_review_canvas_markdown(
         cc_aov_cell = f"${renewal_aov:,.0f}" if renewal_aov > 0 else "Unknown"
         total_aov += renewal_aov
 
-        renewal_atr = float(
-            enrichment.get("renewal_aov", {}).get("renewal_atr", 0) or 0
+        ren_blk = enrichment.get("renewal_aov", {}) or {}
+        atr_snow = float(
+            ren_blk.get("renewal_atr_snow", 0) or ren_blk.get("renewal_atr", 0) or 0
         )
-        atr_cell = fmt_amount(renewal_atr) if renewal_atr > 0 else "N/A"
-
         forecasted_atr = abs(float(opp.get("Forecasted_Attrition__c", 0) or 0))
+        atr_merged = forecasted_atr or atr_snow
+        atr_cell = fmt_amount(atr_merged) if atr_merged > 0 else "N/A"
+
         for_atr_cell = f"$-{forecasted_atr:,.0f}" if forecasted_atr > 0 else "N/A"
-        total_atr += forecasted_atr
+        total_atr += forecasted_atr or atr_snow
 
         gmv_rate = display.get("gmv_rate", "Unknown")
         util_rate = display.get("utilization_rate", "N/A")

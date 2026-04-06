@@ -34,7 +34,7 @@ reviews = [
         "enrichment": {
             "renewal_aov": {
                 "renewal_aov": 1608311,
-                "renewal_atr": 810000,
+                "renewal_atr_snow": 810000,
                 "csg_geo": "EMEA",
             }
         },

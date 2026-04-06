@@ -29,12 +29,14 @@ _SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# GM export column set (Snowflake = static renewal row; org62 opp = dynamic $ / notes).
 HEADERS_22 = [
     "Account",
     "OU",
     "Cloud AOV",
     "ATR",
     "Forecasted Attrition",
+    "Swing",
     "Util Rate",
     "Attrition Risk Reasons",
     "Red AC Flag",
@@ -45,11 +47,12 @@ HEADERS_22 = [
     "Health",
     "SF Products",
     "Risk Assessment",
-    "Next Key Action",
+    "Manager Notes",
+    "Next Steps",
     "AE",
     "Renewal Manager",
     "CSM",
-    "Attrition Slack Channel",
+    "Renewal Status",
     "Latest Commentary",
     "Exported At",
 ]
@@ -57,6 +60,13 @@ HEADERS_22 = [
 
 def _strip_slack_emoji(text: str) -> str:
     return re.sub(r":[a-z_]+:", "", str(text or "")).strip()
+
+
+def _opp_owner_name(opp: dict) -> str:
+    o = (opp or {}).get("Owner")
+    if isinstance(o, dict):
+        return str(o.get("Name") or "").strip()
+    return ""
 
 
 def _safe_cell(value) -> str:
@@ -107,7 +117,7 @@ def export_to_gsheet(
     cloud: str | None = None,
 ) -> str:
     """
-    Export GM reviews to Google Sheets — batched 22-column append.
+    Export GM reviews to Google Sheets — batched fixed-column append (see ``HEADERS_22``).
 
     ``cloud``: workflow / user-selected cloud (slash command); drives AOV column
     header via ``cloud_aov_label`` — not Snowflake TARGET_CLOUD.
@@ -205,18 +215,26 @@ def export_to_gsheet(
                 or "Unknown"
             )
 
-            renewal_aov = float(
-                enrichment.get("renewal_aov", {}).get("renewal_aov", 0) or 0
-            )
-            cc_aov = fmt_amount(renewal_aov) if renewal_aov > 0 else "Unknown"
+            # AOV — Snowflake (prior ACV); ATR / forecast / swing — org62 first
+            renewal_aov = float(renewal.get("renewal_aov", 0) or 0)
+            cc_aov = fmt_amount(renewal_aov) if renewal_aov else "Unknown"
 
-            renewal_atr = float(
-                enrichment.get("renewal_aov", {}).get("renewal_atr", 0) or 0
+            atr_org62 = abs(float(opp.get("Forecasted_Attrition__c") or 0))
+            atr_snow = float(
+                renewal.get("renewal_atr_snow", 0)
+                or renewal.get("renewal_atr", 0)
+                or 0
             )
-            atr = fmt_amount(renewal_atr) if renewal_atr > 0 else "N/A"
+            atr_val = atr_org62 or atr_snow
+            atr = fmt_amount(atr_val) if atr_val else "N/A"
 
-            forecasted_atr = abs(float(opp.get("Forecasted_Attrition__c", 0) or 0))
-            for_attrition = fmt_amount(forecasted_atr) if forecasted_atr > 0 else "N/A"
+            fcast_raw = float(opp.get("Forecasted_Attrition__c") or 0)
+            fcast_cell = (
+                fmt_amount(abs(fcast_raw)) if fcast_raw else "N/A"
+            )
+
+            swing_raw = float(opp.get("Swing__c") or 0)
+            swing_cell = fmt_amount(swing_raw) if swing_raw else "N/A"
 
             util_rate = display.get("utilization_rate", "N/A")
 
@@ -240,7 +258,11 @@ def export_to_gsheet(
                 red_flag = f"Yes - {red_stage} ({days_red_str})"
 
             close_date = opp.get("CloseDate", "") or ""
-            renewal_month = close_date[:7] if close_date else "N/A"
+            renewal_month = (
+                str(renewal.get("renewal_close_month") or "").strip()
+                or (close_date[:7] if close_date else "")
+                or "N/A"
+            )
 
             ari_reason = display.get("ari_reason", "N/A")
             attrition_pred = f"{ari_cat} ({ari_prob}) - {ari_reason}"
@@ -263,6 +285,7 @@ def export_to_gsheet(
             sf_products = get_sf_products_display(all_prods)
             risk_assessment = recommendation
 
+            manager_notes = str(opp.get("PAM_Comment__c") or "").strip()
             next_step = opp.get("NextStep", "") or ""
 
             try:
@@ -270,11 +293,19 @@ def export_to_gsheet(
             except Exception:
                 team = {}
 
-            ae = team.get("ae", "") or ""
-            renewal_mgr = team.get("renewal_mgr", "") or ""
-            csm = team.get("csm", "") or ""
-
-            slack_channel = ""
+            ae = (
+                (renewal.get("ae_name") or "").strip()
+                or team.get("ae", "")
+                or _opp_owner_name(opp)
+                or "Unknown"
+            )
+            renewal_mgr = (
+                (renewal.get("renewal_manager") or "").strip()
+                or team.get("renewal_mgr", "")
+                or "Unknown"
+            )
+            csm = (renewal.get("csm_name") or "").strip() or team.get("csm", "") or "Unknown"
+            renewal_status = (renewal.get("renewal_status") or "").strip() or "Unknown"
 
             specialist_notes = opp.get("Specialist_Sales_Notes__c", "") or ""
             description = opp.get("Description", "") or ""
@@ -293,7 +324,8 @@ def export_to_gsheet(
                     _safe_cell(ou),
                     _safe_cell(cc_aov),
                     _safe_cell(atr),
-                    _safe_cell(for_attrition),
+                    _safe_cell(fcast_cell),
+                    _safe_cell(swing_cell),
                     _safe_cell(util_rate),
                     _safe_cell(risk_reasons),
                     _safe_cell(red_flag),
@@ -304,11 +336,12 @@ def export_to_gsheet(
                     _safe_cell(health_display),
                     _safe_cell(sf_products),
                     _safe_cell(risk_assessment),
+                    _safe_cell(manager_notes),
                     _safe_cell(next_step),
                     _safe_cell(ae),
                     _safe_cell(renewal_mgr),
                     _safe_cell(csm),
-                    _safe_cell(slack_channel),
+                    _safe_cell(renewal_status),
                     _safe_cell(latest_commentary),
                     _safe_cell(exported_at),
                 ]

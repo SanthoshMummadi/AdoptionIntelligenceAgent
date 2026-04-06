@@ -33,25 +33,25 @@ app = App(token=slack_bot_token)
 
 def _resolve_atr_for_tldr(snowflake_display: dict | None, opp: dict | None) -> str:
     """
-    Prefer Snowflake renewal ATR for TLDR; fall back to Salesforce
-    ``Forecasted_Attrition__c`` so text matches the account brief blocks.
+    Prefer Salesforce ``Forecasted_Attrition__c``; fall back to Snowflake FCAST baseline
+    (``renewal_atr_snow``).
     """
     from domain.analytics.snowflake_client import extract_usd, fmt_amount
+
+    sf_atr = (opp or {}).get("Forecasted_Attrition__c")
+    if sf_atr is not None and str(sf_atr).strip() != "":
+        return fmt_amount(extract_usd(sf_atr))
 
     disp = snowflake_display or {}
     atr_val = disp.get("renewal_atr")
     if atr_val is None:
         renewal = disp.get("renewal_aov") or {}
-        atr_val = renewal.get("renewal_atr")
+        atr_val = renewal.get("renewal_atr_snow") or renewal.get("renewal_atr")
     if atr_val is not None and str(atr_val).strip() != "":
         try:
             return fmt_amount(float(atr_val))
         except (TypeError, ValueError):
             return fmt_amount(atr_val)
-
-    sf_atr = (opp or {}).get("Forecasted_Attrition__c")
-    if sf_atr is not None and str(sf_atr).strip() != "":
-        return fmt_amount(extract_usd(sf_atr))
     return "N/A"
 
 
@@ -980,6 +980,7 @@ def attrition_risk_cmd(ack, say, command, client):
             from domain.content.canvas_builder import build_account_brief_blocks
             from domain.intelligence.risk_engine import generate_risk_analysis
             from domain.salesforce.org62_client import (
+                OPPORTUNITY_RENEWAL_SOQL_FIELDS,
                 _escape,
                 get_red_account,
                 get_renewal_opportunities,
@@ -1015,21 +1016,8 @@ def attrition_risk_cmd(ack, say, command, client):
 
                 try:
                     result = sf_query(
-                        f"""
-                        SELECT
-                            Id, Name, StageName, Amount, CloseDate,
-                            Account.Id, Account.Name,
-                            Account.BillingCountry,
-                            ForecastCategoryName,
-                            Forecasted_Attrition__c, Swing__c,
-                            License_At_Risk_Reason__c,
-                            ACV_Reason_Detail__c, NextStep,
-                            Description, Specialist_Sales_Notes__c,
-                            Manager_Forecast_Judgement__c
-                        FROM Opportunity
-                        WHERE Id = '{_escape(opp_id)}'
-                        LIMIT 1
-                    """
+                        f"SELECT {OPPORTUNITY_RENEWAL_SOQL_FIELDS} "
+                        f"FROM Opportunity WHERE Id = '{_escape(opp_id)}' LIMIT 1"
                     )
                     if not result.get("records"):
                         say(":x: Opportunity *" + opp_id + "* not found in org62.")
