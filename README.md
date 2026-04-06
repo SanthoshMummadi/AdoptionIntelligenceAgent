@@ -80,7 +80,7 @@ A Slack-native “PM Intelligence Hub” that helps product teams analyze briefs
 - `.env` – runtime configuration (see **`.env.example`** for keys; never commit `.env`).
   - `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
   - `LLM_GATEWAY_API_KEY`, `LLM_MODEL=claude-3-7-sonnet`
-  - TLS: LLM calls use **certifi** (or **`LLM_GATEWAY_CA_BUNDLE`** for a custom CA). `LLM_GATEWAY_VERIFY=false` is ignored with a startup warning.
+  - TLS: **Internal** Salesforce LLM gateway URLs use **`LLM_GATEWAY_CA_BUNDLE`** if set, otherwise **verify is disabled** (corporate CA is not in certifi). Other URLs use **certifi** / custom CA; `LLM_GATEWAY_VERIFY=false` only affects messaging for non-internal URLs (verify stays on).
   - `TABLEAU_*` credentials (for Tableau integrations).
 - `project_paths.py` – `PROJECT_ROOT` for portable `load_dotenv(PROJECT_ROOT / ".env")` (no hardcoded home paths).
 - **Architecture docs**

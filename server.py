@@ -18,6 +18,31 @@ from log_utils import log_debug, log_error, log_structured
 # Load environment variables
 load_dotenv()
 
+# Default matches internal Salesforce LLM Express gateway (corporate CA; not in certifi).
+_DEFAULT_LLM_GATEWAY_URL = (
+    "https://eng-ai-model-gateway.sfproxy.devx-preprod.aws-esvc1-useast2.aws.sfdc.cl"
+    "/v1/chat/completions"
+)
+
+
+def _llm_gateway_url() -> str:
+    u = (os.getenv("LLM_GATEWAY_URL") or "").strip()
+    return u if u else _DEFAULT_LLM_GATEWAY_URL
+
+
+def _is_internal_llm_gateway(url: str) -> bool:
+    """Hosts that use Salesforce corporate PKI — certifi alone often fails."""
+    u = (url or "").lower()
+    return any(
+        marker in u
+        for marker in (
+            "sfproxy",
+            "sfdc.cl",
+            "salesforce.com",
+            "devx",
+        )
+    )
+
 
 def _validate_required_env() -> None:
     """Validate required env vars at startup — fail fast with clear error."""
@@ -50,11 +75,19 @@ def _validate_required_env() -> None:
         log_error(error_msg)
         raise RuntimeError(error_msg)
 
-    if os.getenv("LLM_GATEWAY_VERIFY", "").strip().lower() == "false":
-        log_error(
-            "⚠️ WARNING: LLM_GATEWAY_VERIFY=false detected — ignored; "
-            "LLM gateway always verifies TLS (certifi, LLM_GATEWAY_CA_BUNDLE, or system CAs)."
-        )
+    verify_raw = os.getenv("LLM_GATEWAY_VERIFY", "").strip().lower()
+    gw = _llm_gateway_url()
+    if verify_raw == "false":
+        if _is_internal_llm_gateway(gw):
+            log_debug(
+                "LLM_GATEWAY_VERIFY=false: internal gateway URL will skip TLS verify "
+                "when no valid LLM_GATEWAY_CA_BUNDLE is set (see _get_llm_verify_config)."
+            )
+        else:
+            log_error(
+                "LLM_GATEWAY_VERIFY=false ignored for this LLM_GATEWAY_URL — "
+                "TLS uses certifi or LLM_GATEWAY_CA_BUNDLE."
+            )
 
     log_debug("✓ All required environment variables present")
 
@@ -219,22 +252,39 @@ _llm_verify_resolved: str | bool | None = None
 
 def _get_llm_verify_config() -> str | bool:
     """
-    TLS verification for LLM gateway requests.
+    TLS verification for LLM gateway ``requests`` calls.
 
-    Priority: custom CA bundle (LLM_GATEWAY_CA_BUNDLE) > certifi > system default.
-    verify=False is not used; LLM_GATEWAY_VERIFY=false is warned at startup only.
+    Order:
+
+    1. ``LLM_GATEWAY_CA_BUNDLE`` if the path exists (recommended for internal gateways).
+    2. Internal Salesforce proxy URLs (sfproxy / devx / sfdc.cl / …): ``verify=False``
+       when no bundle — corporate CA is not in certifi.
+    3. Otherwise certifi, then system defaults.
+
+    For external gateway URLs, ``LLM_GATEWAY_VERIFY=false`` does not disable verify.
     """
     global _llm_verify_resolved
     if _llm_verify_resolved is not None:
         return _llm_verify_resolved
 
-    custom_ca = os.getenv("LLM_GATEWAY_CA_BUNDLE")
-    if custom_ca:
-        if os.path.isfile(custom_ca):
-            log_debug(f"Using custom CA bundle for LLM gateway: {custom_ca}")
-            _llm_verify_resolved = custom_ca
+    url = _llm_gateway_url()
+    internal = _is_internal_llm_gateway(url)
+
+    custom_ca_raw = (os.getenv("LLM_GATEWAY_CA_BUNDLE") or "").strip()
+    if custom_ca_raw:
+        if os.path.isfile(custom_ca_raw):
+            log_debug(f"Using custom CA bundle for LLM gateway: {custom_ca_raw}")
+            _llm_verify_resolved = custom_ca_raw
             return _llm_verify_resolved
-        log_error(f"Custom CA bundle not found: {custom_ca}")
+        log_error(f"LLM_GATEWAY_CA_BUNDLE path not found: {custom_ca_raw}")
+
+    if internal:
+        log_debug(
+            "Internal LLM gateway host — TLS verify disabled (set LLM_GATEWAY_CA_BUNDLE "
+            "to enable verification with corporate CA)"
+        )
+        _llm_verify_resolved = False
+        return _llm_verify_resolved
 
     try:
         ca_path = certifi.where()
@@ -252,7 +302,7 @@ def _get_llm_verify_config() -> str | bool:
 def call_llm_gateway(prompt: str, system_prompt: str = None, max_tokens: int = 4000):
     """Call Salesforce LLM Gateway Express"""
 
-    gateway_url = "https://eng-ai-model-gateway.sfproxy.devx-preprod.aws-esvc1-useast2.aws.sfdc.cl/v1/chat/completions"
+    gateway_url = _llm_gateway_url()
 
     api_key = os.environ.get("LLM_GATEWAY_API_KEY")
     if not api_key:
