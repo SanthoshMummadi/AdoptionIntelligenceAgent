@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from domain.analytics.snowflake_client import (
+    cloud_aov_label,
     fmt_amount,
     get_sf_products_display,
     split_products_by_type,
@@ -204,6 +205,8 @@ def build_account_brief_blocks(
     risk_notes: str,
     recommendation: str,
     tldr: str = None,
+    user_cloud: str = "",
+    all_products: list | None = None,
 ) -> list:
     """Slack Block Kit: header, ARI/health, AOV/util, financial status, products, notes, risk, actions, summary, link."""
     account_name = account.get("name", "Unknown")
@@ -245,6 +248,9 @@ def build_account_brief_blocks(
     cc_aov = snowflake_display.get("cc_aov", "Unknown")
     util_rate = snowflake_display.get("utilization_rate", "N/A")
 
+    c_lbl = (user_cloud or "").strip() or "Commerce Cloud"
+    aov_lbl = cloud_aov_label(c_lbl)
+
     if util_rate and util_rate != "N/A":
         util_emoji = _util_emoji(util_rate)
         util_display = f"{util_emoji} {util_rate}"
@@ -254,7 +260,7 @@ def build_account_brief_blocks(
     blocks.append({
         "type": "section",
         "fields": [
-            {"type": "mrkdwn", "text": f"*Cloud AOV:*\n{cc_aov}"},
+            {"type": "mrkdwn", "text": f"*{aov_lbl}:*\n{cc_aov}"},
             {"type": "mrkdwn", "text": f"*Utilization:*\n{util_display}"},
         ],
     })
@@ -492,7 +498,11 @@ def build_canvas_row(
     util_rate = snowflake_display.get("utilization_rate", "N/A")
     gmv_rate = snowflake_display.get("gmv_rate", "N/A")
     close_date = opp.get("CloseDate", "N/A") if opp else "N/A"
-    territory = snowflake_display.get("territory", "N/A")
+    territory = (
+        snowflake_display.get("territory")
+        or snowflake_display.get("csg_territory")
+        or "N/A"
+    )
 
     # Red account flag
     red_ac_flag = "Yes" if (red_account and not red_account.get("_historical")) else "No"
@@ -545,6 +555,9 @@ def build_gm_review_canvas_markdown(
             ]
         )
 
+    c_lbl = (cloud or "").strip() or "Commerce Cloud"
+    aov_hdr = cloud_aov_label(c_lbl)
+
     lines = [
         f"# {cloud} — GM Review",
         f"### {today}",
@@ -553,7 +566,7 @@ def build_gm_review_canvas_markdown(
         "",
         "## At-Risk Renewals",
         "",
-        "| ACCOUNT | ARI | CC AOV | ATR | For. Attrition | GMV Rate | Util Rate | Close Date | Territory | SF Products | Notes | Risk Analysis | Recommendation |",
+        f"| ACCOUNT | ARI | {aov_hdr} | ATR | For. Attrition | GMV Rate | Util Rate | Close Date | Territory | SF Products | Notes | Risk Analysis | Recommendation |",
         "|---------|-----|--------|-----|----------------|----------|-----------|------------|-----------|-------------|-------|---------------|----------------|",
     ]
 
@@ -598,7 +611,10 @@ def build_gm_review_canvas_markdown(
         close_date = opp.get("CloseDate", "N/A")
 
         territory = (
-            str(enrichment.get("renewal_aov", {}).get("csg_geo", "") or "").strip()
+            display.get("territory")
+            or display.get("csg_territory")
+            or str(enrichment.get("renewal_aov", {}).get("csg_territory", "") or "").strip()
+            or str(enrichment.get("renewal_aov", {}).get("csg_geo", "") or "").strip()
             or (str(red.get("CSG_GEO__c", "") or "").strip() if red else "")
             or "N/A"
         )
@@ -680,7 +696,7 @@ def build_gm_review_canvas_markdown(
         f"| **Cloud** | {cloud} |",
         f"| **Filter** | {filter_label} |",
         f"| **Accounts Reviewed** | {len(reviews)} |",
-        f"| **Total CC AOV** | {fmt_amount(total_aov)} |",
+        f"| **Total {aov_hdr}** | {fmt_amount(total_aov)} |",
         f"| **Total Forecasted Attrition** | ${total_atr:,.0f} |",
         f"| **Generated** | {today} |",
         "",
@@ -710,6 +726,9 @@ def build_gm_review_canvas(
 
     filter_label = " - ".join(filter_parts)
 
+    c_lbl = (cloud or "").strip() or "Commerce Cloud"
+    aov_hdr = cloud_aov_label(c_lbl)
+
     # Calculate totals
     def parse_amt(val):
         try:
@@ -727,7 +746,7 @@ def build_gm_review_canvas(
 
     # Build table
     table = (
-        "|ACCOUNT|CC AOV|ATR|Forecasted Attrition|GMV Rate|Util Rate|"
+        f"|ACCOUNT|{aov_hdr}|ATR|Forecasted Attrition|GMV Rate|Util Rate|"
         "Close Date|Territory|SF Products|Notes|Risk Analysis|Recommendation|\n"
         "|---|---|---|---|---|---|---|---|---|---|---|---|\n"
     )
@@ -765,7 +784,7 @@ def build_gm_review_canvas(
 |Metric|Value|
 |---|---|
 |Total Accounts|{len(rows)}|
-|Total CC AOV|{fmt_amount(total_aov)}|
+|Total {aov_hdr}|{fmt_amount(total_aov)}|
 |Total Forecasted Attrition|{fmt_amount(total_atr)}|
 |Generated|{today}|
 
@@ -817,8 +836,16 @@ class CanvasBuilder:
         if account_data.get("risk_analysis"):
             parts.append(self.format_risk_section(account_data["risk_analysis"]))
             parts.append("")
-        if account_data.get("adoption_pov"):
-            parts.append(self.format_adoption_section(account_data["adoption_pov"]))
+        ap = account_data.get("adoption_pov")
+        if ap:
+            if isinstance(ap, dict):
+                ap_m = dict(ap)
+                wc = account_data.get("cloud")
+                if wc:
+                    ap_m.setdefault("cloud", wc)
+                parts.append(self.format_adoption_section(ap_m))
+            else:
+                parts.append("## Adoption & usage\n\n" + str(ap) + "\n")
         return "\n".join(parts).rstrip() + "\n"
 
     def format_risk_section(self, risk_data: Dict[str, Any]) -> str:
@@ -858,7 +885,9 @@ class CanvasBuilder:
         if burn is not None:
             lines.append(f"- **Burn rate:** {burn}")
         if aov is not None:
-            lines.append(f"- **CC AOV:** {aov}")
+            c_ad = (adoption_data.get("cloud") or "").strip() or "Commerce Cloud"
+            aov_l = cloud_aov_label(c_ad)
+            lines.append(f"- **{aov_l}:** {aov}")
         if terr is not None:
             lines.append(f"- **Territory:** {terr}")
         if geo is not None:

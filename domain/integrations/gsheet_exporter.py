@@ -4,6 +4,7 @@ Google Sheets export — batched 22-column write.
 """
 import json
 import os
+import re
 import traceback
 from datetime import date, datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ _SCOPES = [
 HEADERS_22 = [
     "Account",
     "OU",
-    "CC AOV",
+    "Cloud AOV",
     "ATR",
     "Forecasted Attrition",
     "Util Rate",
@@ -52,6 +53,10 @@ HEADERS_22 = [
     "Latest Commentary",
     "Exported At",
 ]
+
+
+def _strip_slack_emoji(text: str) -> str:
+    return re.sub(r":[a-z_]+:", "", str(text or "")).strip()
 
 
 def _safe_cell(value) -> str:
@@ -96,14 +101,25 @@ def get_google_creds():
     )
 
 
-def export_to_gsheet(reviews: list, sheet_name: str | None = None) -> str:
+def export_to_gsheet(
+    reviews: list,
+    sheet_name: str | None = None,
+    cloud: str | None = None,
+) -> str:
     """
     Export GM reviews to Google Sheets — batched 22-column append.
+
+    ``cloud``: workflow / user-selected cloud (slash command); drives AOV column
+    header via ``cloud_aov_label`` — not Snowflake TARGET_CLOUD.
 
     Returns:
         Sheet URL, or "" on skip/failure.
     """
-    from domain.analytics.snowflake_client import fmt_amount, get_sf_products_display
+    from domain.analytics.snowflake_client import (
+        cloud_aov_label,
+        fmt_amount,
+        get_sf_products_display,
+    )
     from domain.salesforce.org62_client import get_account_team
 
     sheet_id = _gsheet_id()
@@ -129,21 +145,31 @@ def export_to_gsheet(reviews: list, sheet_name: str | None = None) -> str:
             except Exception:
                 ws = sh.add_worksheet(title=sheet_name, rows=500, cols=25)
 
+        headers_row = list(HEADERS_22)
+        if reviews:
+            r0 = reviews[0]
+            hdr_cloud = (cloud or r0.get("cloud") or "").strip()
+            if not hdr_cloud:
+                hdr_cloud = "Commerce Cloud"
+            headers_row[2] = cloud_aov_label(hdr_cloud)
+        else:
+            headers_row[2] = "Cloud AOV"
+
         existing_row1: list = []
         try:
             existing_row1 = ws.row_values(1)
         except Exception:
             pass
 
-        if existing_row1 != HEADERS_22:
+        if existing_row1 != headers_row:
             if not existing_row1:
                 ws.append_row(
-                    HEADERS_22, value_input_option="USER_ENTERED"
+                    headers_row, value_input_option="USER_ENTERED"
                 )
                 print("✓ Headers written to sheet")
             else:
                 ws.insert_row(
-                    HEADERS_22,
+                    headers_row,
                     index=1,
                     value_input_option="USER_ENTERED",
                     inherit_from_before=False,
@@ -171,7 +197,13 @@ def export_to_gsheet(reviews: list, sheet_name: str | None = None) -> str:
 
             ari_cat = display.get("ari_category", "Unknown")
             ari_prob = display.get("ari_probability", "N/A")
-            ou = f"{ari_cat} ({ari_prob})"
+
+            renewal = enrichment.get("renewal_aov", {}) or {}
+            ou = (
+                renewal.get("csg_territory")
+                or renewal.get("csg_geo")
+                or "Unknown"
+            )
 
             renewal_aov = float(
                 enrichment.get("renewal_aov", {}).get("renewal_aov", 0) or 0
@@ -213,14 +245,21 @@ def export_to_gsheet(reviews: list, sheet_name: str | None = None) -> str:
             ari_reason = display.get("ari_reason", "N/A")
             attrition_pred = f"{ari_cat} ({ari_prob}) - {ari_reason}"
 
-            health_score = display.get("health_score", "Unknown")
-            health_literal = display.get("health_literal", "")
-            if health_literal:
-                css_score = f"{health_score} ({health_literal})"
+            health_score = enrichment.get("health", {}).get("overall_score")
+            health_literal = enrichment.get("health", {}).get(
+                "overall_literal", "Unknown"
+            )
+            if health_score:
+                try:
+                    css_score = f"{int(float(health_score))} ({health_literal})"
+                except (TypeError, ValueError):
+                    css_score = "Unknown"
             else:
-                css_score = str(health_score)
+                css_score = "Unknown"
 
-            health_display = display.get("health_display", "Unknown")
+            health_display = _strip_slack_emoji(
+                display.get("health_display", "Unknown")
+            )
             sf_products = get_sf_products_display(all_prods)
             risk_assessment = recommendation
 

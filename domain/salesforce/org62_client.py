@@ -270,6 +270,7 @@ def resolve_account_enhanced(name: str, cloud: str = "Commerce Cloud") -> Option
                     "target_cloud": (snow or {}).get("target_cloud") or "",
                     "renewal_aov": float((snow or {}).get("renewal_aov") or 0),
                     "renewal_atr": abs(float((snow or {}).get("renewal_atr") or 0)),
+                    "csg_territory": (snow or {}).get("csg_territory") or "",
                     "csg_geo": (snow or {}).get("csg_geo") or "",
                 }
             return out

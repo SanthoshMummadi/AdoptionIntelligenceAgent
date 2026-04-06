@@ -48,6 +48,62 @@ SUCCESS_PLAN_KEYWORDS = [
     "- standard",
 ]
 
+# AOV column/header label — driven by user / workflow cloud (slash command), not TARGET_CLOUD
+# (Snowflake often returns TARGET_CLOUD = "Core" for FSC/industry).
+CLOUD_AOV_LABEL_MAP: dict[str, str] = {
+    "Commerce Cloud": "Commerce AOV",
+    "B2C Commerce": "Commerce AOV",
+    "B2B Commerce": "Commerce AOV",
+    "Financial Services Cloud": "FSC AOV",
+    "FSC": "FSC AOV",
+    "Marketing Cloud": "Marketing AOV",
+    "Sales Cloud": "Sales AOV",
+    "Service Cloud": "Service AOV",
+    "Data Cloud": "Data AOV",
+    "Tableau": "Tableau AOV",
+    "MuleSoft": "MuleSoft AOV",
+    "Health Cloud": "Health AOV",
+    "Industries": "Industries AOV",
+}
+
+
+def cloud_aov_label(cloud: str | None) -> str:
+    """
+    Return cloud-specific AOV label for sheet/canvas.
+    Driven by user-selected cloud from GM Review workflow (slash command),
+    not by renewal TARGET_CLOUD (often ``Core`` for FSC).
+    """
+    if not cloud or str(cloud).strip() in ("", "All Clouds"):
+        return "Cloud AOV"
+    c = str(cloud).strip()
+    if c in CLOUD_AOV_LABEL_MAP:
+        return CLOUD_AOV_LABEL_MAP[c]
+    c_lower = c.lower()
+    if "commerce" in c_lower:
+        return "Commerce AOV"
+    if "financial" in c_lower:
+        return "FSC AOV"
+    if "fsc" in c_lower:
+        return "FSC AOV"
+    if "marketing" in c_lower:
+        return "Marketing AOV"
+    if "sales" in c_lower:
+        return "Sales AOV"
+    if "service" in c_lower:
+        return "Service AOV"
+    if "data" in c_lower:
+        return "Data AOV"
+    if "tableau" in c_lower:
+        return "Tableau AOV"
+    if "mulesoft" in c_lower:
+        return "MuleSoft AOV"
+    if "health" in c_lower:
+        return "Health AOV"
+    parts = c.split()
+    first = parts[0] if parts else "Cloud"
+    return f"{first} AOV"
+
+
 _pool: Queue = Queue(maxsize=POOL_SIZE)
 _pool_initialized = False
 _pool_lock = threading.Lock()
@@ -967,7 +1023,7 @@ def _gmv_rate_pct_from_renewal_row(row: dict) -> Optional[str]:
 
 
 def get_renewal_aov(opty_id):
-    """Renewal row from WV_CI_RENEWAL_OPTY_VW (AOV, ATR, CSG_GEO, GMV rate from view)."""
+    """Renewal row from WV_CI_RENEWAL_OPTY_VW (AOV, ATR, CSG_TERRITORY, CSG_GEO, GMV rate)."""
     if not opty_id:
         return {}
     opty_id_15 = to_15_char_id(opty_id)
@@ -986,6 +1042,7 @@ def get_renewal_aov(opty_id):
             "renewal_aov": float(r.get("RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV") or 0),
             "renewal_atr": abs(float(r.get("RENEWAL_FCAST_ATTRITION_CONV") or 0)),
             "csg_geo": r.get("CSG_GEO") or "",
+            "csg_territory": r.get("CSG_TERRITORY") or "",
         }
         gmv = _gmv_rate_pct_from_renewal_row(r)
         if gmv:
@@ -1003,7 +1060,7 @@ def get_open_renewal_from_snowflake(
     Closed/Dead stages; latest ``AS_OF_DATE``; highest prior ACV).
 
     Returns keys: ``opty_id`` (15-char), ``account_id``, ``account_name``,
-    ``renewal_aov``, ``renewal_atr``, ``csg_geo``, ``target_cloud``.
+    ``renewal_aov``, ``renewal_atr``, ``csg_territory``, ``csg_geo``, ``target_cloud``.
     """
     is_fsc = (
         "financial services" in str(cloud).lower()
@@ -1036,6 +1093,7 @@ def get_open_renewal_from_snowflake(
             ACCOUNT_NM                               AS ACCOUNT_NAME,
             RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
             RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR,
+            CSG_TERRITORY,
             CSG_GEO,
             TARGET_CLOUD
         FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
@@ -1064,6 +1122,7 @@ def get_open_renewal_from_snowflake(
                 "account_name": r.get("ACCOUNT_NAME") or "",
                 "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
                 "renewal_atr": abs(float(r.get("RENEWAL_ATR") or 0)),
+                "csg_territory": r.get("CSG_TERRITORY") or "",
                 "csg_geo": r.get("CSG_GEO") or "",
                 "target_cloud": r.get("TARGET_CLOUD") or "",
             }
@@ -1259,6 +1318,7 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
         "ari_emoji": ari_emoji,
         "ari_reason": ari.get("reason", "N/A"),
         "territory": "N/A",
+        "csg_territory": "",
         "csg_geo": "N/A",
         "burn_rate": "N/A",
         "gmv_rate": "N/A",
@@ -1316,6 +1376,17 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
             result["renewal_atr"] = renewal.get("renewal_atr")
         if renewal.get("gmv_rate_pct") is not None:
             result["gmv_rate"] = renewal.get("gmv_rate_pct")
+        result["csg_geo"] = renewal.get("csg_geo", "N/A")
+        ct = renewal.get("csg_territory")
+        result["csg_territory"] = (str(ct).strip() if ct else "") or ""
+        result["territory"] = (
+            renewal.get("csg_territory")
+            or renewal.get("csg_geo")
+            or "N/A"
+        )
+        tc = renewal.get("target_cloud")
+        if tc is not None and str(tc).strip():
+            result["target_cloud"] = str(tc).strip()
     return result
 
 
@@ -1377,7 +1448,8 @@ def resolve_account_from_snowflake(
     Resolve account from Snowflake renewal view using parallel fuzzy LIKE patterns.
 
     Returns ``account_id``, ``account_name``, plus open-renewal row fields when matched:
-    ``opty_id`` (15-char), ``renewal_aov``, ``renewal_atr``, ``csg_geo``, ``target_cloud``.
+    ``opty_id`` (15-char), ``renewal_aov``, ``renewal_atr``, ``csg_territory``,
+    ``csg_geo``, ``target_cloud``.
 
     Each pattern uses the latest ``AS_OF_DATE`` snapshot, excludes closed/dead stages,
     and orders by ``RENEWAL_AMT_CONV`` for deterministic tie-breaks on duplicate names.
@@ -1431,6 +1503,7 @@ def resolve_account_from_snowflake(
                     ren.RENEWAL_OPTY_ID,
                     ren.RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
                     ren.RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR,
+                    ren.CSG_TERRITORY,
                     ren.CSG_GEO,
                     ren.TARGET_CLOUD
                 FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
@@ -1454,6 +1527,7 @@ def resolve_account_from_snowflake(
                     "opty_id": to_15_char_id(str(r.get("RENEWAL_OPTY_ID") or "")),
                     "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
                     "renewal_atr": abs(float(r.get("RENEWAL_ATR") or 0)),
+                    "csg_territory": r.get("CSG_TERRITORY") or "",
                     "csg_geo": r.get("CSG_GEO") or "",
                     "target_cloud": r.get("TARGET_CLOUD") or "",
                     "priority": priority,
@@ -1487,6 +1561,7 @@ def resolve_account_from_snowflake(
             "opty_id": best.get("opty_id") or "",
             "renewal_aov": float(best.get("renewal_aov") or 0),
             "renewal_atr": float(best.get("renewal_atr") or 0),
+            "csg_territory": best.get("csg_territory") or "",
             "csg_geo": best.get("csg_geo") or "",
             "target_cloud": best.get("target_cloud") or "",
         }

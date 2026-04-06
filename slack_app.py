@@ -1167,6 +1167,10 @@ def attrition_risk_cmd(ack, say, command, client):
                 risk_notes=risk_notes,
                 recommendation=recommendation,
                 tldr=tldr,
+                user_cloud=detected_cloud,
+                all_products=product_attrition
+                if isinstance(product_attrition, list)
+                else [],
             )
             say(
                 text="Account Risk Briefing — " + account_name,
@@ -1329,7 +1333,9 @@ def gm_review_canvas(ack, say, command, client):
                     f"{len(reviews)} review(s), GSHEET_ID={'set' if gsheet_env else 'MISSING'}"
                 )
                 sheet_name = date_type.today().strftime("GM Review %Y-%m-%d")
-                sheet_url = export_to_gsheet(reviews, sheet_name=sheet_name)
+                sheet_url = export_to_gsheet(
+                    reviews, sheet_name=sheet_name, cloud=detected_cloud
+                )
                 if sheet_url:
                     print(f"[gm-review-canvas] Sheets export OK: {sheet_url[:80]}...")
                     say(

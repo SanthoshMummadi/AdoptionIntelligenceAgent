@@ -167,6 +167,7 @@ class GMReviewWorkflow:
             {
                 "account_name": r["account_name"],
                 "account_id": r["account_id"],
+                "cloud": r.get("cloud") or cloud,
                 "opp": r.get("opp") or {},
                 "snowflake_display": r.get("snowflake_display") or {},
                 "enrichment": r.get("enrichment") or {},
@@ -238,6 +239,7 @@ class GMReviewWorkflow:
                     "target_cloud": snow_opp.get("target_cloud") or "",
                     "renewal_aov": float(snow_opp.get("renewal_aov") or 0),
                     "renewal_atr": abs(float(snow_opp.get("renewal_atr") or 0)),
+                    "csg_territory": snow_opp.get("csg_territory") or "",
                     "csg_geo": snow_opp.get("csg_geo") or "",
                 }
         elif _OPP_ID_RE.match(raw_in):
@@ -467,6 +469,7 @@ class GMReviewWorkflow:
         return {
             "account_id": account_id,
             "account_name": account_name,
+            "cloud": cloud,
             "opp": opp,
             "enrichment": enrichment,
             "snowflake_display": display,
