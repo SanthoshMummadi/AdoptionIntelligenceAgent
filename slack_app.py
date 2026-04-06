@@ -33,6 +33,31 @@ if not slack_bot_token:
 
 app = App(token=slack_bot_token)
 
+
+def _resolve_atr_for_tldr(snowflake_display: dict | None, opp: dict | None) -> str:
+    """
+    Prefer Snowflake renewal ATR for TLDR; fall back to Salesforce
+    ``Forecasted_Attrition__c`` so text matches the account brief blocks.
+    """
+    from domain.analytics.snowflake_client import extract_usd, fmt_amount
+
+    disp = snowflake_display or {}
+    atr_val = disp.get("renewal_atr")
+    if atr_val is None:
+        renewal = disp.get("renewal_aov") or {}
+        atr_val = renewal.get("renewal_atr")
+    if atr_val is not None and str(atr_val).strip() != "":
+        try:
+            return fmt_amount(float(atr_val))
+        except (TypeError, ValueError):
+            return fmt_amount(atr_val)
+
+    sf_atr = (opp or {}).get("Forecasted_Attrition__c")
+    if sf_atr is not None and str(sf_atr).strip() != "":
+        return fmt_amount(extract_usd(sf_atr))
+    return "N/A"
+
+
 # -------------------------
 # Persistence
 # -------------------------
@@ -1111,9 +1136,7 @@ def attrition_risk_cmd(ack, say, command, client):
                     + " | ARI: "
                     + str(display.get("ari_category", "N/A"))
                     + " | ATR: "
-                    + str(
-                        abs(opp.get("Forecasted_Attrition__c") or 0) if opp else 0
-                    )
+                    + _resolve_atr_for_tldr(display, opp)
                     + " | Risk: "
                     + str(
                         opp.get("License_At_Risk_Reason__c") or "N/A"

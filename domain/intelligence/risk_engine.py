@@ -2,6 +2,7 @@
 domain/intelligence/risk_engine.py
 AI-powered risk analysis — March 30-style themes + LLM prompts, plus RiskEngine for workflows.
 """
+import re
 from typing import Any, Dict
 
 from log_utils import log_debug
@@ -165,7 +166,7 @@ def generate_risk_analysis(
     call_llm_fn=None,
 ) -> tuple[str, str]:
     """
-    Generate risk notes + recommendations via LLM.
+    Generate risk notes + recommendations via a single LLM call (two delimited sections).
     Returns: (risk_notes, recommendation)
     """
     opp = opp or {}
@@ -225,57 +226,63 @@ Risk Detail: {risk_detail}
     if not call_llm_fn:
         return fallback_notes.strip(), fallback_recommendation.strip()
 
-    try:
-        risk_notes = call_llm_fn(
-            "Write 3 crisp bullet points about this account's attrition risk:\n"
-            + context
-            + "\n\n"
-            "Rules:\n"
-            "- Start each bullet with -\n"
-            "- NO emojis or special symbols\n"
-            "- NO markdown bold (**text**)\n"
-            "- NO pipe characters\n"
-            "- Plain text only\n"
-            "- Each bullet max 20 words",
-            system_prompt="Senior Salesforce PM. Plain text bullets only.",
-            max_tokens=400,
-        )
-    except Exception as e:
-        log_debug(f"Risk notes generation error: {str(e)[:100]}")
-        risk_notes = ""
-    if not (risk_notes and str(risk_notes).strip()):
-        risk_notes = fallback_notes
+    playbook = (
+        "\n".join(f"- {r}" for r in recs)
+        if recs
+        else "- Use sound renewal judgment based on context."
+    )
 
-    rec_context = f"""
-Account: {account_name}
-Risk Theme: {theme}
-Standard recommendations:
-{chr(10).join("- " + r for r in recs)}
+    prompt = (
+        "You are a Senior Salesforce PM analyst. Use the account context below.\n\n"
+        + context.strip()
+        + "\n\nStandard recommendation themes (use where relevant):\n"
+        + playbook
+        + "\n\nRespond in EXACTLY this structure. Plain text only: no emojis, no markdown "
+        "bold, no pipe (|) characters. Each bullet must start with \"- \" and stay under "
+        "20 words.\n\n"
+        "RISK_NOTES:\n"
+        "- (three bullets: key attrition risk signals)\n\n"
+        "RECOMMENDATIONS:\n"
+        "- (two bullets: specific actions for the account team)\n"
+    )
 
-Account context:
-{context[:400]}
-"""
+    risk_notes = fallback_notes.strip()
+    recommendation = fallback_recommendation.strip()
 
     try:
-        recommendation = call_llm_fn(
-            "Write 2 specific recommendations for this account:\n"
-            + rec_context
-            + "\n\n"
-            "Rules:\n"
-            "- Start each with -\n"
-            "- NO emojis or special symbols\n"
-            "- NO markdown bold (**text**)\n"
-            "- NO pipe characters\n"
-            "- Plain text only\n"
-            "- Each max 20 words",
-            system_prompt="Senior Salesforce PM. Plain text bullets only.",
-            max_tokens=300,
+        llm_response = call_llm_fn(
+            prompt,
+            system_prompt=(
+                "Senior Salesforce PM. Output only the RISK_NOTES and RECOMMENDATIONS "
+                "sections exactly as requested."
+            ),
+            max_tokens=700,
         )
     except Exception as e:
-        log_debug(f"Recommendation generation error: {str(e)[:100]}")
-        recommendation = ""
-    if not (recommendation and str(recommendation).strip()):
-        recommendation = fallback_recommendation
+        log_debug(f"Combined risk analysis LLM error: {str(e)[:100]}")
+        llm_response = ""
+
+    if llm_response and str(llm_response).strip():
+        raw = str(llm_response).strip()
+        parts = re.split(r"RECOMMENDATIONS\s*:", raw, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            risk_part = re.sub(
+                r"^\s*RISK_NOTES\s*:?\s*",
+                "",
+                parts[0],
+                flags=re.IGNORECASE | re.DOTALL,
+            ).strip()
+            rec_part = parts[1].strip()
+            if risk_part:
+                risk_notes = risk_part
+            else:
+                risk_notes = fallback_notes.strip()
+            if rec_part:
+                recommendation = rec_part
+            else:
+                recommendation = fallback_recommendation.strip()
+        else:
+            risk_notes = raw
 
     return risk_notes.strip(), recommendation.strip()
 

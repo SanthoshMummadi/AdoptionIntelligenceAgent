@@ -183,8 +183,9 @@ class GMReviewWorkflow:
         """Generate a single account review — all direct domain calls."""
         from domain.analytics.snowflake_client import (
             enrich_account,
+            filter_products_by_cloud,
             format_enrichment_for_display,
-            get_account_attrition,
+            get_account_attrition_all,
             to_15_char_id,
         )
         from domain.content.canvas_builder import build_adoption_pov
@@ -289,12 +290,11 @@ class GMReviewWorkflow:
         t_snow_start = time.time()
         snow_note = "" if needs_renewal_lookup else " (incl. overlapped SF)"
         if needs_renewal_lookup:
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            with ThreadPoolExecutor(max_workers=2) as ex:
                 fut_enrich = ex.submit(
                     _enrich_fn, account_id_15, opty_id or None, cloud
                 )
-                fut_products = ex.submit(get_account_attrition, account_id_15, cloud)
-                fut_all_prod = ex.submit(get_account_attrition, account_id_15, None)
+                fut_attrition = ex.submit(get_account_attrition_all, account_id_15)
 
                 try:
                     enrichment = fut_enrich.result(timeout=30)
@@ -303,15 +303,12 @@ class GMReviewWorkflow:
                     enrichment = {}
 
                 try:
-                    product_attrition = fut_products.result(timeout=15)
+                    attrition_data = fut_attrition.result(timeout=20)
+                    all_products = attrition_data.get("all", [])
+                    product_attrition = filter_products_by_cloud(all_products, cloud)
                 except Exception as e:
-                    log_debug(f"get_account_attrition error: {str(e)[:60]}")
+                    log_debug(f"get_account_attrition_all error: {str(e)[:60]}")
                     product_attrition = []
-
-                try:
-                    all_products = fut_all_prod.result(timeout=15)
-                except Exception as e:
-                    log_debug(f"get_account_attrition (all) error: {str(e)[:60]}")
                     all_products = []
 
             t_snow = time.time() - t_snow_start
@@ -320,12 +317,11 @@ class GMReviewWorkflow:
             )
         else:
             # Case 2: opp already known — enrich + attrition + red + team in one pool
-            with ThreadPoolExecutor(max_workers=5) as ex:
+            with ThreadPoolExecutor(max_workers=4) as ex:
                 fut_enrich = ex.submit(
                     _enrich_fn, account_id_15, opty_id or None, cloud
                 )
-                fut_products = ex.submit(get_account_attrition, account_id_15, cloud)
-                fut_all_prod = ex.submit(get_account_attrition, account_id_15, None)
+                fut_attrition = ex.submit(get_account_attrition_all, account_id_15)
                 fut_red = ex.submit(get_red_account, account_id)
                 fut_team = ex.submit(get_account_team, account_id)
 
@@ -336,15 +332,12 @@ class GMReviewWorkflow:
                     enrichment = {}
 
                 try:
-                    products = fut_products.result(timeout=15)
+                    attrition_data = fut_attrition.result(timeout=20)
+                    all_products = attrition_data.get("all", [])
+                    products = filter_products_by_cloud(all_products, cloud)
                 except Exception as e:
-                    log_debug(f"get_account_attrition error: {str(e)[:60]}")
+                    log_debug(f"get_account_attrition_all error: {str(e)[:60]}")
                     products = []
-
-                try:
-                    all_products = fut_all_prod.result(timeout=15)
-                except Exception as e:
-                    log_debug(f"get_account_attrition (all) error: {str(e)[:60]}")
                     all_products = []
 
                 try:

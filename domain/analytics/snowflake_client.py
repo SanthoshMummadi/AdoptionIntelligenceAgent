@@ -235,16 +235,30 @@ def split_products_by_type(products: list) -> dict:
     return {"core": core, "success_plans": success_plans}
 
 
-def run_query(sql: str, params: Optional[list] = None) -> list[dict]:
-    """Execute Snowflake query using the connection pool; always returns the connection."""
+def run_query(
+    sql: str,
+    params: Optional[list] = None,
+    *,
+    statement_timeout: Optional[int] = None,
+) -> list[dict]:
+    """
+    Execute Snowflake query using the connection pool; always returns the connection.
+
+    ``statement_timeout``: seconds for ``STATEMENT_TIMEOUT_IN_SECONDS`` on this query
+    only; when omitted, uses ``SNOWFLAKE_STATEMENT_TIMEOUT`` (default 30).
+    """
 
     def _execute(conn: Any) -> list[dict]:
         cursor = conn.cursor()
         try:
             t_query_start = time.time()
-            statement_timeout = _env_int("SNOWFLAKE_STATEMENT_TIMEOUT", 30)
+            timeout = (
+                statement_timeout
+                if statement_timeout is not None
+                else _env_int("SNOWFLAKE_STATEMENT_TIMEOUT", 30)
+            )
             cursor.execute(
-                f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {statement_timeout}"
+                f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {timeout}"
             )
             cursor.execute(sql, params or [])
             rows = cursor.fetchall()
@@ -408,6 +422,7 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
             LIMIT 1
             """,
             [account_id],
+            statement_timeout=_env_int("SNOWFLAKE_USAGE_PRECHECK_TIMEOUT", 20),
         )
         if not check:
             log_debug(
@@ -418,7 +433,14 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
         log_debug(f"get_usage_unified pre-check error: {str(e)[:60]}")
         # Continue with normal fallback chain if pre-check fails
 
-    def _run(snap_filter: str, params: list) -> list:
+    cidm_timeout = _env_int("SNOWFLAKE_USAGE_CIDM_TIMEOUT", 45)
+
+    def _run(
+        snap_filter: str,
+        params: list,
+        *,
+        statement_timeout: int | None = None,
+    ) -> list:
         sql = f"""
             SELECT
                 DRVD_APM_LVL_1,
@@ -436,6 +458,8 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
             ORDER BY PROVISIONED DESC
         """
         try:
+            if statement_timeout is not None:
+                return run_query(sql, params, statement_timeout=statement_timeout)
             return run_query(sql, params)
         except Exception as e:
             log_debug(f"get_usage_unified error: {str(e)[:100]}")
@@ -456,6 +480,7 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
             )
             """,
             [account_id, account_id],
+            statement_timeout=cidm_timeout,
         )
 
     if not rows:
@@ -475,6 +500,7 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
                 ORDER BY PROVISIONED DESC
                 """,
                 [account_id],
+                statement_timeout=cidm_timeout,
             )
         except Exception as e:
             log_debug(f"GMV fallback error: {str(e)[:100]}")
@@ -674,7 +700,8 @@ def enrich_account(account_id, opty_id=None, cloud=None):
 
     if result["ari"]["category"] == "Unknown":
         try:
-            all_products = get_account_attrition(account_id_15, cloud)
+            att = get_account_attrition_all(account_id_15)
+            all_products = filter_products_by_cloud(att.get("all", []), cloud)
             if all_products:
                 ari_result = calculate_overall_ari(
                     all_products, min_atr_threshold=0
@@ -778,7 +805,11 @@ def get_customer_health(account_id):
         ORDER BY CATEGORY
         LIMIT 20
     """
-    rows = run_query(sql, [account_id, account_id])
+    rows = run_query(
+        sql,
+        [account_id, account_id],
+        statement_timeout=_env_int("SNOWFLAKE_HEALTH_STATEMENT_TIMEOUT", 45),
+    )
 
     if not rows:
         return None
@@ -923,6 +954,99 @@ def _apm_product_display_name(row: dict) -> str:
     return "Unknown"
 
 
+def _normalize_attrition_row(r: dict) -> dict:
+    """Single CSS attrition row → structure used by GM Review / Slack / enrich."""
+    return {
+        "product": _apm_product_display_name(r),
+        "APM_LVL_1": r.get("APM_LVL_1"),
+        "APM_LVL_2": r.get("APM_LVL_2"),
+        "APM_LVL_3": r.get("APM_LVL_3"),
+        "ATTRITION_PIPELINE": r.get("ATTRITION_PIPELINE"),
+        "ATTRITION_PROBA": r.get("ATTRITION_PROBA"),
+        "ATTRITION_PROBA_CATEGORY": r.get("ATTRITION_PROBA_CATEGORY"),
+        "ATTRITION_REASON": r.get("ATTRITION_REASON"),
+        "attrition": abs(float(r.get("ATTRITION_PIPELINE") or 0)),
+        "category": r.get("ATTRITION_PROBA_CATEGORY"),
+        "reason": r.get("ATTRITION_REASON") or "",
+        "factors_incr": r.get("FACTORS_INCR_RISK") or "",
+        "factors_decr": r.get("FACTORS_DECR_RISK") or "",
+    }
+
+
+def _apm_cloud_match_variants(cloud: str) -> list[str]:
+    """Lowercased substring needles aligned with ``apm_cloud_levels_predicate`` (LIKE %%v%%)."""
+    if not cloud or str(cloud).strip() == "" or str(cloud) == "All Clouds":
+        return []
+    c = str(cloud).strip()
+    variants = [c.lower()]
+    first = c.split(None, 1)[0] if c else ""
+    if first and first != c and len(first) >= 3:
+        variants.append(first.lower())
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def filter_products_by_cloud(products: list, cloud: str | None) -> list:
+    """
+    Filter normalized attrition products by cloud in Python (substring on APM_LVL_1/2/3).
+    If no row matches, returns ``products`` unchanged (same as SQL retry without cloud).
+    """
+    if not products:
+        return []
+    if not cloud or str(cloud).strip() == "" or str(cloud) == "All Clouds":
+        return list(products)
+
+    variants = _apm_cloud_match_variants(str(cloud).strip())
+    if not variants:
+        return list(products)
+
+    def row_matches(p: dict) -> bool:
+        for k in ("APM_LVL_1", "APM_LVL_2", "APM_LVL_3"):
+            cell = str(p.get(k, "") or "").lower()
+            if not cell:
+                continue
+            if any(v in cell for v in variants):
+                return True
+        return False
+
+    filtered = [p for p in products if row_matches(p)]
+    return filtered if filtered else list(products)
+
+
+def get_account_attrition_all(account_id: str) -> dict[str, Any]:
+    """
+    Single wide pull of attrition products for an account (latest CSS snapshot, no cloud predicate).
+
+    Returns normalized ``all`` rows plus ``raw`` Snowflake dicts. Callers filter by cloud with
+    ``filter_products_by_cloud`` to avoid a second round-trip.
+    """
+    conditions = [
+        "ACCOUNT_ID = %s",
+        "SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM "
+        "SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT)",
+    ]
+    params: list[Any] = [to_15_char_id(account_id)]
+    where_clause = " AND ".join(conditions)
+    sql = f"""
+        SELECT
+            APM_LVL_1, APM_LVL_2, APM_LVL_3,
+            ATTRITION_PROBA, ATTRITION_PROBA_CATEGORY,
+            ATTRITION_REASON, ATTRITION_PIPELINE
+        FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
+        WHERE {where_clause}
+        ORDER BY ATTRITION_PIPELINE DESC NULLS LAST
+        LIMIT 50
+    """
+    raw = run_query(sql, params)
+    all_products = [_normalize_attrition_row(r) for r in raw]
+    return {"all": all_products, "raw": raw}
+
+
 def get_account_attrition(account_id: str, cloud: str | None = "Commerce Cloud") -> list:
     """
     Product-level attrition on latest CSS snapshot.
@@ -964,24 +1088,7 @@ def get_account_attrition(account_id: str, cloud: str | None = "Commerce Cloud")
         log_debug("get_account_attrition: no rows with cloud filter; retrying without")
         rows = _run(None)
 
-    out = []
-    for r in rows:
-        out.append({
-            "product": _apm_product_display_name(r),
-            "APM_LVL_1": r.get("APM_LVL_1"),
-            "APM_LVL_2": r.get("APM_LVL_2"),
-            "APM_LVL_3": r.get("APM_LVL_3"),
-            "ATTRITION_PIPELINE": r.get("ATTRITION_PIPELINE"),
-            "ATTRITION_PROBA": r.get("ATTRITION_PROBA"),
-            "ATTRITION_PROBA_CATEGORY": r.get("ATTRITION_PROBA_CATEGORY"),
-            "ATTRITION_REASON": r.get("ATTRITION_REASON"),
-            "attrition": abs(float(r.get("ATTRITION_PIPELINE") or 0)),
-            "category": r.get("ATTRITION_PROBA_CATEGORY"),
-            "reason": r.get("ATTRITION_REASON") or "",
-            "factors_incr": r.get("FACTORS_INCR_RISK") or "",
-            "factors_decr": r.get("FACTORS_DECR_RISK") or "",
-        })
-    return out
+    return [_normalize_attrition_row(r) for r in rows]
 
 
 def format_enrichment_for_display(enrichment: dict) -> dict:
