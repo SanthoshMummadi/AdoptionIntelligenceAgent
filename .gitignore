@@ -5,6 +5,7 @@
 .env
 *.env
 .env.*
+!.env.example
 
 # Google OAuth / Credentials
 google_token.pkl
