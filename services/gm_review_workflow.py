@@ -4,6 +4,7 @@ GM Review orchestration — direct domain calls, no adapters.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
@@ -75,7 +76,7 @@ class GMReviewWorkflow:
     No adapter layer — calls domain functions directly.
     """
 
-    def __init__(self, call_llm_fn, max_concurrent: int = 8):
+    def __init__(self, call_llm_fn, max_concurrent: int = 5):
         self.call_llm_fn = call_llm_fn
         self.max_concurrent = max_concurrent
 
@@ -101,7 +102,7 @@ class GMReviewWorkflow:
         run_id = str(uuid.uuid4())
 
         _resolution_cache: dict[str, dict] = {}
-        _enrichment_cache: dict[str, dict] = {}
+        _enrichment_cache: dict[tuple, dict] = {}
 
         def _resolve_with_cache(name: str) -> dict | None:
             key = name.strip().lower()
@@ -113,12 +114,26 @@ class GMReviewWorkflow:
                 _resolution_cache[key] = result
             return result
 
-        def _enrich_with_cache(account_id_15: str, opty_id=None, cloud=cloud) -> dict:
-            key = account_id_15.strip().lower()
+        def _enrich_with_cache(
+            account_id_15: str,
+            opty_id=None,
+            cloud=cloud,
+            renewal_prefetch=None,
+        ) -> dict:
+            key = (
+                account_id_15.strip().lower(),
+                (opty_id or "") or "",
+                json.dumps(renewal_prefetch or {}, sort_keys=True, default=str),
+            )
             if key in _enrichment_cache:
                 log_debug(f"Enrichment cache hit for account_id: {account_id_15}")
                 return _enrichment_cache[key]
-            result = enrich_account(account_id_15, opty_id=opty_id, cloud=cloud)
+            result = enrich_account(
+                account_id_15,
+                opty_id=opty_id,
+                cloud=cloud,
+                renewal_prefetch=renewal_prefetch,
+            )
             if result:
                 _enrichment_cache[key] = result
             return result
@@ -136,10 +151,10 @@ class GMReviewWorkflow:
                 ): inp
                 for inp in account_inputs
             }
-            for future in as_completed(futures, timeout=120):
+            for future in as_completed(futures, timeout=300):
                 inp = futures[future]
                 try:
-                    result = future.result(timeout=90)
+                    result = future.result(timeout=280)
                     if result:
                         reviews.append(result)
                         log_debug(f"✓ {result.get('account_name', inp)}")
@@ -186,6 +201,7 @@ class GMReviewWorkflow:
             filter_products_by_cloud,
             format_enrichment_for_display,
             get_account_attrition_all,
+            get_open_renewal_from_snowflake,
             to_15_char_id,
         )
         from domain.content.canvas_builder import build_adoption_pov
@@ -199,12 +215,32 @@ class GMReviewWorkflow:
         )
 
         t0 = time.time()
-        t_resolve_start = t0
         raw_in = (account_input or "").strip()
+
+        # Snowflake-first: open renewal row (excludes Closed/Dead; latest snapshot; top ACV).
+        t_resolve_start = time.time()
+        snow_opp = get_open_renewal_from_snowflake(raw_in, cloud=cloud)
 
         opp: dict = {}
         needs_renewal_lookup = False
-        if _OPP_ID_RE.match(raw_in):
+        opty_id_from_snow = ""
+        account_id = ""
+        account_name = ""
+        renewal_prefetch_for_enrich: dict | None = None
+
+        if snow_opp:
+            account_id = str(snow_opp.get("account_id") or "")
+            account_name = " ".join(str(snow_opp.get("account_name") or "").split())
+            opty_id_from_snow = str(snow_opp.get("opty_id") or "")
+            if str(snow_opp.get("opty_id") or "").strip():
+                renewal_prefetch_for_enrich = {
+                    "account_name": account_name,
+                    "target_cloud": snow_opp.get("target_cloud") or "",
+                    "renewal_aov": float(snow_opp.get("renewal_aov") or 0),
+                    "renewal_atr": abs(float(snow_opp.get("renewal_atr") or 0)),
+                    "csg_geo": snow_opp.get("csg_geo") or "",
+                }
+        elif _OPP_ID_RE.match(raw_in):
             rec = _fetch_opportunity_record(raw_in)
             if not rec:
                 return None
@@ -233,6 +269,11 @@ class GMReviewWorkflow:
                 account_id = str(acct["id"])
                 account_name = " ".join(str(acct["name"]).split())
                 needs_renewal_lookup = True
+                ro = str(acct.get("opty_id") or "").strip()
+                if ro:
+                    opty_id_from_snow = ro
+                if acct.get("renewal_prefetch"):
+                    renewal_prefetch_for_enrich = acct["renewal_prefetch"]
 
         if not account_id:
             return None
@@ -241,49 +282,76 @@ class GMReviewWorkflow:
         t_resolve = time.time() - t_resolve_start
         log_debug(f"  [timing] resolve: {t_resolve:.2f}s")
 
+        if opty_id_from_snow and not (opp or {}).get("Id"):
+            rec = _fetch_opportunity_record(opty_id_from_snow)
+            if rec:
+                opp = rec
+
         red: dict = {}
         team: dict | list = {}
 
         t_sf_start = time.time()
         t_sf = 0.0
         if needs_renewal_lookup:
-            # Case 1: account resolved by name — parallel SF before Snowflake
-            with ThreadPoolExecutor(max_workers=3) as sf_ex:
-                fut_opps = sf_ex.submit(get_renewal_opportunities, account_id, cloud)
-                fut_red = sf_ex.submit(get_red_account, account_id)
-                fut_team = sf_ex.submit(get_account_team, account_id)
+            if opty_id_from_snow:
+                # Open renewal opty already chosen in Snowflake — skip SF opp listing
+                with ThreadPoolExecutor(max_workers=2) as sf_ex:
+                    fut_red = sf_ex.submit(get_red_account, account_id)
+                    fut_team = sf_ex.submit(get_account_team, account_id)
+                    try:
+                        red = fut_red.result(timeout=15)
+                    except Exception as e:
+                        log_debug(f"get_red_account error: {str(e)[:60]}")
+                        red = {}
+                    try:
+                        team = fut_team.result(timeout=15)
+                    except Exception as e:
+                        log_debug(f"get_account_team error: {str(e)[:60]}")
+                        team = []
+                if not (opp or {}).get("Id"):
+                    opp = {}
+                t_sf = time.time() - t_sf_start
+                log_debug(f"  [timing] SF parallel: {t_sf:.2f}s")
+            else:
+                # Case 1: account resolved by name — parallel SF before Snowflake
+                with ThreadPoolExecutor(max_workers=3) as sf_ex:
+                    fut_opps = sf_ex.submit(get_renewal_opportunities, account_id, cloud)
+                    fut_red = sf_ex.submit(get_red_account, account_id)
+                    fut_team = sf_ex.submit(get_account_team, account_id)
 
-                try:
-                    opps = fut_opps.result(timeout=15)
-                except Exception as e:
-                    log_debug(f"get_renewal_opportunities error: {str(e)[:60]}")
+                    try:
+                        opps = fut_opps.result(timeout=15)
+                    except Exception as e:
+                        log_debug(f"get_renewal_opportunities error: {str(e)[:60]}")
+                        opps = []
+
+                    try:
+                        red = fut_red.result(timeout=15)
+                    except Exception as e:
+                        log_debug(f"get_red_account error: {str(e)[:60]}")
+                        red = {}
+
+                    try:
+                        team = fut_team.result(timeout=15)
+                    except Exception as e:
+                        log_debug(f"get_account_team error: {str(e)[:60]}")
+                        team = []
+
+                if not opps:
+                    opps = get_renewal_opportunities_any_cloud(account_id)
+                if not opps:
                     opps = []
-
-                try:
-                    red = fut_red.result(timeout=15)
-                except Exception as e:
-                    log_debug(f"get_red_account error: {str(e)[:60]}")
-                    red = {}
-
-                try:
-                    team = fut_team.result(timeout=15)
-                except Exception as e:
-                    log_debug(f"get_account_team error: {str(e)[:60]}")
-                    team = []
-
-            if not opps:
-                opps = get_renewal_opportunities_any_cloud(account_id)
-            if not opps:
-                opps = []
-            opp = opps[0] if opps else {}
-            t_sf = time.time() - t_sf_start
-            log_debug(f"  [timing] SF parallel: {t_sf:.2f}s")
+                opp = opps[0] if opps else {}
+                t_sf = time.time() - t_sf_start
+                log_debug(f"  [timing] SF parallel: {t_sf:.2f}s")
         else:
             log_debug(
                 "  [timing] SF parallel: 0.00s (overlapped with Snowflake pool)"
             )
 
         opty_id = str(opp.get("Id", "") or "") if opp else ""
+        if not opty_id and opty_id_from_snow:
+            opty_id = opty_id_from_snow
 
         _enrich_fn = enrich_account_fn or enrich_account
 
@@ -292,7 +360,11 @@ class GMReviewWorkflow:
         if needs_renewal_lookup:
             with ThreadPoolExecutor(max_workers=2) as ex:
                 fut_enrich = ex.submit(
-                    _enrich_fn, account_id_15, opty_id or None, cloud
+                    _enrich_fn,
+                    account_id_15,
+                    opty_id or None,
+                    cloud,
+                    renewal_prefetch_for_enrich,
                 )
                 fut_attrition = ex.submit(get_account_attrition_all, account_id_15)
 
@@ -319,7 +391,11 @@ class GMReviewWorkflow:
             # Case 2: opp already known — enrich + attrition + red + team in one pool
             with ThreadPoolExecutor(max_workers=4) as ex:
                 fut_enrich = ex.submit(
-                    _enrich_fn, account_id_15, opty_id or None, cloud
+                    _enrich_fn,
+                    account_id_15,
+                    opty_id or None,
+                    cloud,
+                    renewal_prefetch_for_enrich,
                 )
                 fut_attrition = ex.submit(get_account_attrition_all, account_id_15)
                 fut_red = ex.submit(get_red_account, account_id)

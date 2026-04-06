@@ -141,13 +141,13 @@ def reset_snowflake_pool() -> None:
 
 
 def get_snowflake_connection() -> Any:
-    """Borrow a connection from the pool (blocks up to 30s if all are in use)."""
+    """Borrow a connection from the pool (blocks up to 60s if all are in use)."""
     _init_pool()
     try:
-        return _pool.get(timeout=30)
+        return _pool.get(timeout=60)
     except Empty as e:
         raise RuntimeError(
-            "Snowflake pool exhausted: no connection available within 30s"
+            "Snowflake pool exhausted: no connection available within 60s"
         ) from e
 
 
@@ -328,15 +328,34 @@ def to_15_char_id(account_id: str) -> str:
 
 def apm_cloud_levels_predicate(cloud: str) -> str:
     """
-    SQL ( ... ) over APM_LVL_1/2/3. Uses the full cloud label plus its first token
-    (e.g. 'Commerce Cloud' -> also 'Commerce') so CSS rows match when levels omit 'Cloud'.
+    SQL predicate over APM_LVL_1/2/3 for CSS attrition.
+
+    FSC: CIDM uses ``DRVD_APM_LVL_2 = 'Financial Services Cloud'`` under Industries; CSS
+    uses ``APM_LVL_3`` like ``Financial Services Cloud - Sales`` / ``- Service``.
+    Prefix match on ``Financial Services Cloud`` covers those; also match Industries at L2.
+    Other clouds: full label plus first token (e.g. ``Commerce Cloud`` → ``Commerce``).
     """
     if not cloud or str(cloud).strip() == "" or str(cloud) == "All Clouds":
         return ""
-    c = str(cloud).strip().replace("'", "''").replace("%", "%%")
-    variants: list[str] = [c]
-    first = c.split(None, 1)[0] if c else ""
-    if first and first != c and len(first) >= 3:
+
+    c = str(cloud).strip()
+    c_low = c.lower()
+
+    if "financial services" in c_low or c.upper() == "FSC":
+        # Double %% — predicate is spliced into queries executed with pyformat (%s).
+        return (
+            "("
+            "APM_LVL_3 LIKE '%%Financial Services Cloud%%' "
+            "OR APM_LVL_2 LIKE '%%Financial Services%%' "
+            "OR APM_LVL_1 LIKE '%%Financial Services%%' "
+            "OR APM_LVL_2 LIKE '%%Industries%%'"
+            ")"
+        )
+
+    c_safe = c.replace("'", "''").replace("%", "%%")
+    variants: list[str] = [c_safe]
+    first = c_safe.split(None, 1)[0] if c_safe else ""
+    if first and first != c_safe and len(first) >= 3:
         variants.append(first)
     seen: set[str] = set()
     uniq: list[str] = []
@@ -386,15 +405,28 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
         ``raw_rows`` are CIDM usage rows (for ``build_adoption_pov``).
     """
     CLOUD_L1_MAP = {
+        # Commerce
         "Commerce Cloud": "Commerce",
         "B2C Commerce": "Commerce",
         "B2B Commerce": "Commerce",
+        # FSC — under Industries in CIDM; ``DRVD_APM_LVL_2`` is ``Financial Services Cloud``
+        "Financial Services Cloud": "Financial Services Cloud",
+        "FSC": "Financial Services Cloud",
+        # Marketing
         "Marketing Cloud": "Marketing",
+        # Sales
         "Sales Cloud": "Sales",
+        # Service
         "Service Cloud": "Service",
+        # Data
         "Data Cloud": "AI and Data",
+        # Analytics
         "Tableau": "Analytics",
+        # Integration
         "MuleSoft": "Integration",
+        # Industries (parent bucket for FSC, etc.)
+        "Industries": "Industries",
+        "Health Cloud": "Health Cloud",
     }
 
     def _build_cloud_filter(cloud_val: str | None) -> str:
@@ -606,7 +638,12 @@ def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
     return "N/A"
 
 
-def enrich_account(account_id, opty_id=None, cloud=None):
+def enrich_account(
+    account_id,
+    opty_id=None,
+    cloud=None,
+    renewal_prefetch: Optional[dict] = None,
+):
     """
     Full enrichment with parallel I/O.
 
@@ -614,6 +651,9 @@ def enrich_account(account_id, opty_id=None, cloud=None):
     when ``opty_id`` is set). ``max_workers=3`` caps concurrent tasks — with
     ``opty_id``, four futures are queued so AOV and ARI may overlap health/usage but
     only three run at once.
+
+    If ``renewal_prefetch`` is set (same shape as ``get_renewal_aov``), skips the
+    Snowflake renewal-view lookup for AOV/ATR/geo and uses the preloaded row.
 
     Phase 2: ARI fallback (account-level) only if opp-level ARI is Unknown.
 
@@ -640,10 +680,15 @@ def enrich_account(account_id, opty_id=None, cloud=None):
         "usage_raw_rows": [],
     }
 
+    if renewal_prefetch:
+        result["renewal_aov"] = dict(renewal_prefetch)
+
     with ThreadPoolExecutor(max_workers=3) as ex:
         fut_health = ex.submit(get_customer_health, account_id_15)
         fut_usage = ex.submit(get_usage_unified, account_id_15, cloud)
-        fut_aov = ex.submit(get_renewal_aov, opty_id) if opty_id else None
+        fut_aov = None
+        if not renewal_prefetch:
+            fut_aov = ex.submit(get_renewal_aov, opty_id) if opty_id else None
         fut_ari = ex.submit(get_ari_score, opty_id) if opty_id else None
 
         try:
@@ -681,6 +726,10 @@ def enrich_account(account_id, opty_id=None, cloud=None):
                         result["usage"]["cloud_aov"] = fmt_amount(
                             renewal_data.get("renewal_aov", 0)
                         )
+            elif renewal_prefetch and result["usage"].get("cloud_aov") == "Unknown":
+                result["usage"]["cloud_aov"] = fmt_amount(
+                    renewal_prefetch.get("renewal_aov", 0)
+                )
         except Exception as e:
             log_debug(f"Renewal AOV error: {str(e)[:60]}")
 
@@ -945,6 +994,84 @@ def get_renewal_aov(opty_id):
     return {}
 
 
+def get_open_renewal_from_snowflake(
+    search: str,
+    cloud: str = "Commerce Cloud",
+) -> Optional[dict]:
+    """
+    Snowflake-first: best open renewal row from ``WV_CI_RENEWAL_OPTY_VW`` (excludes
+    Closed/Dead stages; latest ``AS_OF_DATE``; highest prior ACV).
+
+    Returns keys: ``opty_id`` (15-char), ``account_id``, ``account_name``,
+    ``renewal_aov``, ``renewal_atr``, ``csg_geo``, ``target_cloud``.
+    """
+    is_fsc = (
+        "financial services" in str(cloud).lower()
+        or str(cloud).strip().upper() == "FSC"
+    )
+
+    if is_fsc:
+        cloud_filter = (
+            "(TARGET_CLOUD LIKE '%%Core%%' "
+            "OR TARGET_CLOUD LIKE '%%Industries%%' "
+            "OR TARGET_CLOUD LIKE '%%Salesforce Industry%%' "
+            "OR RENEWAL_OPTY_NM LIKE '%%Financial Services%%' "
+            "OR RENEWAL_OPTY_NM LIKE '%%FSC%%')"
+        )
+    else:
+        cloud_safe = str(cloud).strip().replace("'", "''").replace("%", "%%")
+        cloud_filter = (
+            f"(TARGET_CLOUD LIKE '%%{cloud_safe}%%' "
+            f"OR RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%')"
+        )
+
+    search_clean = str(search).strip()
+    search_safe = search_clean.replace("'", "''").replace("%", "%%")
+    opty_bind = to_15_char_id(search_clean)
+
+    sql = f"""
+        SELECT
+            RENEWAL_OPTY_ID,
+            ACCOUNT_18_ID                            AS ACCOUNT_ID,
+            ACCOUNT_NM                               AS ACCOUNT_NAME,
+            RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
+            RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR,
+            CSG_GEO,
+            TARGET_CLOUD
+        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
+        WHERE {cloud_filter}
+        AND (
+            ACCOUNT_NM       LIKE '%%{search_safe}%%'
+            OR RENEWAL_OPTY_NM LIKE '%%{search_safe}%%'
+            OR RENEWAL_OPTY_ID = %s
+        )
+        AND RENEWAL_STG_NM NOT LIKE '%%Closed%%'
+        AND RENEWAL_STG_NM NOT LIKE '%%Dead%%'
+        AND AS_OF_DATE = (
+            SELECT MAX(AS_OF_DATE)
+            FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
+        )
+        ORDER BY RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV DESC NULLS LAST
+        LIMIT 1
+    """
+    try:
+        rows = run_query(sql, [opty_bind])
+        if rows:
+            r = rows[0]
+            return {
+                "opty_id": to_15_char_id(str(r.get("RENEWAL_OPTY_ID") or "")),
+                "account_id": str(r.get("ACCOUNT_ID") or ""),
+                "account_name": r.get("ACCOUNT_NAME") or "",
+                "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
+                "renewal_atr": abs(float(r.get("RENEWAL_ATR") or 0)),
+                "csg_geo": r.get("CSG_GEO") or "",
+                "target_cloud": r.get("TARGET_CLOUD") or "",
+            }
+    except Exception as e:
+        log_debug(f"get_open_renewal_from_snowflake error: {str(e)[:80]}")
+    return None
+
+
 def _apm_product_display_name(row: dict) -> str:
     """Prefer APM_LVL_3, then L2, then L1 (L3 is often NULL in CSS)."""
     for key in ("APM_LVL_3", "APM_LVL_2", "APM_LVL_1"):
@@ -1001,7 +1128,14 @@ def filter_products_by_cloud(products: list, cloud: str | None) -> list:
     if not cloud or str(cloud).strip() == "" or str(cloud) == "All Clouds":
         return list(products)
 
-    variants = _apm_cloud_match_variants(str(cloud).strip())
+    c_strip = str(cloud).strip()
+    c_low = c_strip.lower()
+    variants = _apm_cloud_match_variants(c_strip)
+    if (
+        c_low in ("financial services cloud", "fsc")
+        or "financial services" in c_low
+    ):
+        variants = list(dict.fromkeys(list(variants) + ["industries"]))
     if not variants:
         return list(products)
 
@@ -1241,12 +1375,12 @@ def resolve_account_from_snowflake(
 ) -> Optional[dict]:
     """
     Resolve account from Snowflake renewal view using parallel fuzzy LIKE patterns.
-    Returns: {"account_id", "account_name"} or None.
 
-    Intentionally avoids ``ORDER BY`` on renewal close-date columns (e.g. former
-    ``RENEWAL_CLSD_DT``): identifiers and sortability differ by view version; see
-    ``run_query('SELECT * FROM ...WV_CI_RENEWAL_OPTY_VW LIMIT 1')`` to list columns
-    if a deterministic sort is required later.
+    Returns ``account_id``, ``account_name``, plus open-renewal row fields when matched:
+    ``opty_id`` (15-char), ``renewal_aov``, ``renewal_atr``, ``csg_geo``, ``target_cloud``.
+
+    Each pattern uses the latest ``AS_OF_DATE`` snapshot, excludes closed/dead stages,
+    and orders by ``RENEWAL_AMT_CONV`` for deterministic tie-breaks on duplicate names.
     """
     if not name:
         return None
@@ -1265,26 +1399,63 @@ def resolve_account_from_snowflake(
 
     def try_pattern(pattern: str, priority: int) -> Optional[dict]:
         try:
-            cloud_safe = str(cloud).replace("'", "''").replace("%", "%%")
-            # No ORDER BY on close-date columns: names like RENEWAL_CLSD_DT vary by deployment
-            # and may be invalid or non-sortable. LIMIT 1 + outer priority (pattern index) is enough.
+            is_fsc = (
+                "financial services" in str(cloud).lower()
+                or str(cloud).strip().upper() == "FSC"
+            )
+            # LIKE literals use %% — Snowflake connector runs sql % params (pyformat).
+            if is_fsc:
+                cloud_filter = (
+                    "(ren.TARGET_CLOUD LIKE '%%Core%%' "
+                    "OR ren.TARGET_CLOUD LIKE '%%Industries%%' "
+                    "OR ren.TARGET_CLOUD LIKE '%%Salesforce Industry%%' "
+                    "OR ren.RENEWAL_OPTY_NM LIKE '%%Financial Services%%' "
+                    "OR ren.RENEWAL_OPTY_NM LIKE '%%FSC%%')"
+                )
+            else:
+                cloud_safe = (
+                    str(cloud)
+                    .strip()
+                    .replace("'", "''")
+                    .replace("%", "%%")
+                )
+                cloud_filter = (
+                    f"(ren.TARGET_CLOUD LIKE '%%{cloud_safe}%%' "
+                    f"OR ren.RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%')"
+                )
+
             sql = f"""
-                SELECT DISTINCT
-                    ren.ACCOUNT_18_ID AS ACCOUNT_ID,
-                    ren.ACCOUNT_NM    AS ACCOUNT_NAME
+                SELECT
+                    ren.ACCOUNT_18_ID                            AS ACCOUNT_ID,
+                    ren.ACCOUNT_NM                               AS ACCOUNT_NAME,
+                    ren.RENEWAL_OPTY_ID,
+                    ren.RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
+                    ren.RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR,
+                    ren.CSG_GEO,
+                    ren.TARGET_CLOUD
                 FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
                 WHERE ren.ACCOUNT_NM LIKE %s
-                AND (
-                    ren.TARGET_CLOUD LIKE '%%{cloud_safe}%%'
-                    OR ren.RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%'
+                AND {cloud_filter}
+                AND ren.RENEWAL_STG_NM NOT LIKE '%%Closed%%'
+                AND ren.RENEWAL_STG_NM NOT LIKE '%%Dead%%'
+                AND ren.AS_OF_DATE = (
+                    SELECT MAX(AS_OF_DATE)
+                    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
                 )
+                ORDER BY ren.RENEWAL_AMT_CONV DESC NULLS LAST
                 LIMIT 1
             """
             rows = run_query(sql, [pattern])
             if rows:
+                r = rows[0]
                 return {
-                    "account_id": rows[0].get("ACCOUNT_ID"),
-                    "account_name": rows[0].get("ACCOUNT_NAME"),
+                    "account_id": r.get("ACCOUNT_ID"),
+                    "account_name": r.get("ACCOUNT_NAME"),
+                    "opty_id": to_15_char_id(str(r.get("RENEWAL_OPTY_ID") or "")),
+                    "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
+                    "renewal_atr": abs(float(r.get("RENEWAL_ATR") or 0)),
+                    "csg_geo": r.get("CSG_GEO") or "",
+                    "target_cloud": r.get("TARGET_CLOUD") or "",
                     "priority": priority,
                 }
         except Exception as e:
@@ -1310,7 +1481,15 @@ def resolve_account_from_snowflake(
                 continue
 
     if best:
-        return {"account_id": best["account_id"], "account_name": best["account_name"]}
+        return {
+            "account_id": best["account_id"],
+            "account_name": best["account_name"],
+            "opty_id": best.get("opty_id") or "",
+            "renewal_aov": float(best.get("renewal_aov") or 0),
+            "renewal_atr": float(best.get("renewal_atr") or 0),
+            "csg_geo": best.get("csg_geo") or "",
+            "target_cloud": best.get("target_cloud") or "",
+        }
 
     return _resolve_account_from_snowflake_css(search_clean)
 
@@ -1541,6 +1720,9 @@ APM_L1_DISPLAY_MAP: dict[str, str] = {
     "AI and Data": "Data Cloud",
     "Cross Cloud - CRM": "CRM",
     "Cross Cloud - Einstein": "Einstein",
+    "Industries": "Industries",
+    "Sales Cloud & Industries": "FSC Sales",
+    "Service Cloud & Industries": "FSC Service",
 }
 
 APM_L1_EXCLUDE = frozenset({"Other", ""})

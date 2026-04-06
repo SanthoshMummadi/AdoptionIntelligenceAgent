@@ -52,11 +52,16 @@ def _validate_required_env() -> None:
         "LLM_GATEWAY_API_KEY": "LLM Gateway API key",
     }
 
-    # Salesforce: either session token + instance, or username + password
-    sf_valid = (
-        (os.getenv("SALESFORCE_SESSION_ID") and os.getenv("SALESFORCE_INSTANCE_URL"))
-        or (os.getenv("SALESFORCE_USERNAME") and os.getenv("SALESFORCE_PASSWORD"))
+    # Salesforce: must match domain/salesforce/org62_client.get_sf_client()
+    sf_token = (
+        os.getenv("SF_ACCESS_TOKEN")
+        or os.getenv("SALESFORCE_ACCESS_TOKEN")
+        or os.getenv("SALESFORCE_SESSION_ID")
     )
+    sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
+    sf_user = os.getenv("SF_USERNAME") or os.getenv("SALESFORCE_USERNAME")
+    sf_pass = os.getenv("SF_PASSWORD") or os.getenv("SALESFORCE_PASSWORD")
+    sf_valid = (bool(sf_token) and bool(sf_instance)) or (bool(sf_user) and bool(sf_pass))
 
     missing: list[str] = []
     for key, description in required.items():
@@ -65,8 +70,11 @@ def _validate_required_env() -> None:
 
     if not sf_valid:
         missing.append(
-            "  - Salesforce auth: need either (SALESFORCE_SESSION_ID + SALESFORCE_INSTANCE_URL) "
-            "or (SALESFORCE_USERNAME + SALESFORCE_PASSWORD)"
+            "  - Salesforce auth: set session style "
+            "(SF_ACCESS_TOKEN or SALESFORCE_ACCESS_TOKEN or SALESFORCE_SESSION_ID) "
+            "+ (SF_INSTANCE_URL or SALESFORCE_INSTANCE_URL), "
+            "or username style (SF_USERNAME or SALESFORCE_USERNAME) "
+            "+ (SF_PASSWORD or SALESFORCE_PASSWORD)"
         )
 
     if missing:
@@ -433,7 +441,7 @@ def init_gm_workflow() -> GMReviewWorkflow:
     """Initialize GM Review workflow (domain calls + LLM gateway)."""
     return GMReviewWorkflow(
         call_llm_fn=call_llm_gateway_with_retry,
-        max_concurrent=8,
+        max_concurrent=5,
     )
 
 
@@ -449,10 +457,14 @@ def ping() -> str:
 
 def _health_salesforce_env_ok() -> tuple[bool, list[str]]:
     """True if token+instance or username+password are set (matches org62_client)."""
-    token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
+    token = (
+        os.getenv("SF_ACCESS_TOKEN")
+        or os.getenv("SALESFORCE_ACCESS_TOKEN")
+        or os.getenv("SALESFORCE_SESSION_ID")
+    )
     inst = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
-    user = os.getenv("SF_USERNAME")
-    password = os.getenv("SF_PASSWORD")
+    user = os.getenv("SF_USERNAME") or os.getenv("SALESFORCE_USERNAME")
+    password = os.getenv("SF_PASSWORD") or os.getenv("SALESFORCE_PASSWORD")
     if token and inst:
         return True, []
     if user and password:

@@ -9,10 +9,24 @@ import re
 
 CLOUD_KEYWORDS = [
     "B2C Commerce", "B2B Commerce", "Commerce Cloud",
+    "Financial Services Cloud",
     "Marketing Cloud", "Sales Cloud", "Service Cloud",
     "Data Cloud", "MuleSoft", "Tableau", "Agentforce",
     "Slack", "Order Management", "All Clouds",
 ]
+
+FSC_KEYWORDS = frozenset(
+    {
+        "fsc",
+        "financial services",
+        "financial services cloud",
+        "financial cloud",
+        "wealth management",
+        "insurance",
+        "banking cloud",
+        "lending",
+    }
+)
 
 REGION_MAP = {
     "emea": "EMEA", "amer": "AMER",
@@ -82,12 +96,15 @@ def parse_filters(text: str) -> dict:
     """
     t = text.lower().strip()
 
-    # Cloud
+    # Cloud — FSC / Financial Services before generic keyword scan
     cloud = "Commerce Cloud"
-    for kw in CLOUD_KEYWORDS:
-        if kw.lower() in t:
-            cloud = kw
-            break
+    if any(kw in t for kw in FSC_KEYWORDS):
+        cloud = "Financial Services Cloud"
+    else:
+        for kw in CLOUD_KEYWORDS:
+            if kw.lower() in t:
+                cloud = kw
+                break
 
     # Region
     region = next((v for k, v in REGION_MAP.items() if k in t), None)

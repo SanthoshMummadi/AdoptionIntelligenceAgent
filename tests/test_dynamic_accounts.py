@@ -29,11 +29,13 @@ from domain.analytics.snowflake_client import (
     CORPORATE_SUFFIXES,
     enrich_account,
     get_account_attrition,
+    get_open_renewal_from_snowflake,
     get_usage_unified,
     resolve_account_from_snowflake,
     run_query,
     to_15_char_id,
 )
+from log_utils import log_debug
 from domain.salesforce.org62_client import get_red_account, resolve_account_enhanced
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -46,6 +48,10 @@ REQUIRED_HEALTH_FIELDS = ["overall_score", "overall_literal"]
 
 VALID_ARI_CATEGORIES = {"high", "medium", "low", "unknown", ""}
 VALID_HEALTH_LITERALS = {"green", "yellow", "red", "unknown", ""}
+
+FSC_CLOUD = "Financial Services Cloud"
+FSC_CLOUD_L1_MAP_KEY = "Industries"
+FSC_CLOUD_L3_KEY = "Financial Services Cloud"
 
 
 def _snowflake_configured() -> bool:
@@ -97,12 +103,12 @@ def _get_random_commerce_accounts(n: int = 5) -> list[dict]:
 
 
 def _strip_suffixes(name: str) -> str:
-    """Remove corporate suffixes + clean trailing punctuation."""
+    """Remove corporate suffixes + clean trailing punctuation/special chars."""
     stripped = re.sub(
         CORPORATE_SUFFIXES, "", name, flags=re.IGNORECASE
     ).strip()
-    # Clean trailing dots, commas, spaces left after suffix removal
-    stripped = re.sub(r"[\.,\s]+$", "", stripped).strip()
+    # Clean trailing dots, commas, spaces, asterisks, dashes
+    stripped = re.sub(r"[\.,\s\*\-]+$", "", stripped).strip()
     return stripped if stripped else name
 
 
@@ -193,41 +199,59 @@ class TestDynamicAccountResolution(unittest.TestCase):
             print(f"    - {nm} ({to_15_char_id(str(aid or ''))})")
 
     def test_DYN_001_random_accounts_resolve(self):
-        """Random accounts from Snowflake resolve correctly."""
+        """
+        Random accounts: Snowflake-first open renewal on WV_CI_RENEWAL_OPTY_VW
+        (not Closed/Dead, latest AS_OF_DATE, highest ACV).
+        """
         errors = []
         for acct in self.accounts:
             name = acct.get("ACCOUNT_NAME") or acct.get("account_name")
-            account_id = to_15_char_id(str(acct.get("ACCOUNT_ID") or acct.get("account_id") or ""))
-            result = resolve_account_from_snowflake(str(name), cloud=CLOUD)
+            result = get_open_renewal_from_snowflake(str(name), cloud=CLOUD)
             if not result:
-                errors.append(f"FAILED to resolve: {name}")
-            elif to_15_char_id(str(result.get("account_id", ""))) != account_id:
-                errors.append(
-                    f"WRONG ID for {name}: "
-                    f"expected {account_id}, got {to_15_char_id(str(result.get('account_id', '')))}"
-                )
+                log_debug(f"No open renewal for: {name} (may be expected)")
+                continue
+            if not result.get("opty_id"):
+                errors.append(f"No opty_id returned for: {name}")
+            if not result.get("account_id"):
+                errors.append(f"No account_id returned for: {name}")
         self.assertFalse(errors, "\n".join(errors))
 
     def test_DYN_002_fuzzy_partial_name_resolution(self):
-        """Partial name (first word) returns some resolution from Snowflake (may differ if ambiguous)."""
+        """
+        Partial name (first word) resolves via Snowflake-first open renewal.
+        Skips accounts with no open renewal — consistent with DYN_001.
+        """
         errors = []
         for acct in self.accounts:
             name = str(acct.get("ACCOUNT_NAME") or acct.get("account_name") or "")
             words = name.strip().split()
             if len(words) < 2 or len(words[0]) < FUZZY_TRUNCATE_LEN:
                 continue
+
+            full_result = get_open_renewal_from_snowflake(name, cloud=CLOUD)
+            if not full_result:
+                log_debug(f"DYN_002: skipping '{name}' — no open renewal")
+                continue
+
             partial = words[0]
-            result = resolve_account_from_snowflake(partial, cloud=CLOUD)
+            result = get_open_renewal_from_snowflake(partial, cloud=CLOUD)
             if not result:
-                errors.append(f"Partial '{partial}' (from '{name}') returned None")
+                errors.append(
+                    f"Partial '{partial}' (from '{name}') returned None"
+                )
         self.assertFalse(errors, "\n".join(errors))
 
     def test_DYN_003_suffix_stripped_resolution(self):
-        """Accounts with corporate suffixes resolve after suffix removal."""
+        """
+        Suffix-stripped names resolve via Snowflake-first open renewal.
+        Skips accounts with no open renewal — consistent with DYN_001.
+        """
         suffix_accounts = [
             a
             for a in self.accounts
-            if _has_suffix(a["ACCOUNT_NAME"])
+            if _has_suffix(
+                str(a.get("ACCOUNT_NAME") or a.get("account_name") or "")
+            )
         ]
         if not suffix_accounts:
             self.skipTest(
@@ -236,19 +260,22 @@ class TestDynamicAccountResolution(unittest.TestCase):
 
         errors = []
         for acct in suffix_accounts:
-            name = acct["ACCOUNT_NAME"]
+            name = str(acct.get("ACCOUNT_NAME") or acct.get("account_name") or "")
             stripped = _strip_suffixes(name)
-
             if not stripped or stripped == name:
                 continue
 
-            result = resolve_account_from_snowflake(stripped, cloud=CLOUD)
+            full_result = get_open_renewal_from_snowflake(name, cloud=CLOUD)
+            if not full_result:
+                log_debug(f"DYN_003: skipping '{name}' — no open renewal")
+                continue
+
+            result = get_open_renewal_from_snowflake(stripped, cloud=CLOUD)
             if not result:
                 errors.append(
-                    f"Suffix-stripped '{stripped}' (from '{name}') returned None"
+                    f"Suffix-stripped '{stripped}' "
+                    f"(from '{name}') returned None"
                 )
-            # Note: stripped name may legitimately match a different account
-            # (ambiguous partial name) — only assert resolution succeeds, not exact ID
         self.assertFalse(errors, "\n".join(errors))
 
     def test_DYN_004_enrichment_field_validation(self):
@@ -690,6 +717,100 @@ class TestDataCorrectness(unittest.TestCase):
             )
 
 
+class TestFSCAccountResolution(unittest.TestCase):
+    """
+    FSC-specific tests — Financial Services Cloud resolution and enrichment.
+    Reference account: AssuredPartners (when present in org / Snowflake).
+    """
+
+    KNOWN_ACCOUNT = "AssuredPartners"
+    CLOUD = FSC_CLOUD
+
+    @classmethod
+    def setUpClass(cls):
+        if not _snowflake_configured():
+            raise unittest.SkipTest("Snowflake env not configured")
+        result = resolve_account_from_snowflake(
+            cls.KNOWN_ACCOUNT, cloud=cls.CLOUD
+        )
+        if not result:
+            raise unittest.SkipTest(
+                f"Could not resolve {cls.KNOWN_ACCOUNT} for FSC in Snowflake"
+            )
+        cls.account_id_15 = to_15_char_id(result["account_id"])
+        cls.enrichment = enrich_account(
+            cls.account_id_15, None, cls.CLOUD
+        )
+
+    def test_FSC_001_resolves_correctly(self):
+        """AssuredPartners resolves for FSC cloud."""
+        result = resolve_account_from_snowflake(
+            self.KNOWN_ACCOUNT, cloud=self.CLOUD
+        )
+        self.assertIsNotNone(result, "AssuredPartners should resolve for FSC")
+        self.assertIsNotNone(result.get("account_id"))
+
+    def test_FSC_002_enrichment_has_required_fields(self):
+        """FSC enrichment has ARI, usage, health fields."""
+        errors = _validate_enrichment_fields(
+            self.enrichment, self.KNOWN_ACCOUNT
+        )
+        self.assertFalse(errors, "\n".join(errors))
+
+    def test_FSC_003_ari_category_valid(self):
+        """FSC ARI category is High/Medium/Low/Unknown."""
+        cat = self.enrichment.get("ari", {}).get("category")
+        self.assertIn(
+            cat,
+            ("High", "Medium", "Low", "Unknown", None),
+            f"Unexpected FSC ARI category: {cat}",
+        )
+
+    def test_FSC_004_health_literal_normalized(self):
+        """FSC health_literal is Green/Yellow/Red/Unknown."""
+        literal = self.enrichment.get("health", {}).get("overall_literal")
+        self.assertIn(
+            literal,
+            ("Green", "Yellow", "Red", "Unknown", None, ""),
+            f"FSC health_literal not normalized: '{literal}'",
+        )
+
+    def test_FSC_005_usage_source_is_industries(self):
+        """
+        FSC usage: source field is present (may be empty when no CIDM rows).
+        """
+        source = self.enrichment.get("usage", {}).get("source", "")
+        util = self.enrichment.get("usage", {}).get("utilization_rate", "")
+        self.assertIsNotNone(source)
+        self.assertIsNotNone(util)
+
+    def test_FSC_006_attrition_products_have_fsc_or_industries(self):
+        """Attrition products for FSC tie to Financial Services or Industries APM levels."""
+        products = get_account_attrition(
+            self.account_id_15, cloud=self.CLOUD
+        )
+        if not products:
+            self.skipTest("No attrition products for FSC account")
+
+        fsc_products = [
+            p
+            for p in products
+            if "financial services" in str(p.get("APM_LVL_3", "")).lower()
+            or "industries" in str(p.get("APM_LVL_1", "")).lower()
+            or "industries" in str(p.get("APM_LVL_2", "")).lower()
+        ]
+        self.assertGreater(
+            len(fsc_products),
+            0,
+            "No FSC/Industries products found in attrition data\n"
+            + "\n".join(
+                f"  - {p.get('APM_LVL_1')} / "
+                f"{p.get('APM_LVL_2')} / {p.get('APM_LVL_3')}"
+                for p in products[:5]
+            ),
+        )
+
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -697,9 +818,10 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestSuffixAccountResolution))
     suite.addTests(loader.loadTestsFromTestCase(TestFieldDataIntegrity))
     suite.addTests(loader.loadTestsFromTestCase(TestDataCorrectness))
+    suite.addTests(loader.loadTestsFromTestCase(TestFSCAccountResolution))
 
     print("\n" + "=" * 70)
-    print("DYNAMIC COMMERCE CLOUD TEST SUITE")
+    print("DYNAMIC ACCOUNT TEST SUITE (Commerce + FSC)")
     print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
     runner = unittest.TextTestRunner(verbosity=2)

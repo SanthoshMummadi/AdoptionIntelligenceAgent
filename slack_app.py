@@ -18,11 +18,8 @@ from dotenv import load_dotenv
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 load_dotenv(os.path.join(_ROOT, ".env"))
-import server
-from server import _validate_required_env
+import server  # side effect: startup env validation (see server._should_run_startup_env_validation)
 from log_utils import log_error
-
-_validate_required_env()
 
 slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
 if not slack_bot_token:
@@ -1273,7 +1270,7 @@ def gm_review_canvas(ack, say, command, client):
 
             workflow = GMReviewWorkflow(
                 call_llm_fn=server.call_llm_gateway_with_retry,
-                max_concurrent=8,
+                max_concurrent=5,
             )
 
             today_hdr = date_type.today().strftime("%A, %B %d, %Y")

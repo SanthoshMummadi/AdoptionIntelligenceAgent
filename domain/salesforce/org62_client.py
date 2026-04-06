@@ -78,7 +78,11 @@ def get_sf_client():
     """Return authenticated Salesforce client (session token preferred, else username/password)."""
     global _sf_client
     if _sf_client is None:
-        sf_token = os.getenv("SF_ACCESS_TOKEN") or os.getenv("SALESFORCE_ACCESS_TOKEN")
+        sf_token = (
+            os.getenv("SF_ACCESS_TOKEN")
+            or os.getenv("SALESFORCE_ACCESS_TOKEN")
+            or os.getenv("SALESFORCE_SESSION_ID")
+        )
         sf_instance = os.getenv("SF_INSTANCE_URL") or os.getenv("SALESFORCE_INSTANCE_URL")
 
         if sf_token and sf_instance:
@@ -88,8 +92,8 @@ def get_sf_client():
             )
             log_debug("✓ Connected to Salesforce org62 (session token)")
         else:
-            sf_username = os.getenv("SF_USERNAME")
-            sf_password = os.getenv("SF_PASSWORD")
+            sf_username = os.getenv("SF_USERNAME") or os.getenv("SALESFORCE_USERNAME")
+            sf_password = os.getenv("SF_PASSWORD") or os.getenv("SALESFORCE_PASSWORD")
             sf_security_token = os.getenv("SF_SECURITY_TOKEN", "")
 
             if not sf_username or not sf_password:
@@ -97,8 +101,9 @@ def get_sf_client():
                     "Salesforce credentials not found in environment.\n\n"
                     "Set one of:\n"
                     "  • SF_ACCESS_TOKEN + SF_INSTANCE_URL\n"
-                    "  • SALESFORCE_ACCESS_TOKEN + SALESFORCE_INSTANCE_URL\n"
-                    "  • SF_USERNAME + SF_PASSWORD (+ optional SF_SECURITY_TOKEN)\n\n"
+                    "  • SALESFORCE_ACCESS_TOKEN / SALESFORCE_SESSION_ID + SALESFORCE_INSTANCE_URL\n"
+                    "  • SF_USERNAME + SF_PASSWORD (+ optional SF_SECURITY_TOKEN)\n"
+                    "  • SALESFORCE_USERNAME + SALESFORCE_PASSWORD\n\n"
                     f".env is loaded from: {_REPO_ROOT / '.env'}\n"
                     "Run commands from the project root or ensure those variables are exported."
                 )
@@ -228,7 +233,8 @@ def resolve_account_enhanced(name: str, cloud: str = "Commerce Cloud") -> Option
     Salesforce-first account resolution (SOSL/SOQL), then Snowflake fuzzy on renewal view
     (plus CSS fallback inside Snowflake client), then Salesforce Account row by Id.
 
-    Returns same shape as resolve_account: id, name, country, billing_country.
+    Returns ``resolve_account`` keys plus, when the Snowflake renewal path matched an
+    open row: ``opty_id`` (15-char) and ``renewal_prefetch`` (dict for ``enrich_account``).
     """
     result = resolve_account(name, cloud)
     if result:
@@ -250,12 +256,23 @@ def resolve_account_enhanced(name: str, cloud: str = "Commerce Cloud") -> Option
         records = sf_query(acc_soql, client=sf).get("records", [])
         if records:
             bc = records[0].get("BillingCountry") or ""
-            return {
+            out: dict = {
                 "id": records[0]["Id"],
                 "name": records[0]["Name"],
                 "country": bc,
                 "billing_country": bc,
             }
+            oid = str((snow or {}).get("opty_id") or "").strip()
+            if oid:
+                out["opty_id"] = oid
+                out["renewal_prefetch"] = {
+                    "account_name": out["name"],
+                    "target_cloud": (snow or {}).get("target_cloud") or "",
+                    "renewal_aov": float((snow or {}).get("renewal_aov") or 0),
+                    "renewal_atr": abs(float((snow or {}).get("renewal_atr") or 0)),
+                    "csg_geo": (snow or {}).get("csg_geo") or "",
+                }
+            return out
     except Exception as e:
         log_debug(f"resolve_account_enhanced Snowflake fallback: {str(e)[:100]}")
 
