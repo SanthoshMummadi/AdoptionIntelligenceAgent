@@ -24,6 +24,15 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_pool_size() -> int:
+    try:
+        return max(1, int(os.getenv("SNOWFLAKE_POOL_SIZE", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+POOL_SIZE = _env_pool_size()
+
 # Corporate suffix patterns for account-name stripping (fuzzy resolution)
 CORPORATE_SUFFIXES = (
     r"\b(Inc\.?|LLC\.?|Ltd\.?|Corp\.?|Holdings?\.?|Holding\.?|Group|GmbH|Co\.?|"
@@ -39,7 +48,6 @@ SUCCESS_PLAN_KEYWORDS = [
     "- standard",
 ]
 
-POOL_SIZE = 8
 _pool: Queue = Queue(maxsize=POOL_SIZE)
 _pool_initialized = False
 _pool_lock = threading.Lock()
@@ -356,8 +364,8 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
     Unified usage fetch: one query pass returns summary stats and raw rows.
 
     Returns:
-        ``{"summary": {...}, "raw_rows": [...]}`` — summary matches ``get_usage_summary`` shape;
-        raw rows match ``get_usage_raw_data`` (for ``build_adoption_pov``).
+        ``{"summary": {...}, "raw_rows": [...]}`` — summary has utilization / source / emoji;
+        ``raw_rows`` are CIDM usage rows (for ``build_adoption_pov``).
     """
     CLOUD_L1_MAP = {
         "Commerce Cloud": "Commerce",
@@ -496,25 +504,6 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
     }
 
     return {"summary": summary, "raw_rows": rows}
-
-
-def get_usage_summary(account_id: str, cloud: str | None = None) -> dict:
-    """
-    DEPRECATED: Prefer ``get_usage_unified()`` (one round-trip: summary + raw rows).
-
-    Returns only the summary dict for backward compatibility.
-    """
-    u = get_usage_unified(account_id, cloud)
-    return u.get("summary") or {}
-
-
-def get_usage_raw_data(account_id: str, cloud: str | None = None) -> list:
-    """
-    DEPRECATED: Prefer ``get_usage_unified()`` (one round-trip: summary + raw rows).
-
-    Raw usage rows from CIDM.WV_AV_USAGE_EXTRACT_VW for ``build_adoption_pov()``.
-    """
-    return get_usage_unified(account_id, cloud).get("raw_rows") or []
 
 
 def extract_usd(value) -> float:
@@ -723,14 +712,17 @@ def get_ari_score_by_account(account_id: str, cloud: str | None = "Commerce Clou
 
 
 def get_customer_health(account_id):
-    """Fetch customer health score - CORRECTED: Use MAX(SNAPSHOT_DT)"""
+    """Fetch customer health score — literals normalized to Green/Yellow/Red/Unknown."""
     sql = """
         SELECT CATEGORY, SUB_CATEGORY,
                OVERALL_SCORE, CATEGORY_SCORE,
                OVERALL_LITERAL_SCORE, CATEGORY_LITERAL_SCORE
         FROM SSE_DM_CSG_RPT_PRD.CSS.CI_CH_FACT_CUSTOMER_HEALTH_VW
         WHERE ACCOUNT_ID = %s
-        AND SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM SSE_DM_CSG_RPT_PRD.CSS.CI_CH_FACT_CUSTOMER_HEALTH_VW)
+        AND SNAPSHOT_DT = (
+            SELECT MAX(SNAPSHOT_DT)
+            FROM SSE_DM_CSG_RPT_PRD.CSS.CI_CH_FACT_CUSTOMER_HEALTH_VW
+        )
         ORDER BY CATEGORY
         LIMIT 20
     """
@@ -739,14 +731,58 @@ def get_customer_health(account_id):
     if not rows:
         return None
 
+    def _normalize_literal(val, score=None) -> str:
+        """
+        Normalize health literal to Green/Yellow/Red/Unknown.
+        CSS sometimes returns numeric string (e.g. '67') instead of label.
+        Falls back to score-based band if literal is empty.
+        """
+        if val is None or str(val).strip() == "":
+            if score is not None:
+                try:
+                    s = float(score)
+                    if s >= 70:
+                        return "Green"
+                    if s >= 40:
+                        return "Yellow"
+                    return "Red"
+                except (TypeError, ValueError):
+                    pass
+            return "Unknown"
+
+        try:
+            s = float(val)
+            if s >= 70:
+                return "Green"
+            if s >= 40:
+                return "Yellow"
+            return "Red"
+        except (TypeError, ValueError):
+            pass
+
+        label = str(val).strip().title()
+        if label in ("Green", "Yellow", "Red"):
+            return label
+        return "Unknown"
+
+    overall_score = rows[0].get("OVERALL_SCORE")
+    overall_literal_raw = rows[0].get("OVERALL_LITERAL_SCORE")
+    overall_literal = _normalize_literal(overall_literal_raw, overall_score)
+
     return {
-        "overall_score": rows[0].get("OVERALL_SCORE"),
-        "overall_literal": rows[0].get("OVERALL_LITERAL_SCORE", "Unknown"),
-        "categories": [{
-            "category": r.get("CATEGORY"),
-            "score": r.get("CATEGORY_SCORE"),
-            "literal": r.get("CATEGORY_LITERAL_SCORE"),
-        } for r in rows],
+        "overall_score": overall_score,
+        "overall_literal": overall_literal,
+        "categories": [
+            {
+                "category": r.get("CATEGORY"),
+                "score": r.get("CATEGORY_SCORE"),
+                "literal": _normalize_literal(
+                    r.get("CATEGORY_LITERAL_SCORE"),
+                    r.get("CATEGORY_SCORE"),
+                ),
+            }
+            for r in rows
+        ],
     }
 
 
@@ -941,19 +977,7 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
     if health_literal in (None, ""):
         health_literal = "Unknown"
 
-    # Normalize numeric health_literal → Green/Yellow/Red (e.g. "75" from Snowflake)
-    try:
-        score_val = float(health_literal)
-        if score_val >= 70:
-            health_literal = "Green"
-        elif score_val >= 40:
-            health_literal = "Yellow"
-        else:
-            health_literal = "Red"
-    except (TypeError, ValueError):
-        pass  # Already a string label like "Green", keep as-is
-
-    # Build health_display from health_score
+    # overall_literal already normalized in get_customer_health()
     if health_score:
         try:
             hs = float(health_score)
@@ -1026,12 +1050,16 @@ def _resolve_account_from_snowflake_css(account_name: str) -> Optional[dict]:
     if not account_name:
         return None
     try:
+        # Attrition product grain has no reliable account-name column; join renewal view
+        # (same pattern as slack_app at-risk query: atr.ACCOUNT_ID = ren.ACCT_ID).
         rows = run_query(
             """
-            SELECT DISTINCT ACCOUNT_ID, ACCOUNT_NAME
-            FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
-            WHERE UPPER(ACCOUNT_NAME) LIKE UPPER(%s)
-            AND SNAPSHOT_DT = (
+            SELECT ren.ACCOUNT_18_ID AS ACCOUNT_ID, ren.ACCOUNT_NM AS ACCOUNT_NAME
+            FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT atr
+            INNER JOIN SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
+                ON atr.ACCOUNT_ID = ren.ACCT_ID
+            WHERE UPPER(ren.ACCOUNT_NM) LIKE UPPER(%s)
+            AND atr.SNAPSHOT_DT = (
                 SELECT MAX(SNAPSHOT_DT)
                 FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT
             )
@@ -1042,7 +1070,7 @@ def _resolve_account_from_snowflake_css(account_name: str) -> Optional[dict]:
         if rows:
             return {
                 "account_id": rows[0].get("ACCOUNT_ID"),
-                "account_name": rows[0].get("ACCOUNT_NAME"),
+                "account_name": rows[0].get("ACCOUNT_NAME") or rows[0].get("ACCOUNT_NM"),
             }
     except Exception as e:
         log_debug(f"CSS Snowflake account resolve error: {str(e)[:80]}")
@@ -1055,6 +1083,11 @@ def resolve_account_from_snowflake(
     """
     Resolve account from Snowflake renewal view using parallel fuzzy LIKE patterns.
     Returns: {"account_id", "account_name"} or None.
+
+    Intentionally avoids ``ORDER BY`` on renewal close-date columns (e.g. former
+    ``RENEWAL_CLSD_DT``): identifiers and sortability differ by view version; see
+    ``run_query('SELECT * FROM ...WV_CI_RENEWAL_OPTY_VW LIMIT 1')`` to list columns
+    if a deterministic sort is required later.
     """
     if not name:
         return None
@@ -1074,15 +1107,18 @@ def resolve_account_from_snowflake(
     def try_pattern(pattern: str, priority: int) -> Optional[dict]:
         try:
             cloud_safe = str(cloud).replace("'", "''").replace("%", "%%")
+            # No ORDER BY on close-date columns: names like RENEWAL_CLSD_DT vary by deployment
+            # and may be invalid or non-sortable. LIMIT 1 + outer priority (pattern index) is enough.
             sql = f"""
                 SELECT DISTINCT
                     ren.ACCOUNT_18_ID AS ACCOUNT_ID,
-                    ren.ACCOUNT_NM AS ACCOUNT_NAME
+                    ren.ACCOUNT_NM    AS ACCOUNT_NAME
                 FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
                 WHERE ren.ACCOUNT_NM LIKE %s
-                AND (ren.TARGET_CLOUD LIKE '%%{cloud_safe}%%'
-                     OR ren.RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%')
-                ORDER BY ren.RENEWAL_CLSD_DT DESC NULLS LAST
+                AND (
+                    ren.TARGET_CLOUD LIKE '%%{cloud_safe}%%'
+                    OR ren.RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%'
+                )
                 LIMIT 1
             """
             rows = run_query(sql, [pattern])
@@ -1248,7 +1284,8 @@ class SnowflakeClient:
         self, account_id: str, cloud: str = "Commerce Cloud"
     ) -> Optional[dict[str, Any]]:
         try:
-            usage = get_usage_summary(to_15_char_id(account_id), cloud)
+            u = get_usage_unified(to_15_char_id(account_id), cloud)
+            usage = u.get("summary") or {}
             if usage:
                 return {
                     "utilization_rate": usage.get("utilization_rate", "N/A"),

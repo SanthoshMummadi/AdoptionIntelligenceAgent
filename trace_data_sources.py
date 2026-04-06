@@ -15,7 +15,7 @@ from domain.analytics.snowflake_client import (
     get_ari_score_by_account,
     get_customer_health,
     get_renewal_aov,
-    get_usage_summary,
+    get_usage_unified,
     to_15_char_id,
 )
 
@@ -181,7 +181,7 @@ print()
 
 print("STEP 9: Usage/Utilization (CIDM.WV_AV_USAGE_EXTRACT_VW)")
 print("-" * 70)
-usage = get_usage_summary(account_id_15, "Commerce Cloud")
+usage = get_usage_unified(account_id_15, "Commerce Cloud").get("summary") or {}
 if usage:
     print("✓ SOURCE: CIDM.WV_AV_USAGE_EXTRACT_VW")
     print(f"  Utilization: {usage.get('utilization_rate')}")

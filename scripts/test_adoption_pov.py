@@ -1,4 +1,4 @@
-from domain.analytics.snowflake_client import get_usage_raw_data, to_15_char_id
+from domain.analytics.snowflake_client import get_usage_unified, to_15_char_id
 from domain.content.canvas_builder import build_adoption_pov
 from domain.salesforce.org62_client import resolve_account
 
@@ -13,7 +13,7 @@ for name in ['Adidas AG', 'Oxford Industries']:
     print(f'ADOPTION POV: {name}')
     print(f'{"="*50}')
     
-    usage_raw = get_usage_raw_data(account_id_15, cloud='Commerce Cloud')
+    usage_raw = get_usage_unified(account_id_15, cloud='Commerce Cloud').get("raw_rows") or []
     print(f'Raw usage rows: {len(usage_raw)}')
     
     pov = build_adoption_pov(usage_raw, cloud='Commerce Cloud')

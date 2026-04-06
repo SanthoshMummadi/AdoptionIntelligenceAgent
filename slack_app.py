@@ -1422,7 +1422,7 @@ def at_risk_canvas(ack, say, command, client):
                     ren.RENEWAL_OPTY_ID_18,
                     ren.RENEWAL_AMT_CONV,
                     ren.RENEWAL_ATR_CONV,
-                    ren.RENEWAL_CLSD_DT,
+                    NULL AS RENEWAL_CLSD_DT,
                     ren.RENEWAL_STG_NM,
                     ren.ACCOUNT_18_ID
                 FROM CSS.ATTRITION_PREDICTION_ACCT_PRODUCT atr

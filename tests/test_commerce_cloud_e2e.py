@@ -259,10 +259,10 @@ def test_renewal_aov():
 
 @test("SF2-006: Usage / utilization from CIDM")
 def test_usage_gmv():
-    from domain.analytics.snowflake_client import get_usage_summary, to_15_char_id
+    from domain.analytics.snowflake_client import get_usage_unified, to_15_char_id
 
     acct_id_15 = to_15_char_id(TEST_ACCOUNTS["adidas"]["id"])
-    usage = get_usage_summary(acct_id_15, "Commerce Cloud")
+    usage = get_usage_unified(acct_id_15, "Commerce Cloud").get("summary") or {}
     assert usage, "No usage data"
     src = usage.get("source")
     assert src in ("GMV", "Commerce aggregate", "All products"), (
@@ -329,10 +329,10 @@ def test_full_enrichment():
 
 @test("SF2-011: Raw usage data for adoption POV")
 def test_usage_raw():
-    from domain.analytics.snowflake_client import get_usage_raw_data, to_15_char_id
+    from domain.analytics.snowflake_client import get_usage_unified, to_15_char_id
 
     acct_id_15 = to_15_char_id(TEST_ACCOUNTS["adidas"]["id"])
-    rows = get_usage_raw_data(acct_id_15, "Commerce Cloud")
+    rows = get_usage_unified(acct_id_15, "Commerce Cloud").get("raw_rows") or []
     assert len(rows) > 0, "No usage rows"
 
 

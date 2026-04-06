@@ -32,7 +32,7 @@ print()
 print('3. Testing domain imports...')
 try:
     from domain.salesforce.org62_client import resolve_account_enhanced
-    from domain.analytics.snowflake_client import enrich_account, get_usage_raw_data
+    from domain.analytics.snowflake_client import enrich_account, get_usage_unified
     from domain.content.canvas_builder import build_adoption_pov, build_gm_review_canvas_markdown
     from domain.intelligence.risk_engine import generate_risk_analysis
     from domain.integrations.gsheet_exporter import export_to_gsheet
