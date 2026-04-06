@@ -361,7 +361,11 @@ def fmt_amount(val) -> str:
 
 def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
     """
-    Unified usage fetch: one query pass returns summary stats and raw rows.
+    Unified usage fetch: summary stats and raw rows from CIDM.
+
+    Runs a lightweight ``SELECT 1 … LIMIT 1`` pre-check first. If the account has no
+    CIDM rows with PROVISIONED > 0, returns empty immediately instead of three
+    sequential fallbacks.
 
     Returns:
         ``{"summary": {...}, "raw_rows": [...]}`` — summary has utilization / source / emoji;
@@ -392,6 +396,27 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
         """
 
     cloud_filter = _build_cloud_filter(cloud)
+
+    # Fast pre-check: skip CURR_SNAP / MAX(SNAPSHOT) / GMV fallbacks when no CIDM usage rows
+    try:
+        check = run_query(
+            """
+            SELECT 1 AS EXISTS_FLAG
+            FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+            WHERE ACCOUNT_ID = %s
+            AND PROVISIONED > 0
+            LIMIT 1
+            """,
+            [account_id],
+        )
+        if not check:
+            log_debug(
+                f"get_usage_unified: no CIDM data for {account_id}, skipping fallbacks"
+            )
+            return {"summary": {}, "raw_rows": []}
+    except Exception as e:
+        log_debug(f"get_usage_unified pre-check error: {str(e)[:60]}")
+        # Continue with normal fallback chain if pre-check fails
 
     def _run(snap_filter: str, params: list) -> list:
         sql = f"""
@@ -557,7 +582,16 @@ def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
 
 def enrich_account(account_id, opty_id=None, cloud=None):
     """
-    Full enrichment: renewal AOV, CIDM usage (WV_AV_USAGE_EXTRACT_VW), ARI, health.
+    Full enrichment with parallel I/O.
+
+    Phase 1: independent queries run concurrently (health + usage + renewal AOV + opp ARI
+    when ``opty_id`` is set). ``max_workers=3`` caps concurrent tasks — with
+    ``opty_id``, four futures are queued so AOV and ARI may overlap health/usage but
+    only three run at once.
+
+    Phase 2: ARI fallback (account-level) only if opp-level ARI is Unknown.
+
+    Phase 3: ``cloud_aov`` from ``renewal_aov`` if still Unknown.
     """
     start = time.time()
     account_id_15 = to_15_char_id(account_id)
@@ -580,57 +614,66 @@ def enrich_account(account_id, opty_id=None, cloud=None):
         "usage_raw_rows": [],
     }
 
-    if opty_id:
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fut_health = ex.submit(get_customer_health, account_id_15)
+        fut_usage = ex.submit(get_usage_unified, account_id_15, cloud)
+        fut_aov = ex.submit(get_renewal_aov, opty_id) if opty_id else None
+        fut_ari = ex.submit(get_ari_score, opty_id) if opty_id else None
+
         try:
-            renewal_data = get_renewal_aov(opty_id)
-            if renewal_data:
-                result["renewal_aov"] = renewal_data
+            health_data = fut_health.result(timeout=30)
+            if health_data:
+                result["health"] = health_data
+        except Exception as e:
+            log_debug(f"Health fetch error: {str(e)[:60]}")
+
+        try:
+            usage_unified = fut_usage.result(timeout=30)
+            if usage_unified and usage_unified.get("summary"):
+                usage_data = usage_unified["summary"]
+                result["usage"] = {
+                    "utilization_rate": usage_data.get("utilization_rate", "N/A"),
+                    "util_emoji": usage_data.get("util_emoji", ":white_circle:"),
+                    "cloud_aov": usage_data.get("cloud_aov", "Unknown"),
+                    "gmv_util": usage_data.get("gmv_util"),
+                    "source": usage_data.get("source", ""),
+                }
+                result["usage_raw_rows"] = usage_unified.get("raw_rows", [])
+                log_debug(
+                    f"✓ Usage: {usage_data.get('utilization_rate')} "
+                    f"({usage_data.get('source')})"
+                )
+        except Exception as e:
+            log_debug(f"Usage fetch error: {str(e)[:60]}")
+
+        try:
+            if fut_aov:
+                renewal_data = fut_aov.result(timeout=15)
+                if renewal_data:
+                    result["renewal_aov"] = renewal_data
+                    if result["usage"].get("cloud_aov") == "Unknown":
+                        result["usage"]["cloud_aov"] = fmt_amount(
+                            renewal_data.get("renewal_aov", 0)
+                        )
         except Exception as e:
             log_debug(f"Renewal AOV error: {str(e)[:60]}")
 
-    # 4. Usage summary + raw data (unified fetch, CIDM.WV_AV_USAGE_EXTRACT_VW)
-    try:
-        usage_unified = get_usage_unified(account_id_15, cloud)
-        if usage_unified and usage_unified.get("summary"):
-            usage_data = usage_unified["summary"]
-            result["usage"] = {
-                "utilization_rate": usage_data.get("utilization_rate", "N/A"),
-                "util_emoji": usage_data.get("util_emoji", ":white_circle:"),
-                "cloud_aov": usage_data.get("cloud_aov", "Unknown"),
-                "gmv_util": usage_data.get("gmv_util"),
-                "source": usage_data.get("source", ""),
-            }
-            result["usage_raw_rows"] = usage_unified.get("raw_rows", [])
-            if (
-                result["usage"].get("cloud_aov") == "Unknown"
-                and result.get("renewal_aov")
-            ):
-                result["usage"]["cloud_aov"] = fmt_amount(
-                    result["renewal_aov"].get("renewal_aov", 0)
-                )
-            log_debug(
-                f"✓ Usage: {usage_data.get('utilization_rate')} "
-                f"({usage_data.get('source')})"
-            )
-        elif result.get("renewal_aov"):
-            result["usage"]["cloud_aov"] = fmt_amount(
-                result["renewal_aov"].get("renewal_aov", 0)
-            )
-    except Exception as e:
-        log_debug(f"Usage fetch error: {str(e)[:60]}")
+        try:
+            if fut_ari:
+                ari_data = fut_ari.result(timeout=15)
+                if ari_data:
+                    result["ari"] = {
+                        "probability": ari_data.get("ATTRITION_PROBA"),
+                        "category": ari_data.get(
+                            "ATTRITION_PROBA_CATEGORY", "Unknown"
+                        ),
+                        "reason": ari_data.get("ATTRITION_REASON", "N/A"),
+                    }
+        except Exception as e:
+            log_debug(f"ARI fetch error: {str(e)[:60]}")
 
-    try:
-        if opty_id:
-            ari_data = get_ari_score(opty_id)
-            if ari_data:
-                prob = ari_data.get("ATTRITION_PROBA")
-                result["ari"] = {
-                    "probability": prob,
-                    "category": ari_data.get("ATTRITION_PROBA_CATEGORY", "Unknown"),
-                    "reason": ari_data.get("ATTRITION_REASON", "N/A"),
-                }
-
-        if result["ari"]["category"] == "Unknown":
+    if result["ari"]["category"] == "Unknown":
+        try:
             all_products = get_account_attrition(account_id_15, cloud)
             if all_products:
                 ari_result = calculate_overall_ari(
@@ -645,17 +688,19 @@ def enrich_account(account_id, opty_id=None, cloud=None):
                 }
                 log_debug(
                     "ARI from account-level: "
-                    f"{ari_result['category']} via {ari_result.get('top_product')}"
+                    f"{ari_result['category']} via "
+                    f"{ari_result.get('top_product')}"
                 )
-    except Exception as e:
-        log_debug(f"ARI fetch error: {str(e)[:60]}")
+        except Exception as e:
+            log_debug(f"ARI account-level error: {str(e)[:60]}")
 
-    try:
-        health_data = get_customer_health(account_id_15)
-        if health_data:
-            result["health"] = health_data
-    except Exception as e:
-        log_debug(f"Health fetch error: {str(e)[:60]}")
+    if (
+        result["usage"].get("cloud_aov") == "Unknown"
+        and result.get("renewal_aov")
+    ):
+        result["usage"]["cloud_aov"] = fmt_amount(
+            result["renewal_aov"].get("renewal_aov", 0)
+        )
 
     log_debug(f"✓ enrich_account took {time.time() - start:.2f}s")
     return result
@@ -712,7 +757,13 @@ def get_ari_score_by_account(account_id: str, cloud: str | None = "Commerce Clou
 
 
 def get_customer_health(account_id):
-    """Fetch customer health score — literals normalized to Green/Yellow/Red/Unknown."""
+    """
+    Fetch customer health score.
+
+    ``CI_CH_FACT_CUSTOMER_HEALTH_VW`` has no ``CURR_SNAP_FLG``; latest snap is
+    ``MAX(SNAPSHOT_DT)`` scoped to this ``ACCOUNT_ID`` in the subquery (avoids a
+    full-table max). Literals are normalized to Green/Yellow/Red/Unknown below.
+    """
     sql = """
         SELECT CATEGORY, SUB_CATEGORY,
                OVERALL_SCORE, CATEGORY_SCORE,
@@ -722,11 +773,12 @@ def get_customer_health(account_id):
         AND SNAPSHOT_DT = (
             SELECT MAX(SNAPSHOT_DT)
             FROM SSE_DM_CSG_RPT_PRD.CSS.CI_CH_FACT_CUSTOMER_HEALTH_VW
+            WHERE ACCOUNT_ID = %s
         )
         ORDER BY CATEGORY
         LIMIT 20
     """
-    rows = run_query(sql, [account_id])
+    rows = run_query(sql, [account_id, account_id])
 
     if not rows:
         return None
