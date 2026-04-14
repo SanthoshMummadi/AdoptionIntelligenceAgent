@@ -84,30 +84,91 @@ def clean_html(text: str) -> str:
 def build_adoption_pov(usage_data: list, cloud: str = "Commerce Cloud") -> str:
     """
     Build Adoption POV from CIDM.WV_AV_USAGE_EXTRACT_VW data.
-    Only shows Commerce L1 — excludes Success Plans, Partner, Sandbox, On Demand.
 
-    Example output:
-        - B2C Commerce: 214.83M provisioned, 82% utilized (176.55M used)
-        - Order Management: 500 provisioned, 3% utilized (15 used)
+    Commerce: aggregate provisioned/used by L2.
+    FSC: count orgs and calculate average utilization.
     """
     if not usage_data:
         return "No adoption data available."
 
-    commerce_rows = [
+    cloud_l1_map: Dict[str, List[str]] = {
+        "Commerce Cloud": ["commerce"],
+        "Financial Services Cloud": ["industries", "cross cloud - industries"],
+    }
+    exclude_l2 = ["success plan", "partner", "sandbox"]
+    exclude_type = ["on demand"]
+    l1_filters = cloud_l1_map.get(cloud, ["commerce"])
+
+    filtered_rows = [
         u
         for u in usage_data
-        if str(u.get("DRVD_APM_LVL_1") or "").strip().lower() == "commerce"
-        and "success plan" not in str(u.get("DRVD_APM_LVL_2") or "").lower()
-        and "partner" not in str(u.get("DRVD_APM_LVL_2") or "").lower()
-        and "sandbox" not in str(u.get("DRVD_APM_LVL_2") or "").lower()
-        and "on demand" not in str(u.get("TYPE") or "").lower()
+        if str(u.get("DRVD_APM_LVL_1") or "").strip().lower() in l1_filters
+        and not any(x in str(u.get("DRVD_APM_LVL_2") or "").lower() for x in exclude_l2)
+        and not any(x in str(u.get("TYPE") or "").lower() for x in exclude_type)
     ]
 
-    if not commerce_rows:
-        return "No Commerce adoption data available."
+    if not filtered_rows:
+        return "No adoption data available."
+
+    # FSC branch: use only L2=Financial Services Cloud for utilization summary.
+    if cloud == "Financial Services Cloud":
+        fsc_rows = [
+            r
+            for r in filtered_rows
+            if str(r.get("DRVD_APM_LVL_2") or "").strip().lower()
+            == "financial services cloud"
+            and float(r.get("PROVISIONED") or 0) > 0
+        ]
+        if not fsc_rows:
+            return "No adoption data available."
+
+        org_count = len({r.get("ACCOUNT_ID") for r in fsc_rows if r.get("ACCOUNT_ID")})
+
+        product_agg: Dict[str, Dict[str, float]] = {}
+        for r in fsc_rows:
+            ptype = str(r.get("TYPE") or "Unknown").strip()
+            provisioned = float(r.get("PROVISIONED") or 0)
+            activated = float(r.get("ACTIVATED") or 0)
+            used = float(r.get("USED") or 0)
+            # LA first (activated/provisioned), LU fallback (used/provisioned).
+            active = activated if activated > 0 else used
+            if ptype not in product_agg:
+                product_agg[ptype] = {"provisioned": 0.0, "active": 0.0}
+            product_agg[ptype]["provisioned"] += provisioned
+            product_agg[ptype]["active"] += active
+
+        lines = [f"- Financial Services Cloud: {org_count} orgs"]
+        for ptype, vals in sorted(
+            product_agg.items(), key=lambda x: x[1]["provisioned"], reverse=True
+        ):
+            p = vals["provisioned"]
+            a = vals["active"]
+            util = f"{round(a / p * 100)}%" if p > 0 and a > 0 else "0%"
+            lines.append(
+                f"  - {ptype}: {p:,.0f} provisioned, {util} utilized ({a:,.0f} active)"
+            )
+        return "\n".join(lines)
+
+    # Non-Commerce fallback: summarize unique ACCOUNT_ID orgs + average utilization.
+    if cloud != "Commerce Cloud":
+        org_count = len(
+            {r.get("ACCOUNT_ID") for r in filtered_rows if r.get("ACCOUNT_ID")}
+        )
+        total_util = 0.0
+        count = 0
+        for r in filtered_rows:
+            provisioned = float(r.get("PROVISIONED") or 0)
+            activated = float(r.get("ACTIVATED") or 0)
+            used = float(r.get("USED") or 0)
+            active = activated if activated > 0 else used
+            if provisioned > 0 and active > 0:
+                total_util += (active / provisioned)
+                count += 1
+        avg_util = round((total_util / count) * 100) if count > 0 else 0
+        return f"- {cloud}: {org_count} orgs, {avg_util}% average utilization"
 
     l2_summary: Dict[str, Dict[str, float]] = {}
-    for u in commerce_rows:
+    for u in filtered_rows:
         l2 = str(u.get("DRVD_APM_LVL_2") or "").strip()
         if not l2:
             continue
@@ -149,7 +210,7 @@ def build_adoption_pov(usage_data: list, cloud: str = "Commerce Cloud") -> str:
             f"{pct:.0f}% utilized ({active_fmt} used)"
         )
 
-    return "\n".join(pov_lines) if pov_lines else "No Commerce adoption data available."
+    return "\n".join(pov_lines) if pov_lines else "No adoption data available."
 
 
 def get_canvas_url(canvas_id: str) -> str:

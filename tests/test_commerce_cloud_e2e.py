@@ -374,6 +374,7 @@ def test_default_cloud():
 
     f = parse_filters("Adidas AG")
     assert f["cloud"] == "Commerce Cloud"
+    assert f.get("cloud_explicit") is False
 
 
 @test("FP-002: Detect cloud from text")
@@ -382,6 +383,7 @@ def test_detect_cloud():
 
     f = parse_filters("B2C Commerce, Adidas AG")
     assert f["cloud"] == "B2C Commerce"
+    assert f.get("cloud_explicit") is True
 
 
 @test("FP-003: Detect ARI filter")
@@ -779,7 +781,9 @@ def test_gs_export():
         {
             "account_name": "TEST - Delete Me",
             "account_id": "001000000000000AAA",
+            "opportunity_id": "006000000000000AAA",
             "opp": {
+                "Id": "006000000000000AAA",
                 "Name": "Test Renewal",
                 "CloseDate": "2027-01-31",
                 "StageName": "01 Initiate",
@@ -807,6 +811,7 @@ def test_gs_export():
                 "renewal_aov": {
                     "renewal_aov": 1608311,
                     "renewal_atr_snow": 810000,
+                    "csg_territory": "AMER REG",
                     "csg_geo": "EMEA",
                 }
             },

@@ -32,7 +32,7 @@ _SCOPES = [
 # GM export column set (Snowflake = static renewal row; org62 opp = dynamic $ / notes).
 HEADERS_22 = [
     "Account",
-    "OU",
+    "CSG_TERRITORY",
     "Cloud AOV",
     "ATR",
     "Forecasted Attrition",
@@ -60,6 +60,23 @@ HEADERS_22 = [
 
 def _strip_slack_emoji(text: str) -> str:
     return re.sub(r":[a-z_]+:", "", str(text or "")).strip()
+
+
+def _sf_base_url() -> str:
+    """Salesforce instance URL (no trailing slash)."""
+    base = (
+        os.getenv("SF_INSTANCE_URL")
+        or os.getenv("SALESFORCE_INSTANCE_URL")
+        or ""
+    ).strip().rstrip("/")
+    return base if base else "https://org62.my.salesforce.com"
+
+
+def _sf_opportunity_url(opp_id: str) -> str:
+    oid = str(opp_id or "").strip()
+    if not oid:
+        return ""
+    return f"{_sf_base_url()}/{oid}"
 
 
 def _opp_owner_name(opp: dict) -> str:
@@ -126,9 +143,11 @@ def export_to_gsheet(
         Sheet URL, or "" on skip/failure.
     """
     from domain.analytics.snowflake_client import (
+        calculate_overall_ari,
         cloud_aov_label,
         fmt_amount,
         get_sf_products_display,
+        resolve_money,
     )
     from domain.salesforce.org62_client import get_account_team
 
@@ -207,36 +226,59 @@ def export_to_gsheet(
 
             ari_cat = display.get("ari_category", "Unknown")
             ari_prob = display.get("ari_probability", "N/A")
+            ari_reason = display.get("ari_reason", "N/A")
+
+            if (ari_cat == "Unknown" or ari_prob == "N/A") and all_prods:
+                try:
+                    ov = calculate_overall_ari(all_prods, min_atr_threshold=0)
+                    oc = str(ov.get("category") or "").strip()
+                    if oc and oc.lower() != "unknown":
+                        ari_cat = ov["category"]
+                        prob = ov.get("probability")
+                        if prob is not None:
+                            try:
+                                pf = float(prob)
+                                ari_prob = (
+                                    f"{pf * 100:.1f}%"
+                                    if pf <= 1.0
+                                    else f"{pf:.1f}%"
+                                )
+                            except (TypeError, ValueError):
+                                pass
+                        ar0 = ov.get("reason")
+                        if ar0:
+                            ari_reason = ar0
+                except Exception:
+                    pass
 
             renewal = enrichment.get("renewal_aov", {}) or {}
-            ou = (
-                renewal.get("csg_territory")
-                or renewal.get("csg_geo")
+            if not isinstance(renewal, dict):
+                renewal = {}
+            # CSG_TERRITORY only (e.g. AMER REG) — not CSG_GEO / area
+            csg_territory_cell = (
+                (renewal.get("csg_territory") or "").strip()
+                or (display.get("csg_territory") or "").strip()
                 or "Unknown"
             )
 
-            # AOV — Snowflake (prior ACV); ATR / forecast / swing — org62 first
-            renewal_aov = float(renewal.get("renewal_aov", 0) or 0)
-            cc_aov = fmt_amount(renewal_aov) if renewal_aov else "Unknown"
-
-            atr_org62 = abs(float(opp.get("Forecasted_Attrition__c") or 0))
-            atr_snow = float(
-                renewal.get("renewal_atr_snow", 0)
-                or renewal.get("renewal_atr", 0)
-                or 0
-            )
-            atr_val = atr_org62 or atr_snow
-            atr = fmt_amount(atr_val) if atr_val else "N/A"
+            # AOV / ATR / swing — same resolution as canvas (Snowflake + display + opp)
+            cc_aov = resolve_money(display, opp, "aov")
+            atr = resolve_money(display, opp, "atr")
 
             fcast_raw = float(opp.get("Forecasted_Attrition__c") or 0)
             fcast_cell = (
                 fmt_amount(abs(fcast_raw)) if fcast_raw else "N/A"
             )
+            if fcast_cell == "N/A":
+                fcast_cell = resolve_money(display, opp, "attrition")
 
-            swing_raw = float(opp.get("Swing__c") or 0)
-            swing_cell = fmt_amount(swing_raw) if swing_raw else "N/A"
+            swing_cell = resolve_money(display, opp, "swing")
 
             util_rate = display.get("utilization_rate", "N/A")
+            if util_rate in ("N/A", "Unknown", "", None):
+                util_rate = (enrichment.get("usage") or {}).get(
+                    "utilization_rate", "N/A"
+                )
 
             risk_reason = opp.get("License_At_Risk_Reason__c", "") or ""
             acv_reason = opp.get("ACV_Reason_Detail__c", "") or ""
@@ -264,14 +306,13 @@ def export_to_gsheet(
                 or "N/A"
             )
 
-            ari_reason = display.get("ari_reason", "N/A")
             attrition_pred = f"{ari_cat} ({ari_prob}) - {ari_reason}"
 
             health_score = enrichment.get("health", {}).get("overall_score")
             health_literal = enrichment.get("health", {}).get(
                 "overall_literal", "Unknown"
             )
-            if health_score:
+            if health_score is not None and str(health_score).strip() != "":
                 try:
                     css_score = f"{int(float(health_score))} ({health_literal})"
                 except (TypeError, ValueError):
@@ -314,14 +355,22 @@ def export_to_gsheet(
                 latest_update = red.get("Latest_Updates__c", "") or ""
             latest_commentary = specialist_notes or description or latest_update
 
-            sf_url = f"https://org62.my.salesforce.com/{account_id}"
+            opp_id_link = str(
+                review.get("opportunity_id")
+                or (opp or {}).get("Id")
+                or ""
+            ).strip()
             account_name_escaped = str(account_name).replace('"', '""')
-            acct_cell = f'=HYPERLINK("{sf_url}","{account_name_escaped}")'
+            if opp_id_link:
+                sf_url = _sf_opportunity_url(opp_id_link)
+                acct_cell = f'=HYPERLINK("{sf_url}","{account_name_escaped}")'
+            else:
+                acct_cell = account_name_escaped
 
             all_rows.append(
                 [
                     _safe_cell(acct_cell),
-                    _safe_cell(ou),
+                    _safe_cell(csg_territory_cell),
                     _safe_cell(cc_aov),
                     _safe_cell(atr),
                     _safe_cell(fcast_cell),

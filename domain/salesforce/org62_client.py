@@ -72,6 +72,52 @@ def get_opportunity_by_id(opp_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def infer_cloud_label_from_opportunity_name(name: str) -> Optional[str]:
+    """
+    Map renewal ``Opportunity.Name`` to the cloud string used by GM Review / Snowflake.
+    Used when ``/gm-review-canvas`` is invoked with only opp Ids (no explicit cloud token).
+    """
+    if not (name or "").strip():
+        return None
+    n = str(name).lower()
+    if re.search(r"\bfsc\b", n) or any(
+        phrase in n
+        for phrase in (
+            "financial services cloud",
+            "financial services",
+            "wealth management",
+            "insurance cloud",
+        )
+    ):
+        return "Financial Services Cloud"
+    if "b2c commerce" in n or "b2b commerce" in n or "commerce cloud" in n:
+        return "Commerce Cloud"
+    if "marketing cloud" in n:
+        return "Marketing Cloud"
+    if "mulesoft" in n:
+        return "MuleSoft"
+    if "tableau" in n:
+        return "Tableau"
+    if "data cloud" in n:
+        return "Data Cloud"
+    if "service cloud" in n:
+        return "Service Cloud"
+    if "sales cloud" in n:
+        return "Sales Cloud"
+    return None
+
+
+def infer_cloud_from_opportunity_id(opp_id: str) -> Optional[str]:
+    """Load Opportunity by Id and infer workflow ``cloud`` from ``Name``."""
+    oid = (opp_id or "").strip()
+    if not oid:
+        return None
+    rec = get_opportunity_by_id(oid)
+    if not rec:
+        return None
+    return infer_cloud_label_from_opportunity_name(rec.get("Name") or "")
+
+
 def _sf_max_concurrent() -> int:
     try:
         return max(1, int(os.getenv("SF_MAX_CONCURRENT", "10")))
@@ -319,6 +365,7 @@ def resolve_account_enhanced(name: str, cloud: str = "Commerce Cloud") -> Option
                     "renewal_aov": float((snow or {}).get("renewal_aov") or 0),
                     "renewal_atr_snow": abs(float(ra_snow or 0)),
                     "csg_territory": (snow or {}).get("csg_territory") or "",
+                    "csg_area": (snow or {}).get("csg_area") or "",
                     "csg_geo": (snow or {}).get("csg_geo") or "",
                 }
             return out
@@ -495,6 +542,43 @@ def get_account_team(account_id: str) -> dict:
     except Exception as e:
         log_debug(f"Error fetching account team: {str(e)[:100]}")
         return {}
+
+
+def get_account_hierarchy(account_id_18: str) -> list[str]:
+    """
+    Return account hierarchy ids from org62: parent + all descendants.
+    """
+    root = str(account_id_18 or "").strip()
+    if not root:
+        return []
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    queue: list[str] = [root]
+
+    while queue:
+        parent_id = queue.pop(0)
+        if not parent_id or parent_id in seen:
+            continue
+        seen.add(parent_id)
+        ordered.append(parent_id)
+        try:
+            q = f"""
+            SELECT Id, ParentId
+            FROM Account
+            WHERE ParentId = '{_escape(parent_id)}'
+            AND IsDeleted = false
+            """
+            records = sf_query(q).get("records", [])
+            for rec in records:
+                cid = str(rec.get("Id") or "").strip()
+                if cid and cid not in seen:
+                    queue.append(cid)
+        except Exception as e:
+            log_debug(f"get_account_hierarchy error: {str(e)[:100]}")
+            break
+
+    return ordered
 
 
 def expand_canvas_records_with_all_renewals(seed_records: list, cloud: str) -> list:

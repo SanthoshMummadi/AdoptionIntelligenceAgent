@@ -10,6 +10,7 @@ import re
 CLOUD_KEYWORDS = [
     "B2C Commerce", "B2B Commerce", "Commerce Cloud",
     "Financial Services Cloud",
+    "FSC",
     "Marketing Cloud", "Sales Cloud", "Service Cloud",
     "Data Cloud", "MuleSoft", "Tableau", "Agentforce",
     "Slack", "Order Management", "All Clouds",
@@ -98,12 +99,15 @@ def parse_filters(text: str) -> dict:
 
     # Cloud — FSC / Financial Services before generic keyword scan
     cloud = "Commerce Cloud"
+    cloud_explicit = False
     if any(kw in t for kw in FSC_KEYWORDS):
         cloud = "Financial Services Cloud"
+        cloud_explicit = True
     else:
         for kw in CLOUD_KEYWORDS:
             if kw.lower() in t:
                 cloud = kw
+                cloud_explicit = True
                 break
 
     # Region
@@ -213,10 +217,11 @@ def parse_filters(text: str) -> dict:
     )
 
     # Opp IDs
-    opp_ids = list(dict.fromkeys(re.findall(r"006[a-zA-Z0-9]{12,15}", text)))
+    opp_ids = list(dict.fromkeys(re.findall(r"006[a-zA-Z0-9]{12,18}", text)))
 
     return {
         "cloud":                 cloud,
+        "cloud_explicit":        cloud_explicit,
         "region":                region,
         "fy":                    fy,
         "quarter":               quarter,

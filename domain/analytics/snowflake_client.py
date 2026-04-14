@@ -61,6 +61,8 @@ _account_resolve_cache: dict[str, tuple[Any, float]] = {}
 _account_enrich_cache: dict[str, tuple[Any, float]] = {}
 _account_cache_lock = threading.Lock()
 
+_PREWARM_REFRESH_INTERVAL_S = _env_int("SNOWFLAKE_PREWARM_REFRESH_S", 86400)
+
 
 def _cache_get(cache: dict, key: str) -> Any:
     with _account_cache_lock:
@@ -76,6 +78,39 @@ def _cache_set(cache: dict, key: str, value: Any) -> None:
         cache[key] = (value, time.time())
 
 
+def _should_refresh_prewarm(cache_key: str) -> bool:
+    """True if prewarm cache is missing or older than ``SNOWFLAKE_PREWARM_REFRESH_S``."""
+    entry = _usage_snapshot_cache.get(f"{cache_key}_cached_at")
+    if not entry:
+        return True
+    try:
+        return (time.time() - float(entry)) > _PREWARM_REFRESH_INTERVAL_S
+    except (TypeError, ValueError):
+        return True
+
+
+def clear_stale_caches() -> None:
+    """Remove TTL-expired entries from process-level account caches."""
+    now = time.time()
+    removed = 0
+    with _account_cache_lock:
+        stale_r = [
+            k for k, (_, ts) in _account_resolve_cache.items()
+            if (now - ts) > _ACCOUNT_CACHE_TTL_S
+        ]
+        for k in stale_r:
+            del _account_resolve_cache[k]
+        removed += len(stale_r)
+        stale_e = [
+            k for k, (_, ts) in _account_enrich_cache.items()
+            if (now - ts) > _ACCOUNT_CACHE_TTL_S
+        ]
+        for k in stale_e:
+            del _account_enrich_cache[k]
+        removed += len(stale_e)
+    log_debug(f"clear_stale_caches: removed {removed} entries")
+
+
 def clear_usage_snapshot_cache() -> None:
     """Clear CIDM snapshot cache and failure backoff (call once per GM Review batch start)."""
     _usage_snapshot_cache.clear()
@@ -87,13 +122,64 @@ def prewarm_cidm_usage_snapshot_dt() -> None:
     Call after ``clear_usage_snapshot_cache()`` at batch start so parallel
     ``enrich_account`` calls hit cache instead of stampeding Snowflake.
     """
+    cache_key = "cidm_wv_av_usage_extract_vw_max_snapshot_dt"
+    cached_at_key = f"{cache_key}_cached_at"
+    if not _should_refresh_prewarm(cache_key):
+        log_debug("CIDM prewarm: cache still fresh, skipping")
+        return
+    prev_at = _usage_snapshot_cache.get(cached_at_key)
+    ignore_env = (
+        prev_at is not None
+        and (time.time() - float(prev_at)) > _PREWARM_REFRESH_INTERVAL_S
+    )
     try:
-        _get_latest_cidm_usage_snapshot_dt()
+        with _usage_snapshot_lock:
+            _usage_snapshot_cache.pop(cache_key, None)
+        _get_latest_cidm_usage_snapshot_dt(ignore_env_override=ignore_env)
+        with _usage_snapshot_lock:
+            _usage_snapshot_cache[cached_at_key] = time.time()
     except Exception as e:
-        log_debug(f"prewarm_cidm_usage_snapshot_dt: {_fmt_exc(e)[:100]}")
+        log_debug(f"prewarm_cidm: {_fmt_exc(e)[:100]}")
 
 
-def _get_latest_cidm_usage_snapshot_dt() -> Any:
+def prewarm_renewal_as_of_date() -> None:
+    """Cache MAX(AS_OF_DATE) for renewal view at batch start."""
+    key = "renewal_as_of_date"
+    cached_at_key = f"{key}_cached_at"
+    if not _should_refresh_prewarm(key):
+        log_debug("Renewal prewarm: cache still fresh, skipping")
+        return
+    prev_at = _usage_snapshot_cache.get(cached_at_key)
+    ignore_env = (
+        prev_at is not None
+        and (time.time() - float(prev_at)) > _PREWARM_REFRESH_INTERVAL_S
+    )
+    override = (os.getenv("SNOWFLAKE_RENEWAL_AS_OF_DATE") or "").strip()
+    if override and not ignore_env:
+        _usage_snapshot_cache[key] = override
+        with _usage_snapshot_lock:
+            _usage_snapshot_cache[cached_at_key] = time.time()
+        return
+    try:
+        with _usage_snapshot_lock:
+            _usage_snapshot_cache.pop(key, None)
+        rows = run_query(
+            "SELECT MAX(AS_OF_DATE) AS MAX_DATE "
+            "FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW",
+            [],
+            statement_timeout=120,
+        )
+        max_date = (rows[0] or {}).get("MAX_DATE") if rows else None
+        if max_date:
+            _usage_snapshot_cache[key] = max_date
+            log_debug(f"✓ Renewal AS_OF_DATE prewarmed: {max_date}")
+        with _usage_snapshot_lock:
+            _usage_snapshot_cache[cached_at_key] = time.time()
+    except Exception as e:
+        log_debug(f"prewarm_renewal_as_of_date: {str(e)[:80]}")
+
+
+def _get_latest_cidm_usage_snapshot_dt(ignore_env_override: bool = False) -> Any:
     """
     Get MAX(SNAPSHOT_DT) for CIDM usage view.
     Cached; serialized under ``_usage_snapshot_lock``. On repeated 57014 / failures,
@@ -108,7 +194,7 @@ def _get_latest_cidm_usage_snapshot_dt() -> Any:
         if cache_key in _usage_snapshot_cache:
             return _usage_snapshot_cache[cache_key]
 
-        if override:
+        if override and not ignore_env_override:
             _usage_snapshot_cache[cache_key] = override
             log_debug(
                 "CIDM snapshot from SNOWFLAKE_CIDM_SNAPSHOT_DT "
@@ -250,11 +336,12 @@ _pool_lock = threading.Lock()
 def _snowflake_conn_params() -> dict[str, Any]:
     user = os.getenv("SNOWFLAKE_USER")
     account = os.getenv("SNOWFLAKE_ACCOUNT")
-    warehouse = os.getenv("SNOWFLAKE_WAREHOUSE") or "COMPUTE_WH"
+    warehouse = os.getenv("SNOWFLAKE_WAREHOUSE") or "DEMO_WH"
     database = os.getenv("SNOWFLAKE_DATABASE") or "SSE_DM_CSG_RPT_PRD"
     schema = os.getenv("SNOWFLAKE_SCHEMA") or "RENEWALS"
-    role = os.getenv("SNOWFLAKE_ROLE")
+    role = os.getenv("SNOWFLAKE_ROLE") or None
     password = os.getenv("SNOWFLAKE_PASSWORD")
+    key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "")
 
     if not account or not user:
         raise Exception("Missing SNOWFLAKE_ACCOUNT or SNOWFLAKE_USER in .env")
@@ -270,9 +357,30 @@ def _snowflake_conn_params() -> dict[str, Any]:
         params["schema"] = schema
     if role:
         params["role"] = role
-    if password:
+    # Key-pair auth (service account)
+    if key_path and os.path.isfile(key_path):
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding,
+            NoEncryption,
+            PrivateFormat,
+            load_pem_private_key,
+        )
+        from cryptography.hazmat.backends import default_backend
+
+        passphrase = (os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or "").strip()
+        with open(key_path, "rb") as f:
+            private_key = load_pem_private_key(
+                f.read(),
+                password=passphrase.encode() if passphrase else None,
+                backend=default_backend(),
+            )
+        params["private_key"] = private_key.private_bytes(
+            Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
+        )
+    elif password:
         params["password"] = password
     else:
+        # Fallback — should not hit this with service account
         params["authenticator"] = os.getenv(
             "SNOWFLAKE_AUTHENTICATOR", "externalbrowser"
         )
@@ -490,11 +598,12 @@ def run_query(
             cursor.execute(sql, params or [])
             rows = cursor.fetchall()
             elapsed = time.time() - t_query_start
-            if elapsed > 10:
+            if elapsed > 5:
                 log_structured(
                     "snowflake_slow_query",
                     level="warning",
                     latency_s=round(elapsed, 2),
+                    row_count=len(rows),
                     sql_preview=str(sql)[:80],
                 )
             if not cursor.description:
@@ -747,26 +856,84 @@ def get_usage_unified(account_id: str | list[str], cloud: str | None = None) -> 
         # Multi-account: prefer sequential per-account CIDM (ACCOUNT_ID = %s). Heavy
         # ``IN (...)`` + ``GROUP BY`` often hits stricter warehouse statement caps (~30s)
         # even when the session requests a longer timeout.
-        use_hierarchy_aggregate = _env_int(
-            "SNOWFLAKE_USAGE_HIERARCHY_USE_AGGREGATE", 0
-        )
-        if not use_hierarchy_aggregate:
-            log_debug(
-                f"get_usage_unified hierarchy: per-account merge only "
-                f"({len(account_ids)} ids; set SNOWFLAKE_USAGE_HIERARCHY_USE_AGGREGATE=1 "
-                "for single GROUP BY)"
-            )
-            merged_rows: list = []
+        def _hierarchy_per_account_merge_with_batch_precheck(log_msg: str) -> dict:
+            log_debug(log_msg)
+            pinned_pc = (os.getenv("SNOWFLAKE_CIDM_SNAPSHOT_DT") or "").strip()
+            if not pinned_pc:
+                pinned_val = _usage_snapshot_cache.get(
+                    "cidm_wv_av_usage_extract_vw_max_snapshot_dt"
+                )
+                pinned_pc = str(pinned_val) if pinned_val else ""
+
+            placeholders = ", ".join(["%s"] * len(account_ids))
+            try:
+                if pinned_pc:
+                    existing_rows = run_query(
+                        f"""
+                        SELECT DISTINCT ACCOUNT_ID
+                        FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+                        WHERE ACCOUNT_ID IN ({placeholders})
+                        AND SNAPSHOT_DT = %s
+                        AND PROVISIONED > 0
+                        """,
+                        [*account_ids, pinned_pc],
+                        statement_timeout=_env_int(
+                            "SNOWFLAKE_USAGE_PRECHECK_TIMEOUT", 20
+                        ),
+                    )
+                else:
+                    existing_rows = run_query(
+                        f"""
+                        SELECT DISTINCT ACCOUNT_ID
+                        FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+                        WHERE ACCOUNT_ID IN ({placeholders})
+                        AND CURR_SNAP_FLG = 'Y'
+                        AND PROVISIONED > 0
+                        """,
+                        list(account_ids),
+                        statement_timeout=_env_int(
+                            "SNOWFLAKE_USAGE_PRECHECK_TIMEOUT", 20
+                        ),
+                    )
+                existing_ids = {r["ACCOUNT_ID"] for r in existing_rows}
+                log_debug(
+                    f"get_usage_unified hierarchy batch pre-check: "
+                    f"{len(existing_ids)}/{len(account_ids)} accounts have CIDM data"
+                )
+            except Exception as e:
+                log_debug(
+                    f"get_usage_unified hierarchy batch pre-check error: "
+                    f"{_fmt_exc(e)[:80]}"
+                )
+                existing_ids = set(account_ids)
+
+            merged_local: list = []
             for aid in account_ids:
+                if aid not in existing_ids:
+                    log_debug(
+                        f"get_usage_unified: no CIDM data for {aid}, "
+                        "skipping (batch pre-check)"
+                    )
+                    continue
                 try:
                     part = get_usage_unified(aid, cloud).get("raw_rows") or []
-                    merged_rows.extend(part)
+                    merged_local.extend(part)
                 except Exception as e:
                     log_debug(
                         f"get_usage_unified hierarchy per-account {aid}: "
                         f"{_fmt_exc(e)[:80]}"
                     )
-            return _hierarchy_summary_from_rows(merged_rows)
+            return _hierarchy_summary_from_rows(merged_local)
+
+        use_hierarchy_aggregate = _env_int(
+            "SNOWFLAKE_USAGE_HIERARCHY_USE_AGGREGATE", 0
+        )
+        if not use_hierarchy_aggregate:
+            return _hierarchy_per_account_merge_with_batch_precheck(
+                "get_usage_unified hierarchy: per-account merge only "
+                f"({len(account_ids)} ids; set SNOWFLAKE_USAGE_HIERARCHY_USE_AGGREGATE=1 "
+                "for single GROUP BY)"
+            )
 
         # Hierarchy aggregate (opt-in): CURR_SNAP / scoped MAX — same strategy as single-account.
         ph = ", ".join(["%s"] * len(account_ids))
@@ -874,20 +1041,10 @@ def get_usage_unified(account_id: str | list[str], cloud: str | None = None) -> 
                 log_debug(f"get_usage_unified hierarchy GMV error: {str(e)[:80]}")
                 merged_rows = []
         if not merged_rows:
-            log_debug(
+            return _hierarchy_per_account_merge_with_batch_precheck(
                 "get_usage_unified hierarchy: per-account CIDM merge "
-                f"({len(account_ids)} ids)"
+                f"(aggregate fallbacks exhausted, {len(account_ids)} ids)"
             )
-            merged_rows = []
-            for aid in account_ids:
-                try:
-                    part = get_usage_unified(aid, cloud).get("raw_rows") or []
-                    merged_rows.extend(part)
-                except Exception as e:
-                    log_debug(
-                        f"get_usage_unified hierarchy per-account {aid}: "
-                        f"{_fmt_exc(e)[:80]}"
-                    )
         return _hierarchy_summary_from_rows(merged_rows)
 
     account_id = to_15_char_id(str(account_id))
@@ -1078,42 +1235,19 @@ def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
     disp = snowflake_display or {}
     ren = _renewal_dict(disp)
 
-    if field == "atr":
+    if field in ("atr", "attrition"):
         val = 0.0
         if opp:
             val = extract_usd(opp.get("Forecasted_Attrition__c"))
         if not val:
-            v2 = ren.get("renewal_atr_snow") or ren.get("renewal_atr")
+            v2 = disp.get("renewal_atr")
+            if v2 is None:
+                v2 = ren.get("renewal_atr_snow")
             if v2 is not None:
                 try:
                     val = float(v2)
                 except (TypeError, ValueError):
                     val = 0.0
-        if not val and disp.get("renewal_atr") is not None:
-            try:
-                val = float(disp["renewal_atr"])
-            except (TypeError, ValueError):
-                val = 0.0
-        if val:
-            val = abs(float(val))
-        return fmt_amount(val) if val else "N/A"
-
-    if field == "attrition":
-        val = 0.0
-        if opp:
-            val = extract_usd(opp.get("Forecasted_Attrition__c"))
-        if not val:
-            v2 = ren.get("renewal_atr_snow") or ren.get("renewal_atr")
-            if v2 is not None:
-                try:
-                    val = float(v2)
-                except (TypeError, ValueError):
-                    val = 0.0
-        if not val and disp.get("renewal_atr") is not None:
-            try:
-                val = float(disp["renewal_atr"])
-            except (TypeError, ValueError):
-                val = 0.0
         if val:
             val = abs(float(val))
         return fmt_amount(val) if val else "N/A"
@@ -1133,6 +1267,13 @@ def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
 
     if field == "swing":
         val = extract_usd(opp.get("Swing__c")) if opp else 0.0
+        if not val:
+            v2 = ren.get("renewal_swing_snow")
+            if v2 is not None:
+                try:
+                    val = abs(float(v2))
+                except (TypeError, ValueError):
+                    val = 0.0
         return fmt_amount(val) if val else "N/A"
 
     return "N/A"
@@ -1336,7 +1477,7 @@ def enrich_account(
 
     if result["ari"]["category"] == "Unknown":
         try:
-            att = get_account_attrition_all(account_id_15)
+            att = get_account_attrition_all_cached(account_id_15)
             all_products = filter_products_by_cloud(att.get("all", []), cloud)
             if all_products:
                 ari_result = calculate_overall_ari(
@@ -1393,7 +1534,11 @@ def get_ari_score(opty_id):
         AND SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_OPPTY)
         LIMIT 1
     """
-    rows = run_query(sql, [opty_id_15])
+    rows = run_query(
+        sql,
+        [opty_id_15],
+        statement_timeout=_env_int("SNOWFLAKE_RENEWAL_STATEMENT_TIMEOUT", 120),
+    )
     return rows[0] if rows else None
 
 
@@ -1543,7 +1688,7 @@ def _format_gmv_rate_for_display(val: Any) -> Optional[str]:
 
 
 def _gmv_rate_pct_from_renewal_row(row: dict) -> Optional[str]:
-    """Pick GMV rate from WV_CI_RENEWAL_OPTY_VW row (SELECT *); prefers known column names."""
+    """Pick GMV rate from a renewal snap row; prefers known column names."""
     if not row:
         return None
     for key in _GMV_RATE_COLUMN_PREFERENCE:
@@ -1565,45 +1710,100 @@ def _gmv_rate_pct_from_renewal_row(row: dict) -> Optional[str]:
 
 
 def get_renewal_aov(opty_id):
-    """
-    Renewal row from ``WV_CI_RENEWAL_OPTY_VW``.
-
-    Static / slow-changing fields only — dynamic values (manager notes, next steps,
-    swing, live forecasted attrition) come from org62 on the Opportunity.
-    """
+    """Renewal row from ``WV_CI_RENEWAL_OPTY_SNAP_VW`` (explicit columns; pinned AS_OF_DATE)."""
     if not opty_id:
         return {}
     opty_id_15 = to_15_char_id(opty_id)
-    sql = """
-        SELECT *
-        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
+    pinned = (os.getenv("SNOWFLAKE_RENEWAL_AS_OF_DATE") or "").strip()
+    if not pinned:
+        pv = _usage_snapshot_cache.get("renewal_as_of_date")
+        pinned = str(pv).strip() if pv is not None else ""
+
+    if pinned:
+        as_of_fragment = "AND AS_OF_DATE = %s"
+        as_of_bind = [pinned]
+    else:
+        as_of_fragment = """AND AS_OF_DATE = (
+            SELECT MAX(AS_OF_DATE)
+            FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
+        )"""
+        as_of_bind = []
+
+    sql = f"""
+        SELECT
+            RENEWAL_OPTY_ID,
+            RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV,
+            RENEWAL_FCAST_ATTRITION_CONV,
+            RENEWAL_ATR_CONV,
+            CONV_SWING_AMT,
+            RENEWAL_FCAST_CODE,
+            RENEWAL_STG_NM,
+            RENEWAL_KEY_RISK_CAT,
+            RENEWAL_RISK_DETAIL,
+            RENEWAL_CLSD_DT,
+            RENEWAL_CLOSE_MONTH,
+            RENEWAL_FISCAL_QTR,
+            ACCOUNT_NM,
+            ACCOUNT_SECTOR_NM,
+            ACCOUNT_INDUSTRY_NM,
+            TARGET_CLOUD,
+            CSG_TERRITORY,
+            TEAM_TERRITORY,
+            CSG_AREA,
+            CSG_GEO,
+            GEO,
+            AE_FULL_NM,
+            AE_ROLE_NM,
+            ACCT_CSM,
+            RENEWAL_OPTY_OWNR_NM,
+            ACCT_AOV_BAND,
+            CNTR_AOV_BAND,
+            SUCCESS_SEGMENT,
+            SEM_NT,
+            SPECIALIST_SL_NT
+        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
         WHERE RENEWAL_OPTY_ID = %s
+        {as_of_fragment}
         LIMIT 1
     """
-    rows = run_query(sql, [opty_id_15])
+    rows = run_query(
+        sql,
+        [opty_id_15] + as_of_bind,
+        statement_timeout=_env_int("SNOWFLAKE_RENEWAL_STATEMENT_TIMEOUT", 120),
+    )
     if rows:
         r = rows[0]
         fcast = (
             r.get("RENEWAL_FCAST_ATTRITION_CONV")
             if r.get("RENEWAL_FCAST_ATTRITION_CONV") is not None
-            else r.get("RENEWAL_FCAST_ATTRITION")
+            else r.get("RENEWAL_ATR_CONV")
         )
         fcast_atr = abs(float(fcast or 0))
-        stg = r.get("RENEWAL_STATUS") or r.get("RENEWAL_STG_NM") or ""
+        swing = abs(float(r.get("CONV_SWING_AMT") or 0))
+        stg = r.get("RENEWAL_STG_NM") or ""
+
+        territory = (
+            r.get("CSG_TERRITORY")
+            or r.get("TEAM_TERRITORY")
+            or r.get("CSG_AREA")
+            or ""
+        )
+        geo = r.get("CSG_GEO") or r.get("GEO") or ""
 
         out: dict[str, Any] = {
             "renewal_aov": float(
                 r.get("RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV") or 0
             ),
-            "renewal_amt": float(r.get("RENEWAL_AMT_CONV") or 0),
             "renewal_atr_snow": fcast_atr,
+            "renewal_swing_snow": swing,
+            "renewal_fcast_code": r.get("RENEWAL_FCAST_CODE") or "",
             "account_name": r.get("ACCOUNT_NM"),
             "account_sector": r.get("ACCOUNT_SECTOR_NM") or "",
             "account_industry": r.get("ACCOUNT_INDUSTRY_NM") or "",
             "target_cloud": r.get("TARGET_CLOUD") or "",
-            "csg_territory": r.get("CSG_TERRITORY") or "",
+            "csg_territory": territory,
             "csg_area": r.get("CSG_AREA") or "",
-            "csg_geo": r.get("CSG_GEO") or "",
+            "csg_geo": geo,
             "ae_name": r.get("AE_FULL_NM") or "",
             "ae_role": r.get("AE_ROLE_NM") or "",
             "csm_name": r.get("ACCT_CSM") or "",
@@ -1632,12 +1832,23 @@ def get_open_renewal_from_snowflake(
     cloud: str = "Commerce Cloud",
 ) -> Optional[dict]:
     """
-    Snowflake-first: best open renewal row from ``WV_CI_RENEWAL_OPTY_VW`` (excludes
+    Snowflake-first: best open renewal row from ``WV_CI_RENEWAL_OPTY_SNAP_VW`` (excludes
     Closed/Dead stages; latest ``AS_OF_DATE``; highest prior ACV).
 
     Returns keys aligned with ``get_renewal_aov`` (static fields; Snowflake FCAST as
     ``renewal_atr_snow`` baseline only).
     """
+    pinned = (os.getenv("SNOWFLAKE_RENEWAL_AS_OF_DATE") or "").strip()
+    if pinned:
+        as_of_fragment = "AND AS_OF_DATE = %s"
+        as_of_bind = [pinned]
+    else:
+        as_of_fragment = """AND AS_OF_DATE = (
+            SELECT MAX(AS_OF_DATE)
+            FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
+        )"""
+        as_of_bind = []
+
     is_fsc = (
         "financial services" in str(cloud).lower()
         or str(cloud).strip().upper() == "FSC"
@@ -1668,21 +1879,28 @@ def get_open_renewal_from_snowflake(
             ACCOUNT_18_ID                            AS ACCOUNT_ID,
             ACCOUNT_NM                               AS ACCOUNT_NAME,
             RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
-            RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_FCAST_ATTRITION_CONV,
-            AE_FULL_NM,
-            ACCT_CSM,
-            RENEWAL_OPTY_OWNR_NM,
+            RENEWAL_FCAST_ATTRITION_CONV,
+            RENEWAL_ATR_CONV,
+            CONV_SWING_AMT,
+            RENEWAL_FCAST_CODE,
             RENEWAL_STG_NM,
             RENEWAL_KEY_RISK_CAT,
             RENEWAL_RISK_DETAIL,
             CSG_TERRITORY,
+            TEAM_TERRITORY,
             CSG_AREA,
             CSG_GEO,
+            GEO,
+            AE_FULL_NM,
+            ACCT_CSM,
+            RENEWAL_OPTY_OWNR_NM,
             TARGET_CLOUD,
             ACCOUNT_SECTOR_NM,
             RENEWAL_CLOSE_MONTH,
-            RENEWAL_CLSD_DT
-        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
+            RENEWAL_CLSD_DT,
+            ACCT_AOV_BAND,
+            SUCCESS_SEGMENT
+        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
         WHERE {cloud_filter}
         AND (
             ACCOUNT_NM       LIKE '%%{search_safe}%%'
@@ -1691,38 +1909,49 @@ def get_open_renewal_from_snowflake(
         )
         AND RENEWAL_STG_NM NOT LIKE '%%Closed%%'
         AND RENEWAL_STG_NM NOT LIKE '%%Dead%%'
-        AND AS_OF_DATE = (
-            SELECT MAX(AS_OF_DATE)
-            FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
-        )
+        {as_of_fragment}
         ORDER BY RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV DESC NULLS LAST
         LIMIT 1
     """
     try:
-        rows = run_query(sql, [opty_bind])
+        rows = run_query(
+            sql,
+            [opty_bind] + as_of_bind,
+            statement_timeout=_env_int("SNOWFLAKE_RENEWAL_STATEMENT_TIMEOUT", 120),
+        )
         if rows:
             r = rows[0]
             fcast = (
                 r.get("RENEWAL_FCAST_ATTRITION_CONV")
                 if r.get("RENEWAL_FCAST_ATTRITION_CONV") is not None
-                else r.get("RENEWAL_FCAST_ATTRITION")
+                else r.get("RENEWAL_ATR_CONV")
             )
-            stg = r.get("RENEWAL_STATUS") or r.get("RENEWAL_STG_NM") or ""
+            swing = abs(float(r.get("CONV_SWING_AMT") or 0))
+            stg = r.get("RENEWAL_STG_NM") or ""
+            territory = (
+                r.get("CSG_TERRITORY")
+                or r.get("TEAM_TERRITORY")
+                or r.get("CSG_AREA")
+                or ""
+            )
+            geo = r.get("CSG_GEO") or r.get("GEO") or ""
             return {
                 "opty_id": to_15_char_id(str(r.get("RENEWAL_OPTY_ID") or "")),
                 "account_id": str(r.get("ACCOUNT_ID") or ""),
                 "account_name": r.get("ACCOUNT_NAME") or "",
                 "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
                 "renewal_atr_snow": abs(float(fcast or 0)),
+                "renewal_swing_snow": swing,
+                "renewal_fcast_code": r.get("RENEWAL_FCAST_CODE") or "",
                 "ae_name": r.get("AE_FULL_NM") or "",
                 "csm_name": r.get("ACCT_CSM") or "",
                 "renewal_manager": r.get("RENEWAL_OPTY_OWNR_NM") or "",
                 "renewal_status": str(stg or ""),
                 "risk_category": r.get("RENEWAL_KEY_RISK_CAT") or "",
                 "risk_detail": r.get("RENEWAL_RISK_DETAIL") or "",
-                "csg_territory": r.get("CSG_TERRITORY") or "",
+                "csg_territory": territory,
                 "csg_area": r.get("CSG_AREA") or "",
-                "csg_geo": r.get("CSG_GEO") or "",
+                "csg_geo": geo,
                 "target_cloud": r.get("TARGET_CLOUD") or "",
                 "account_sector": r.get("ACCOUNT_SECTOR_NM") or "",
                 "renewal_close_month": str(r.get("RENEWAL_CLOSE_MONTH") or ""),
@@ -1844,6 +2073,17 @@ def get_account_attrition_all(account_id: str) -> dict[str, Any]:
     )
     all_products = [_normalize_attrition_row(r) for r in raw]
     return {"all": all_products, "raw": raw}
+
+
+def get_account_attrition_all_cached(account_id: str) -> dict[str, Any]:
+    key = f"attrition_all|{to_15_char_id(account_id)}"
+    cached = _cache_get(_account_enrich_cache, key)
+    if cached is not None:
+        log_debug(f"attrition_all cache HIT: {account_id}")
+        return cached
+    result = get_account_attrition_all(account_id)
+    _cache_set(_account_enrich_cache, key, result)
+    return result
 
 
 def get_account_attrition(account_id: str, cloud: str | None = "Commerce Cloud") -> list:
@@ -1997,6 +2237,19 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
         tc = renewal.get("target_cloud")
         if tc is not None and str(tc).strip():
             result["target_cloud"] = str(tc).strip()
+
+    # Swing — from Snowflake renewal row (no Org62 needed)
+    renewal = enrichment.get("renewal_aov") or {}
+    swing_snow = renewal.get("renewal_swing_snow")
+    try:
+        swing_ok = swing_snow is not None and float(swing_snow) > 0
+    except (TypeError, ValueError):
+        swing_ok = False
+    if swing_ok:
+        result["swing"] = fmt_amount(float(swing_snow))
+    else:
+        result["swing"] = "N/A"
+
     return result
 
 
@@ -2030,7 +2283,7 @@ def _resolve_account_from_snowflake_css(account_name: str) -> Optional[dict]:
             """
             SELECT ren.ACCOUNT_18_ID AS ACCOUNT_ID, ren.ACCOUNT_NM AS ACCOUNT_NAME
             FROM SSE_DM_CSG_RPT_PRD.CSS.ATTRITION_PREDICTION_ACCT_PRODUCT atr
-            INNER JOIN SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
+            INNER JOIN SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW ren
                 ON atr.ACCOUNT_ID = ren.ACCT_ID
             WHERE UPPER(ren.ACCOUNT_NM) LIKE UPPER(%s)
             AND atr.SNAPSHOT_DT = (
@@ -2066,6 +2319,15 @@ def resolve_account_from_snowflake(
     """
     if not name:
         return None
+
+    pinned = (os.getenv("SNOWFLAKE_RENEWAL_AS_OF_DATE") or "").strip()
+    if pinned:
+        as_of_fragment = "AND ren.AS_OF_DATE = %s"
+    else:
+        as_of_fragment = """AND ren.AS_OF_DATE = (
+                    SELECT MAX(AS_OF_DATE)
+                    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
+                )"""
 
     search_clean = name.strip()
     search_stripped = re.sub(
@@ -2117,19 +2379,21 @@ def resolve_account_from_snowflake(
                     ren.CSG_AREA,
                     ren.CSG_GEO,
                     ren.TARGET_CLOUD
-                FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
+                FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW ren
                 WHERE ren.ACCOUNT_NM LIKE %s
                 AND {cloud_filter}
                 AND ren.RENEWAL_STG_NM NOT LIKE '%%Closed%%'
                 AND ren.RENEWAL_STG_NM NOT LIKE '%%Dead%%'
-                AND ren.AS_OF_DATE = (
-                    SELECT MAX(AS_OF_DATE)
-                    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
-                )
+                {as_of_fragment}
                 ORDER BY ren.RENEWAL_AMT_CONV DESC NULLS LAST
                 LIMIT 1
             """
-            rows = run_query(sql, [pattern])
+            binds = [pattern] + ([pinned] if pinned else [])
+            rows = run_query(
+                sql,
+                binds,
+                statement_timeout=_env_int("SNOWFLAKE_RENEWAL_STATEMENT_TIMEOUT", 120),
+            )
             if rows:
                 r = rows[0]
                 return {

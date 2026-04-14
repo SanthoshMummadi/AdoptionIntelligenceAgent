@@ -439,10 +439,7 @@ def call_llm_gateway_with_retry(
 
 def init_gm_workflow() -> GMReviewWorkflow:
     """Initialize GM Review workflow (domain calls + LLM gateway)."""
-    return GMReviewWorkflow(
-        call_llm_fn=call_llm_gateway_with_retry,
-        max_concurrent=5,
-    )
+    return GMReviewWorkflow(call_llm_fn=call_llm_gateway_with_retry)
 
 
 # ============================================================================

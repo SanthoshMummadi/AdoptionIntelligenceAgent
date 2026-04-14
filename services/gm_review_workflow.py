@@ -334,7 +334,7 @@ class GMReviewWorkflow:
             enrich_account_cached,
             filter_products_by_cloud,
             format_enrichment_for_display,
-            get_account_attrition_all,
+            get_account_attrition_all_cached,
             get_open_renewal_from_snowflake,
             to_15_char_id,
         )
@@ -510,7 +510,7 @@ class GMReviewWorkflow:
 
         def _run_attrition() -> tuple[list, list]:
             try:
-                attrition_data = get_account_attrition_all(account_id_15)
+                attrition_data = get_account_attrition_all_cached(account_id_15)
                 all_p = attrition_data.get("all", [])
                 return filter_products_by_cloud(all_p, cloud), all_p
             except Exception as e:
@@ -543,7 +543,9 @@ class GMReviewWorkflow:
                         usage_account_ids_15,
                         renewal_prefetch_for_enrich,
                     )
-                    fut_attrition = ex.submit(get_account_attrition_all, account_id_15)
+                    fut_attrition = ex.submit(
+                        get_account_attrition_all_cached, account_id_15
+                    )
 
                     try:
                         enrichment = fut_enrich.result(
@@ -614,7 +616,9 @@ class GMReviewWorkflow:
                         usage_account_ids_15,
                         renewal_prefetch_for_enrich,
                     )
-                    fut_attrition = ex.submit(get_account_attrition_all, account_id_15)
+                    fut_attrition = ex.submit(
+                        get_account_attrition_all_cached, account_id_15
+                    )
                     fut_red = ex.submit(get_red_account, account_id)
                     fut_team = ex.submit(get_account_team, account_id)
 

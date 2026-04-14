@@ -21,6 +21,12 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 load_dotenv(os.path.join(_ROOT, ".env"))
 import server  # side effect: startup env validation (see server._should_run_startup_env_validation)
+from domain.analytics.snowflake_client import (
+    clear_stale_caches,
+    clear_usage_snapshot_cache,
+    prewarm_cidm_usage_snapshot_dt,
+    prewarm_renewal_as_of_date,
+)
 from domain.tracking.account_tracker import setup_tracking_tables
 from services.daily_pulse_workflow import run_daily_pulse
 from log_utils import log_error
@@ -46,6 +52,10 @@ def on_startup():
 
 
 on_startup()
+clear_usage_snapshot_cache()
+prewarm_cidm_usage_snapshot_dt()
+prewarm_renewal_as_of_date()
+print("✓ CIDM + Renewal snapshots prewarmed")
 
 
 def setup_pulse_scheduler():
@@ -85,6 +95,12 @@ def setup_pulse_scheduler():
         trigger=trigger,
         id="daily_pulse",
         name="Daily Pulse",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        clear_stale_caches,
+        CronTrigger(minute=0),
+        id="clear_stale_caches",
         replace_existing=True,
     )
     scheduler.start()
