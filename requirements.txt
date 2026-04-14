@@ -34,3 +34,9 @@ tableauserverclient>=0.25.0
 
 # Environment
 python-dotenv>=1.0.0
+
+# Scheduler
+APScheduler==3.10.4
+
+# Retry
+tenacity>=8.2.3

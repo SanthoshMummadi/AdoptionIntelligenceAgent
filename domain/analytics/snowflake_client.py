@@ -6,15 +6,23 @@ import os
 import re
 import threading
 import time
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Empty, Queue
 from typing import Any, Optional
 
 import snowflake.connector
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
 from log_utils import log_debug, log_error, log_structured
 
 load_dotenv()
+
+def _fmt_exc(e: BaseException) -> str:
+    msg = str(e) if e is not None else ""
+    if msg:
+        return f"{type(e).__name__}: {msg}"
+    return f"{type(e).__name__}: {repr(e)}"
 
 
 def _env_int(key: str, default: int) -> int:
@@ -32,6 +40,135 @@ def _env_pool_size() -> int:
 
 
 POOL_SIZE = _env_pool_size()
+INITIAL_POOL_SIZE = max(
+    1,
+    min(
+        POOL_SIZE,
+        _env_int(
+            "SNOWFLAKE_POOL_INITIAL_SIZE",
+            min(4, POOL_SIZE),
+        ),
+    ),
+)
+
+# Cache for latest CIDM usage snapshot date (within a workflow run)
+_usage_snapshot_cache: dict[str, Any] = {}
+_usage_snapshot_lock = threading.Lock()
+
+# Process-level TTL cache for account resolution + enrichment
+_ACCOUNT_CACHE_TTL_S = _env_int("SNOWFLAKE_ACCOUNT_CACHE_TTL_S", 900)  # 15 min default
+_account_resolve_cache: dict[str, tuple[Any, float]] = {}
+_account_enrich_cache: dict[str, tuple[Any, float]] = {}
+_account_cache_lock = threading.Lock()
+
+
+def _cache_get(cache: dict, key: str) -> Any:
+    with _account_cache_lock:
+        entry = cache.get(key)
+        if entry and (time.time() - entry[1]) < _ACCOUNT_CACHE_TTL_S:
+            return entry[0]
+        cache.pop(key, None)
+    return None
+
+
+def _cache_set(cache: dict, key: str, value: Any) -> None:
+    with _account_cache_lock:
+        cache[key] = (value, time.time())
+
+
+def clear_usage_snapshot_cache() -> None:
+    """Clear CIDM snapshot cache and failure backoff (call once per GM Review batch start)."""
+    _usage_snapshot_cache.clear()
+
+
+def prewarm_cidm_usage_snapshot_dt() -> None:
+    """
+    Run the global CIDM MAX(SNAPSHOT_DT) once while serialised.
+    Call after ``clear_usage_snapshot_cache()`` at batch start so parallel
+    ``enrich_account`` calls hit cache instead of stampeding Snowflake.
+    """
+    try:
+        _get_latest_cidm_usage_snapshot_dt()
+    except Exception as e:
+        log_debug(f"prewarm_cidm_usage_snapshot_dt: {_fmt_exc(e)[:100]}")
+
+
+def _get_latest_cidm_usage_snapshot_dt() -> Any:
+    """
+    Get MAX(SNAPSHOT_DT) for CIDM usage view.
+    Cached; serialized under ``_usage_snapshot_lock``. On repeated 57014 / failures,
+    applies a short backoff so parallel GM Review accounts do not each re-run the
+    same heavy MAX. Optional ``SNOWFLAKE_CIDM_SNAPSHOT_DT=YYYY-MM-DD`` skips the query.
+    """
+    cache_key = "cidm_wv_av_usage_extract_vw_max_snapshot_dt"
+    fail_key = f"{cache_key}_fail_until"
+    override = (os.getenv("SNOWFLAKE_CIDM_SNAPSHOT_DT") or "").strip()
+
+    with _usage_snapshot_lock:
+        if cache_key in _usage_snapshot_cache:
+            return _usage_snapshot_cache[cache_key]
+
+        if override:
+            _usage_snapshot_cache[cache_key] = override
+            log_debug(
+                "CIDM snapshot from SNOWFLAKE_CIDM_SNAPSHOT_DT "
+                f"(MAX query skipped): {override!r}"
+            )
+            return override
+
+        now = time.time()
+        fail_until = float(_usage_snapshot_cache.get(fail_key) or 0.0)
+        if fail_until > now:
+            log_debug(
+                "CIDM MAX(SNAPSHOT_DT) in failure backoff "
+                f"({fail_until - now:.0f}s left) — skipping usage snapshot lookup"
+            )
+            return None
+
+        if fail_key in _usage_snapshot_cache:
+            del _usage_snapshot_cache[fail_key]
+
+        stmt_to = _env_int("SNOWFLAKE_USAGE_MAX_SNAPSHOT_TIMEOUT", 120)
+        attempts = max(1, _env_int("SNOWFLAKE_USAGE_MAX_SNAPSHOT_ATTEMPTS", 3))
+        sleep_s = _env_int("SNOWFLAKE_USAGE_MAX_SNAPSHOT_RETRY_SLEEP_S", 4)
+        max_date = None
+        last_exc: Optional[BaseException] = None
+
+        for attempt in range(attempts):
+            try:
+                rows = run_query(
+                    """
+                    SELECT MAX(SNAPSHOT_DT) AS MAX_DATE
+                    FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+                    """,
+                    [],
+                    statement_timeout=stmt_to,
+                )
+                max_date = (rows[0] or {}).get("MAX_DATE") if rows else None
+                if max_date is not None:
+                    break
+            except Exception as e:
+                last_exc = e
+                log_debug(
+                    f"_get_latest_cidm_usage_snapshot_dt attempt {attempt + 1}/"
+                    f"{attempts}: {_fmt_exc(e)[:120]}"
+                )
+                if attempt + 1 < attempts:
+                    time.sleep(sleep_s * (attempt + 1))
+
+        if max_date is not None:
+            _usage_snapshot_cache.pop(fail_key, None)
+            _usage_snapshot_cache[cache_key] = max_date
+            return max_date
+
+        backoff = max(30, _env_int("SNOWFLAKE_CIDM_SNAPSHOT_BACKOFF_S", 120))
+        _usage_snapshot_cache[fail_key] = now + backoff
+        if last_exc:
+            log_debug(
+                f"_get_latest_cidm_usage_snapshot_dt giving up for {backoff}s: "
+                f"{_fmt_exc(last_exc)[:100]}"
+            )
+        return None
 
 # Corporate suffix patterns for account-name stripping (fuzzy resolution)
 CORPORATE_SUFFIXES = (
@@ -106,6 +243,7 @@ def cloud_aov_label(cloud: str | None) -> str:
 
 _pool: Queue = Queue(maxsize=POOL_SIZE)
 _pool_initialized = False
+_pool_created_count = 0
 _pool_lock = threading.Lock()
 
 
@@ -148,18 +286,25 @@ def _create_snowflake_connection() -> Any:
 
 
 def _init_pool() -> None:
-    """Initialize pool of ``POOL_SIZE`` connections (thread-safe, once)."""
-    global _pool_initialized
+    """Initialize pool with ``INITIAL_POOL_SIZE`` (thread-safe, once)."""
+    global _pool_initialized, _pool_created_count
     if _pool_initialized:
         return
     with _pool_lock:
         if _pool_initialized:
             return
-        log_debug(f"Initializing Snowflake connection pool ({POOL_SIZE} connections)...")
-        for _ in range(POOL_SIZE):
+        log_debug(
+            "Initializing Snowflake connection pool "
+            f"({INITIAL_POOL_SIZE}/{POOL_SIZE} initial connections)..."
+        )
+        for _ in range(INITIAL_POOL_SIZE):
             _pool.put(_create_snowflake_connection())
+            _pool_created_count += 1
         _pool_initialized = True
-        log_debug(f"✓ Snowflake pool ready ({POOL_SIZE} connections)")
+        log_debug(
+            "✓ Snowflake pool ready "
+            f"({_pool_created_count}/{POOL_SIZE} connections)"
+        )
 
 
 def return_connection(conn: Any) -> None:
@@ -182,9 +327,10 @@ def return_connection(conn: Any) -> None:
 
 def reset_snowflake_pool() -> None:
     """Drain pool, close connections, allow re-init (tests / hard recovery)."""
-    global _pool_initialized
+    global _pool_initialized, _pool_created_count
     with _pool_lock:
         _pool_initialized = False
+        _pool_created_count = 0
         while True:
             try:
                 c = _pool.get_nowait()
@@ -197,8 +343,14 @@ def reset_snowflake_pool() -> None:
 
 
 def get_snowflake_connection() -> Any:
-    """Borrow a connection from the pool (blocks up to 60s if all are in use)."""
+    """Borrow a connection from the pool (grow lazily up to ``POOL_SIZE``)."""
     _init_pool()
+    # Grow on demand: avoid opening many SSO browser windows at startup.
+    with _pool_lock:
+        global _pool_created_count
+        if _pool.empty() and _pool_created_count < POOL_SIZE:
+            _pool.put(_create_snowflake_connection())
+            _pool_created_count += 1
     try:
         return _pool.get(timeout=60)
     except Empty as e:
@@ -304,6 +456,25 @@ def run_query(
     only; when omitted, uses ``SNOWFLAKE_STATEMENT_TIMEOUT`` (default 30).
     """
 
+    def _is_retryable_snowflake_cancel(err: BaseException) -> bool:
+        # 000604 (57014): SQL execution canceled
+        try:
+            if not isinstance(err, snowflake.connector.errors.ProgrammingError):
+                return False
+            msg = str(err) or ""
+            return "57014" in msg or "000604" in msg or "execution canceled" in msg.lower()
+        except Exception:
+            return False
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=2, max=4),
+        retry=retry_if_exception(_is_retryable_snowflake_cancel),
+        before_sleep=lambda rs: log_debug(
+            f"[retry] Snowflake canceled/timeout; retrying ({rs.attempt_number}/2)..."
+        ),
+        reraise=True,
+    )
     def _execute(conn: Any) -> list[dict]:
         cursor = conn.cursor()
         try:
@@ -448,7 +619,7 @@ def fmt_amount(val) -> str:
         return str(val) if val else "N/A"
 
 
-def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
+def get_usage_unified(account_id: str | list[str], cloud: str | None = None) -> dict:
     """
     Unified usage fetch: summary stats and raw rows from CIDM.
 
@@ -459,6 +630,9 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
     Returns:
         ``{"summary": {...}, "raw_rows": [...]}`` — summary has utilization / source / emoji;
         ``raw_rows`` are CIDM usage rows (for ``build_adoption_pov``).
+
+    Multi-account (hierarchy): by default merges per-account CIDM queries (set
+    ``SNOWFLAKE_USAGE_HIERARCHY_USE_AGGREGATE=1`` for one ``GROUP BY`` over all ids).
     """
     CLOUD_L1_MAP = {
         # Commerce
@@ -488,6 +662,14 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
     def _build_cloud_filter(cloud_val: str | None) -> str:
         if not cloud_val or cloud_val == "All Clouds":
             return ""
+        # FSC: CIDM usage is typically under Industries (L1) but the signal we want is
+        # exact L2 = 'Financial Services Cloud'. This dramatically reduces scan size
+        # and matches build_adoption_pov()’s FSC logic.
+        c_norm = str(cloud_val).strip().lower()
+        if "financial services" in c_norm or c_norm == "fsc":
+            return """
+                AND DRVD_APM_LVL_2 = 'Financial Services Cloud'
+            """
         l1_value = CLOUD_L1_MAP.get(str(cloud_val).strip(), cloud_val)
         l1_safe = str(l1_value).replace("'", "''").replace("%", "%%")
         return f"""
@@ -498,6 +680,217 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
         """
 
     cloud_filter = _build_cloud_filter(cloud)
+
+    def _hierarchy_summary_from_rows(merged_rows: list) -> dict:
+        if not merged_rows:
+            return {"summary": {}, "raw_rows": []}
+        gmv_rows = [
+            r for r in merged_rows if str(r.get("GRP", "")).upper() == "GMV"
+        ]
+        if gmv_rows:
+            total_prov = sum(float(r.get("PROVISIONED") or 0) for r in gmv_rows)
+            total_used = sum(float(r.get("USED") or 0) for r in gmv_rows)
+            source = "GMV"
+        else:
+            commerce_rows = [
+                r
+                for r in merged_rows
+                if "commerce" in str(r.get("DRVD_APM_LVL_1", "")).lower()
+                or "commerce" in str(r.get("DRVD_APM_LVL_2", "")).lower()
+            ]
+            target_rows = commerce_rows if commerce_rows else merged_rows
+            total_prov = sum(
+                float(r.get("PROVISIONED") or 0) for r in target_rows
+            )
+            total_used = sum(float(r.get("USED") or 0) for r in target_rows)
+            source = "Commerce aggregate" if commerce_rows else "All products"
+        if total_prov > 0:
+            util_rate = (total_used / total_prov) * 100
+            util_str = f"{util_rate:.1f}%"
+        else:
+            util_rate = 0
+            util_str = "N/A"
+        if util_rate >= 70:
+            util_emoji = ":large_green_circle:"
+        elif util_rate >= 40:
+            util_emoji = ":large_yellow_circle:"
+        elif util_rate > 0:
+            util_emoji = ":red_circle:"
+        else:
+            util_emoji = ":white_circle:"
+        return {
+            "summary": {
+                "utilization_rate": util_str,
+                "util_emoji": util_emoji,
+                "cloud_aov": "Unknown",
+                "gmv_util": util_str if gmv_rows else None,
+                "source": source,
+            },
+            "raw_rows": merged_rows,
+        }
+
+    # Support parent + child hierarchy usage in one call.
+    if isinstance(account_id, (list, tuple, set)):
+        # Single query for hierarchy accounts (avoid N sequential Snowflake calls).
+        account_ids = [
+            to_15_char_id(str(aid))
+            for aid in account_id
+            if str(aid or "").strip()
+        ]
+        account_ids = list(dict.fromkeys(account_ids))
+        if not account_ids:
+            return {"summary": {}, "raw_rows": []}
+
+        if len(account_ids) == 1:
+            return get_usage_unified(account_ids[0], cloud)
+
+        # Multi-account: prefer sequential per-account CIDM (ACCOUNT_ID = %s). Heavy
+        # ``IN (...)`` + ``GROUP BY`` often hits stricter warehouse statement caps (~30s)
+        # even when the session requests a longer timeout.
+        use_hierarchy_aggregate = _env_int(
+            "SNOWFLAKE_USAGE_HIERARCHY_USE_AGGREGATE", 0
+        )
+        if not use_hierarchy_aggregate:
+            log_debug(
+                f"get_usage_unified hierarchy: per-account merge only "
+                f"({len(account_ids)} ids; set SNOWFLAKE_USAGE_HIERARCHY_USE_AGGREGATE=1 "
+                "for single GROUP BY)"
+            )
+            merged_rows: list = []
+            for aid in account_ids:
+                try:
+                    part = get_usage_unified(aid, cloud).get("raw_rows") or []
+                    merged_rows.extend(part)
+                except Exception as e:
+                    log_debug(
+                        f"get_usage_unified hierarchy per-account {aid}: "
+                        f"{_fmt_exc(e)[:80]}"
+                    )
+            return _hierarchy_summary_from_rows(merged_rows)
+
+        # Hierarchy aggregate (opt-in): CURR_SNAP / scoped MAX — same strategy as single-account.
+        ph = ", ".join(["%s"] * len(account_ids))
+        cidm_to = _env_int(
+            "SNOWFLAKE_USAGE_CIDM_HIERARCHY_TIMEOUT",
+            max(120, _env_int("SNOWFLAKE_USAGE_CIDM_TIMEOUT", 45)),
+        )
+        pinned = (os.getenv("SNOWFLAKE_CIDM_SNAPSHOT_DT") or "").strip()
+
+        def _hierarchy_agg(snap_fragment: str, bind: list, cf: str) -> list:
+            sql = f"""
+            SELECT
+                ACCOUNT_ID,
+                DRVD_APM_LVL_1,
+                DRVD_APM_LVL_2,
+                GRP,
+                TYPE,
+                SUM(PROVISIONED) AS PROVISIONED,
+                SUM(ACTIVATED) AS ACTIVATED,
+                SUM(USED) AS USED
+            FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+            WHERE ACCOUNT_ID IN ({ph})
+            {snap_fragment}
+            {cf}
+            AND PROVISIONED > 0
+            GROUP BY ACCOUNT_ID, DRVD_APM_LVL_1, DRVD_APM_LVL_2, GRP, TYPE
+            ORDER BY PROVISIONED DESC
+            """
+            try:
+                return run_query(sql, bind, statement_timeout=cidm_to)
+            except Exception as e:
+                log_debug(
+                    f"get_usage_unified hierarchy aggregate error: {str(e)[:100]}"
+                )
+                return []
+
+        merged_rows: list = []
+        if pinned:
+            merged_rows = _hierarchy_agg(
+                "AND SNAPSHOT_DT = %s",
+                [*account_ids, pinned],
+                cloud_filter,
+            )
+        if not merged_rows:
+            merged_rows = _hierarchy_agg(
+                "AND CURR_SNAP_FLG = 'Y'",
+                list(account_ids),
+                cloud_filter,
+            )
+        if not merged_rows:
+            scoped_max = (
+                "AND SNAPSHOT_DT = ("
+                "SELECT MAX(SNAPSHOT_DT) "
+                "FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW "
+                f"WHERE ACCOUNT_ID IN ({ph}))"
+            )
+            merged_rows = _hierarchy_agg(
+                scoped_max,
+                [*account_ids, *account_ids],
+                cloud_filter,
+            )
+        if not merged_rows:
+            merged_rows = _hierarchy_agg(
+                "AND CURR_SNAP_FLG = 'Y'",
+                list(account_ids),
+                "",
+            )
+        if not merged_rows:
+            scoped_max = (
+                "AND SNAPSHOT_DT = ("
+                "SELECT MAX(SNAPSHOT_DT) "
+                "FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW "
+                f"WHERE ACCOUNT_ID IN ({ph}))"
+            )
+            merged_rows = _hierarchy_agg(
+                scoped_max,
+                [*account_ids, *account_ids],
+                "",
+            )
+        if not merged_rows:
+            try:
+                merged_rows = run_query(
+                    f"""
+                    SELECT
+                        ACCOUNT_ID,
+                        DRVD_APM_LVL_1,
+                        DRVD_APM_LVL_2,
+                        GRP,
+                        TYPE,
+                        SUM(PROVISIONED) AS PROVISIONED,
+                        SUM(ACTIVATED) AS ACTIVATED,
+                        SUM(USED) AS USED
+                    FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_AV_USAGE_EXTRACT_VW
+                    WHERE ACCOUNT_ID IN ({ph})
+                    AND CURR_SNAP_FLG = 'Y'
+                    AND GRP = 'GMV'
+                    AND PROVISIONED > 0
+                    GROUP BY ACCOUNT_ID, DRVD_APM_LVL_1, DRVD_APM_LVL_2, GRP, TYPE
+                    ORDER BY PROVISIONED DESC
+                    """,
+                    list(account_ids),
+                    statement_timeout=cidm_to,
+                )
+            except Exception as e:
+                log_debug(f"get_usage_unified hierarchy GMV error: {str(e)[:80]}")
+                merged_rows = []
+        if not merged_rows:
+            log_debug(
+                "get_usage_unified hierarchy: per-account CIDM merge "
+                f"({len(account_ids)} ids)"
+            )
+            merged_rows = []
+            for aid in account_ids:
+                try:
+                    part = get_usage_unified(aid, cloud).get("raw_rows") or []
+                    merged_rows.extend(part)
+                except Exception as e:
+                    log_debug(
+                        f"get_usage_unified hierarchy per-account {aid}: "
+                        f"{_fmt_exc(e)[:80]}"
+                    )
+        return _hierarchy_summary_from_rows(merged_rows)
+
+    account_id = to_15_char_id(str(account_id))
 
     # Fast pre-check: skip CURR_SNAP / MAX(SNAPSHOT) / GMV fallbacks when no CIDM usage rows
     try:
@@ -531,6 +924,7 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
     ) -> list:
         sql = f"""
             SELECT
+                ACCOUNT_ID,
                 DRVD_APM_LVL_1,
                 DRVD_APM_LVL_2,
                 GRP,
@@ -553,7 +947,11 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
             log_debug(f"get_usage_unified error: {str(e)[:100]}")
             return []
 
-    rows = _run("AND CURR_SNAP_FLG = 'Y'", [account_id])
+    rows = _run(
+        "AND CURR_SNAP_FLG = 'Y'",
+        [account_id],
+        statement_timeout=cidm_timeout,
+    )
 
     if not rows:
         log_debug(
@@ -577,6 +975,7 @@ def get_usage_unified(account_id: str, cloud: str | None = None) -> dict:
             rows = run_query(
                 """
                 SELECT
+                    ACCOUNT_ID,
                     DRVD_APM_LVL_1, DRVD_APM_LVL_2,
                     GRP, TYPE,
                     PROVISIONED, ACTIVATED, USED
@@ -653,11 +1052,22 @@ def extract_usd(value) -> float:
         return float(value)
     if isinstance(value, str):
         cleaned = value.replace("$", "").replace(",", "").strip()
+        if not cleaned or cleaned.lower() in ("unknown", "n/a"):
+            return 0.0
+        m_suffix = cleaned[-1].upper() == "M" and len(cleaned) > 1
+        if m_suffix:
+            cleaned = cleaned[:-1].strip()
         try:
-            return float(cleaned)
+            n = float(cleaned)
+            return n * 1_000_000 if m_suffix else n
         except ValueError:
             return 0.0
     return 0.0
+
+
+def _renewal_dict(snapshot: Optional[dict]) -> dict:
+    r = (snapshot or {}).get("renewal_aov")
+    return r if isinstance(r, dict) else {}
 
 
 def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
@@ -665,34 +1075,64 @@ def resolve_money(snowflake_display: dict, opp: dict, field: str) -> str:
     Resolve money fields with Snowflake-first, org62 fallback.
     field: one of "atr", "attrition", "aov", "swing".
     """
+    disp = snowflake_display or {}
+    ren = _renewal_dict(disp)
+
     if field == "atr":
+        val = 0.0
         if opp:
             val = extract_usd(opp.get("Forecasted_Attrition__c"))
-        else:
-            val = None
         if not val:
-            ren = (snowflake_display or {}).get("renewal_aov") or {}
-            val = ren.get("renewal_atr_snow") or ren.get("renewal_atr")
-        if not val:
-            val = (snowflake_display or {}).get("renewal_atr")
+            v2 = ren.get("renewal_atr_snow") or ren.get("renewal_atr")
+            if v2 is not None:
+                try:
+                    val = float(v2)
+                except (TypeError, ValueError):
+                    val = 0.0
+        if not val and disp.get("renewal_atr") is not None:
+            try:
+                val = float(disp["renewal_atr"])
+            except (TypeError, ValueError):
+                val = 0.0
+        if val:
+            val = abs(float(val))
         return fmt_amount(val) if val else "N/A"
 
     if field == "attrition":
-        val = extract_usd(opp.get("Forecasted_Attrition__c")) if opp else None
+        val = 0.0
+        if opp:
+            val = extract_usd(opp.get("Forecasted_Attrition__c"))
+        if not val:
+            v2 = ren.get("renewal_atr_snow") or ren.get("renewal_atr")
+            if v2 is not None:
+                try:
+                    val = float(v2)
+                except (TypeError, ValueError):
+                    val = 0.0
+        if not val and disp.get("renewal_atr") is not None:
+            try:
+                val = float(disp["renewal_atr"])
+            except (TypeError, ValueError):
+                val = 0.0
+        if val:
+            val = abs(float(val))
         return fmt_amount(val) if val else "N/A"
 
     if field == "aov":
-        val = (snowflake_display or {}).get("renewal_aov", {}).get("renewal_aov")
+        val = ren.get("renewal_aov") if ren else None
+        if val is not None:
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                val = 0.0
         if not val:
-            val = (snowflake_display or {}).get("cc_aov")
-            if isinstance(val, str):
-                val = extract_usd(val)
+            val = extract_usd(disp.get("cc_aov"))
         if not val and opp:
             val = extract_usd(opp.get("Amount"))
         return fmt_amount(val) if val else "N/A"
 
     if field == "swing":
-        val = extract_usd(opp.get("Swing__c")) if opp else None
+        val = extract_usd(opp.get("Swing__c")) if opp else 0.0
         return fmt_amount(val) if val else "N/A"
 
     return "N/A"
@@ -702,15 +1142,14 @@ def enrich_account(
     account_id,
     opty_id=None,
     cloud=None,
+    usage_account_ids: Optional[list[str]] = None,
     renewal_prefetch: Optional[dict] = None,
 ):
     """
     Full enrichment with parallel I/O.
 
     Phase 1: independent queries run concurrently (health + usage + renewal AOV + opp ARI
-    when ``opty_id`` is set). ``max_workers=3`` caps concurrent tasks — with
-    ``opty_id``, four futures are queued so AOV and ARI may overlap health/usage but
-    only three run at once.
+    when ``opty_id`` is set). ``max_workers=4`` runs all four without queuing in this pool.
 
     If ``renewal_prefetch`` is set (same shape as ``get_renewal_aov``), skips the
     Snowflake renewal-view lookup for AOV/ATR/geo and uses the preloaded row.
@@ -743,23 +1182,30 @@ def enrich_account(
     if renewal_prefetch:
         result["renewal_aov"] = dict(renewal_prefetch)
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        fut_health = ex.submit(get_customer_health, account_id_15)
-        fut_usage = ex.submit(get_usage_unified, account_id_15, cloud)
-        fut_aov = None
-        if not renewal_prefetch:
-            fut_aov = ex.submit(get_renewal_aov, opty_id) if opty_id else None
-        fut_ari = ex.submit(get_ari_score, opty_id) if opty_id else None
+    # Up to four Snowflake calls (health, usage, renewal AOV, opp ARI).
+    # Multi-account hierarchy usage runs a heavy CIDM aggregation; run phase 1 **serially**
+    # so we do not stack 4 Snowflake queries on top of GM Review's parallel attrition/red.
+    _tw_health = _env_int("SNOWFLAKE_ENRICH_HEALTH_WAIT_S", 90)
+    _tw_usage = _env_int("SNOWFLAKE_ENRICH_USAGE_WAIT_S", 120)
+    _tw_renew = _env_int("SNOWFLAKE_ENRICH_RENEWAL_WAIT_S", 45)
+    _tw_ari = _env_int("SNOWFLAKE_ENRICH_ARI_WAIT_S", 45)
 
+    usage_target: str | list[str] = (
+        usage_account_ids if usage_account_ids else account_id_15
+    )
+    _hierarchy_usage = isinstance(usage_target, list) and len(usage_target) > 1
+
+    def _phase1_health() -> None:
         try:
-            health_data = fut_health.result(timeout=30)
+            health_data = get_customer_health(account_id_15)
             if health_data:
                 result["health"] = health_data
         except Exception as e:
-            log_debug(f"Health fetch error: {str(e)[:60]}")
+            log_debug(f"Health fetch error: {_fmt_exc(e)[:120]}")
 
+    def _phase1_usage() -> None:
         try:
-            usage_unified = fut_usage.result(timeout=30)
+            usage_unified = get_usage_unified(usage_target, cloud)
             if usage_unified and usage_unified.get("summary"):
                 usage_data = usage_unified["summary"]
                 result["usage"] = {
@@ -775,11 +1221,12 @@ def enrich_account(
                     f"({usage_data.get('source')})"
                 )
         except Exception as e:
-            log_debug(f"Usage fetch error: {str(e)[:60]}")
+            log_debug(f"Usage fetch error: {_fmt_exc(e)[:120]}")
 
+    def _phase1_renew() -> None:
         try:
-            if fut_aov:
-                renewal_data = fut_aov.result(timeout=15)
+            if not renewal_prefetch and opty_id:
+                renewal_data = get_renewal_aov(opty_id)
                 if renewal_data:
                     result["renewal_aov"] = renewal_data
                     if result["usage"].get("cloud_aov") == "Unknown":
@@ -793,9 +1240,10 @@ def enrich_account(
         except Exception as e:
             log_debug(f"Renewal AOV error: {str(e)[:60]}")
 
+    def _phase1_ari() -> None:
         try:
-            if fut_ari:
-                ari_data = fut_ari.result(timeout=15)
+            if opty_id:
+                ari_data = get_ari_score(opty_id)
                 if ari_data:
                     result["ari"] = {
                         "probability": ari_data.get("ATTRITION_PROBA"),
@@ -806,6 +1254,85 @@ def enrich_account(
                     }
         except Exception as e:
             log_debug(f"ARI fetch error: {str(e)[:60]}")
+
+    if _hierarchy_usage:
+        _phase1_health()
+        _phase1_usage()
+        _phase1_renew()
+        _phase1_ari()
+    else:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            fut_health = ex.submit(get_customer_health, account_id_15)
+            fut_usage = ex.submit(get_usage_unified, usage_target, cloud)
+            fut_aov = (
+                ex.submit(get_renewal_aov, opty_id)
+                if (not renewal_prefetch and opty_id)
+                else None
+            )
+            fut_ari = ex.submit(get_ari_score, opty_id) if opty_id else None
+
+            try:
+                health_data = fut_health.result(timeout=_tw_health)
+                if health_data:
+                    result["health"] = health_data
+            except Exception as e:
+                log_debug(f"Health fetch error: {_fmt_exc(e)[:120]}")
+
+            try:
+                usage_unified = fut_usage.result(timeout=_tw_usage)
+                if usage_unified and usage_unified.get("summary"):
+                    usage_data = usage_unified["summary"]
+                    result["usage"] = {
+                        "utilization_rate": usage_data.get(
+                            "utilization_rate", "N/A"
+                        ),
+                        "util_emoji": usage_data.get(
+                            "util_emoji", ":white_circle:"
+                        ),
+                        "cloud_aov": usage_data.get("cloud_aov", "Unknown"),
+                        "gmv_util": usage_data.get("gmv_util"),
+                        "source": usage_data.get("source", ""),
+                    }
+                    result["usage_raw_rows"] = usage_unified.get("raw_rows", [])
+                    log_debug(
+                        f"✓ Usage: {usage_data.get('utilization_rate')} "
+                        f"({usage_data.get('source')})"
+                    )
+            except Exception as e:
+                log_debug(f"Usage fetch error: {_fmt_exc(e)[:120]}")
+
+            try:
+                if fut_aov:
+                    renewal_data = fut_aov.result(timeout=_tw_renew)
+                    if renewal_data:
+                        result["renewal_aov"] = renewal_data
+                        if result["usage"].get("cloud_aov") == "Unknown":
+                            result["usage"]["cloud_aov"] = fmt_amount(
+                                renewal_data.get("renewal_aov", 0)
+                            )
+                elif (
+                    renewal_prefetch
+                    and result["usage"].get("cloud_aov") == "Unknown"
+                ):
+                    result["usage"]["cloud_aov"] = fmt_amount(
+                        renewal_prefetch.get("renewal_aov", 0)
+                    )
+            except Exception as e:
+                log_debug(f"Renewal AOV error: {str(e)[:60]}")
+
+            try:
+                if fut_ari:
+                    ari_data = fut_ari.result(timeout=_tw_ari)
+                    if ari_data:
+                        result["ari"] = {
+                            "probability": ari_data.get("ATTRITION_PROBA"),
+                            "category": ari_data.get(
+                                "ATTRITION_PROBA_CATEGORY", "Unknown"
+                            ),
+                            "reason": ari_data.get("ATTRITION_REASON", "N/A"),
+                        }
+            except Exception as e:
+                log_debug(f"ARI fetch error: {str(e)[:60]}")
 
     if result["ari"]["category"] == "Unknown":
         try:
@@ -839,6 +1366,17 @@ def enrich_account(
         )
 
     log_debug(f"✓ enrich_account took {time.time() - start:.2f}s")
+    return result
+
+
+def enrich_account_cached(account_id, opty_id=None, cloud=None, **kwargs):
+    key = f"{to_15_char_id(account_id)}|{opty_id or ''}|{cloud or ''}"
+    cached = _cache_get(_account_enrich_cache, key)
+    if cached is not None:
+        log_debug(f"enrich_account cache HIT: {account_id}")
+        return cached
+    result = enrich_account(account_id, opty_id, cloud, **kwargs)
+    _cache_set(_account_enrich_cache, key, result)
     return result
 
 
@@ -917,7 +1455,7 @@ def get_customer_health(account_id):
     rows = run_query(
         sql,
         [account_id, account_id],
-        statement_timeout=_env_int("SNOWFLAKE_HEALTH_STATEMENT_TIMEOUT", 45),
+        statement_timeout=_env_int("SNOWFLAKE_HEALTH_STATEMENT_TIMEOUT", 90),
     )
 
     if not rows:
@@ -1138,6 +1676,7 @@ def get_open_renewal_from_snowflake(
             RENEWAL_KEY_RISK_CAT,
             RENEWAL_RISK_DETAIL,
             CSG_TERRITORY,
+            CSG_AREA,
             CSG_GEO,
             TARGET_CLOUD,
             ACCOUNT_SECTOR_NM,
@@ -1182,6 +1721,7 @@ def get_open_renewal_from_snowflake(
                 "risk_category": r.get("RENEWAL_KEY_RISK_CAT") or "",
                 "risk_detail": r.get("RENEWAL_RISK_DETAIL") or "",
                 "csg_territory": r.get("CSG_TERRITORY") or "",
+                "csg_area": r.get("CSG_AREA") or "",
                 "csg_geo": r.get("CSG_GEO") or "",
                 "target_cloud": r.get("TARGET_CLOUD") or "",
                 "account_sector": r.get("ACCOUNT_SECTOR_NM") or "",
@@ -1297,7 +1837,11 @@ def get_account_attrition_all(account_id: str) -> dict[str, Any]:
         ORDER BY ATTRITION_PIPELINE DESC NULLS LAST
         LIMIT 50
     """
-    raw = run_query(sql, params)
+    raw = run_query(
+        sql,
+        params,
+        statement_timeout=_env_int("SNOWFLAKE_ATTRITION_STATEMENT_TIMEOUT", 90),
+    )
     all_products = [_normalize_attrition_row(r) for r in raw]
     return {"all": all_products, "raw": raw}
 
@@ -1446,6 +1990,7 @@ def format_enrichment_for_display(enrichment: dict) -> dict:
         result["csg_territory"] = (str(ct).strip() if ct else "") or ""
         result["territory"] = (
             renewal.get("csg_territory")
+            or renewal.get("csg_area")
             or renewal.get("csg_geo")
             or "N/A"
         )
@@ -1569,6 +2114,7 @@ def resolve_account_from_snowflake(
                     ren.RENEWAL_PRIOR_ANNUAL_CONTRACT_VALUE_CONV AS RENEWAL_AOV,
                     ren.RENEWAL_FCAST_ATTRITION_CONV             AS RENEWAL_ATR_SNOW,
                     ren.CSG_TERRITORY,
+                    ren.CSG_AREA,
                     ren.CSG_GEO,
                     ren.TARGET_CLOUD
                 FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW ren
@@ -1593,6 +2139,7 @@ def resolve_account_from_snowflake(
                     "renewal_aov": float(r.get("RENEWAL_AOV") or 0),
                     "renewal_atr_snow": abs(float(r.get("RENEWAL_ATR_SNOW") or 0)),
                     "csg_territory": r.get("CSG_TERRITORY") or "",
+                    "csg_area": r.get("CSG_AREA") or "",
                     "csg_geo": r.get("CSG_GEO") or "",
                     "target_cloud": r.get("TARGET_CLOUD") or "",
                     "priority": priority,
@@ -1627,11 +2174,24 @@ def resolve_account_from_snowflake(
             "renewal_aov": float(best.get("renewal_aov") or 0),
             "renewal_atr_snow": float(best.get("renewal_atr_snow") or 0),
             "csg_territory": best.get("csg_territory") or "",
+            "csg_area": best.get("csg_area") or "",
             "csg_geo": best.get("csg_geo") or "",
             "target_cloud": best.get("target_cloud") or "",
         }
 
     return _resolve_account_from_snowflake_css(search_clean)
+
+
+def resolve_account_from_snowflake_cached(name, cloud="Commerce Cloud"):
+    key = f"{name.lower().strip()}|{cloud}"
+    cached = _cache_get(_account_resolve_cache, key)
+    if cached is not None:
+        log_debug(f"resolve_account cache HIT: {name}")
+        return cached
+    result = resolve_account_from_snowflake(name, cloud)
+    if result:
+        _cache_set(_account_resolve_cache, key, result)
+    return result
 
 
 def get_at_risk_accounts_snowflake(

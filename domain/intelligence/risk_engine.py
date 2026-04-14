@@ -2,7 +2,6 @@
 domain/intelligence/risk_engine.py
 AI-powered risk analysis — March 30-style themes + LLM prompts, plus RiskEngine for workflows.
 """
-import re
 from typing import Any, Dict
 
 from log_utils import log_debug
@@ -165,126 +164,55 @@ def generate_risk_analysis(
     snowflake_enrichment: dict | None = None,
     call_llm_fn=None,
 ) -> tuple[str, str]:
-    """
-    Generate risk notes + recommendations via a single LLM call (two delimited sections).
-    Returns: (risk_notes, recommendation)
-    """
+    """Generate risk notes + recommendations via a single structured LLM call."""
+    from domain.analytics.snowflake_client import format_enrichment_for_claude
+
     opp = opp or {}
     red_account = red_account or {}
+    enrichment_text = format_enrichment_for_claude(snowflake_enrichment or {})
+    opp_stage = opp.get("StageName", "N/A")
+    opp_atr = opp.get("Forecasted_Attrition__c", "N/A")
+    red_reason = red_account.get("Reason__c", "") or ""
 
-    risk_reason = str(opp.get("License_At_Risk_Reason__c") or "")
-    risk_detail = str(opp.get("ACV_Reason_Detail__c") or "")
-    description = str(opp.get("Description") or "")
+    prompt = f"""You are a Salesforce renewal risk analyst. Analyze this account and respond in EXACTLY this format:
 
-    classification = classify_risk_situation(risk_reason, risk_detail, description)
-    theme = classification["theme"]
-    recs = RISK_RECOMMENDATION_MAP.get(theme, {}).get("recommendations", [])
+RISK_NOTES:
+<2-3 bullet points on key risks>
 
-    ari, health, usage, workflow_product_lines = _enrichment_slices(snowflake_enrichment)
+RECOMMENDATION:
+<1-2 bullet points on recommended actions>
 
-    atr_fmt = _forecasted_atr_amount(opp)
-    ari_prob = ari.get("probability", "N/A")
-    if ari_prob is not None and ari_prob != "" and not isinstance(ari_prob, str):
-        try:
-            ari_prob = f"{float(ari_prob):.1f}"
-        except (TypeError, ValueError):
-            ari_prob = str(ari_prob)
-
-    sf_extra = ""
-    if workflow_product_lines:
-        sf_extra = f"\nProduct signals:\n{workflow_product_lines}\n"
-
-    context = f"""
 Account: {account_name}
-Risk Theme: {theme}
-Forecasted Attrition: ${atr_fmt:,.0f}
+Stage: {opp_stage}
+Forecasted ATR: {opp_atr}
+Red Account Reason: {red_reason}
+{enrichment_text}"""
 
-Snowflake Signals:
-- ARI Category: {ari.get("category", "Unknown")}
-- ARI Probability: {ari_prob}%
-- Health Score: {health.get("overall_score", "Unknown")} ({health.get("overall_literal", "Unknown")})
-- Utilization: {usage.get("utilization_rate", "Unknown")}
-- Cloud AOV: {usage.get("cloud_aov", "Unknown")}
-{sf_extra}
-Red Account: {red_account.get("Stage__c", "None") if red_account else "None"}
-Manager Notes: {description[:200] if description else "None"}
-Risk Reason: {risk_reason}
-Risk Detail: {risk_detail}
-"""
-
-    fallback_notes = (
-        f"- Forecasted attrition: ${atr_fmt:,.0f}\n"
-        f"- Risk theme: {theme}\n"
-        f"- ARI category: {ari.get('category', 'Unknown')}"
-    )
-    fallback_recommendation = (
-        "\n".join(f"- {r}" for r in recs[:2])
-        if recs
-        else "- Executive engagement recommended\n- Review adoption metrics"
+    system_prompt = (
+        "You are a concise Salesforce renewal analyst. "
+        "Always respond with exactly two sections: RISK_NOTES: and RECOMMENDATION:"
     )
 
     if not call_llm_fn:
-        return fallback_notes.strip(), fallback_recommendation.strip()
-
-    playbook = (
-        "\n".join(f"- {r}" for r in recs)
-        if recs
-        else "- Use sound renewal judgment based on context."
-    )
-
-    prompt = (
-        "You are a Senior Salesforce PM analyst. Use the account context below.\n\n"
-        + context.strip()
-        + "\n\nStandard recommendation themes (use where relevant):\n"
-        + playbook
-        + "\n\nRespond in EXACTLY this structure. Plain text only: no emojis, no markdown "
-        "bold, no pipe (|) characters. Each bullet must start with \"- \" and stay under "
-        "20 words.\n\n"
-        "RISK_NOTES:\n"
-        "- (three bullets: key attrition risk signals)\n\n"
-        "RECOMMENDATIONS:\n"
-        "- (two bullets: specific actions for the account team)\n"
-    )
-
-    risk_notes = fallback_notes.strip()
-    recommendation = fallback_recommendation.strip()
+        return "Data unavailable", "Review manually"
 
     try:
-        llm_response = call_llm_fn(
-            prompt,
-            system_prompt=(
-                "Senior Salesforce PM. Output only the RISK_NOTES and RECOMMENDATIONS "
-                "sections exactly as requested."
-            ),
-            max_tokens=700,
-        )
+        raw = call_llm_fn(prompt, system_prompt=system_prompt, max_tokens=500)
+        if not raw:
+            return "Data unavailable", "Review manually"
+
+        risk_notes, recommendation = "N/A", "N/A"
+        if "RISK_NOTES:" in raw and "RECOMMENDATION:" in raw:
+            parts = raw.split("RECOMMENDATION:", 1)
+            risk_notes = parts[0].replace("RISK_NOTES:", "").strip()
+            recommendation = parts[1].strip()
+        else:
+            risk_notes = raw.strip()
+
+        return risk_notes, recommendation
     except Exception as e:
         log_debug(f"Combined risk analysis LLM error: {str(e)[:100]}")
-        llm_response = ""
-
-    if llm_response and str(llm_response).strip():
-        raw = str(llm_response).strip()
-        parts = re.split(r"RECOMMENDATIONS\s*:", raw, maxsplit=1, flags=re.IGNORECASE)
-        if len(parts) == 2:
-            risk_part = re.sub(
-                r"^\s*RISK_NOTES\s*:?\s*",
-                "",
-                parts[0],
-                flags=re.IGNORECASE | re.DOTALL,
-            ).strip()
-            rec_part = parts[1].strip()
-            if risk_part:
-                risk_notes = risk_part
-            else:
-                risk_notes = fallback_notes.strip()
-            if rec_part:
-                recommendation = rec_part
-            else:
-                recommendation = fallback_recommendation.strip()
-        else:
-            risk_notes = raw
-
-    return risk_notes.strip(), recommendation.strip()
+        return f"Risk analysis unavailable: {str(e)[:60]}", "Review manually"
 
 
 class RiskEngine:

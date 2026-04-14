@@ -1,5 +1,7 @@
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 import os
 import re
 import sys
@@ -19,6 +21,8 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 load_dotenv(os.path.join(_ROOT, ".env"))
 import server  # side effect: startup env validation (see server._should_run_startup_env_validation)
+from domain.tracking.account_tracker import setup_tracking_tables
+from services.daily_pulse_workflow import run_daily_pulse
 from log_utils import log_error
 
 slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -29,6 +33,66 @@ if not slack_bot_token:
     )
 
 app = App(token=slack_bot_token)
+_pulse_scheduler = None
+
+
+def on_startup():
+    """Initialize required DB tables on bot startup."""
+    try:
+        setup_tracking_tables()
+        print("✓ Tracking tables initialized")
+    except Exception as e:
+        log_error(f"Failed to initialize tracking tables: {e}")
+
+
+on_startup()
+
+
+def setup_pulse_scheduler():
+    """Setup pulse schedule from env (daily/weekly/hourly)."""
+    global _pulse_scheduler
+    frequency = os.getenv("PULSE_FREQUENCY", "daily").lower()
+    schedule_time = os.getenv("PULSE_SCHEDULE_TIME", "09:00")
+    pulse_channel = os.getenv("PULSE_CHANNEL", "").strip() or None
+
+    try:
+        hour_s, minute_s = schedule_time.split(":")
+        hour = int(hour_s)
+        minute = int(minute_s)
+    except Exception:
+        hour, minute = 9, 0
+        print("⚠️ Invalid PULSE_SCHEDULE_TIME; defaulting to 09:00")
+
+    scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+    if frequency == "daily":
+        trigger = CronTrigger(hour=hour, minute=minute)
+        print(f"✓ Scheduling daily pulse at {hour:02d}:{minute:02d} IST")
+    elif frequency == "weekly":
+        trigger = CronTrigger(day_of_week="mon", hour=hour, minute=minute)
+        print(f"✓ Scheduling weekly pulse (Mon) at {hour:02d}:{minute:02d} IST")
+    elif frequency == "hourly":
+        trigger = CronTrigger(minute=minute)
+        print(f"✓ Scheduling hourly pulse at :{minute:02d} (testing)")
+    else:
+        trigger = CronTrigger(hour=hour, minute=minute)
+        print(
+            f"⚠️ Unknown PULSE_FREQUENCY={frequency}; "
+            f"defaulting daily at {hour:02d}:{minute:02d} IST"
+        )
+
+    scheduler.add_job(
+        lambda: run_daily_pulse(app.client, pulse_channel),
+        trigger=trigger,
+        id="daily_pulse",
+        name="Daily Pulse",
+        replace_existing=True,
+    )
+    scheduler.start()
+    _pulse_scheduler = scheduler
+    print("✓ Pulse scheduler started")
+
+
+setup_pulse_scheduler()
 
 
 def _resolve_atr_for_tldr(snowflake_display: dict | None, opp: dict | None) -> str:
@@ -973,9 +1037,10 @@ def attrition_risk_cmd(ack, say, command, client):
 
         def process():
             from domain.analytics.snowflake_client import (
-                enrich_account,
+                enrich_account_cached,
                 format_enrichment_for_display,
                 get_account_attrition,
+                resolve_account_from_snowflake_cached,
             )
             from domain.content.canvas_builder import build_account_brief_blocks
             from domain.intelligence.risk_engine import generate_risk_analysis
@@ -1066,6 +1131,24 @@ def attrition_risk_cmd(ack, say, command, client):
                 acct = resolve_account_enhanced(
                     account_name_input, cloud=detected_cloud
                 )
+                if not acct:
+                    snow = resolve_account_from_snowflake_cached(
+                        account_name_input, cloud=detected_cloud
+                    )
+                    if snow:
+                        acct = {
+                            "id": snow.get("account_id"),
+                            "name": snow.get("account_name"),
+                            "opty_id": snow.get("opty_id") or "",
+                            "renewal_prefetch": {
+                                "renewal_aov": snow.get("renewal_aov"),
+                                "renewal_atr_snow": snow.get("renewal_atr_snow"),
+                                "csg_territory": snow.get("csg_territory") or "",
+                                "csg_area": snow.get("csg_area") or "",
+                                "csg_geo": snow.get("csg_geo") or "",
+                                "target_cloud": snow.get("target_cloud") or "",
+                            },
+                        }
 
                 if not acct:
                     uid = command.get("user_id") or ""
@@ -1094,7 +1177,9 @@ def attrition_risk_cmd(ack, say, command, client):
             # Snowflake enrichment (parallel)
             opty_id = opp.get("Id", "") if opp else ""
             with ThreadPoolExecutor(max_workers=2) as ex:
-                fut_enrich = ex.submit(enrich_account, account_id, opty_id, detected_cloud)
+                fut_enrich = ex.submit(
+                    enrich_account_cached, account_id, opty_id, detected_cloud
+                )
                 fut_attrition = ex.submit(get_account_attrition, account_id, cloud=detected_cloud)
                 enrichment = fut_enrich.result()
                 product_attrition = fut_attrition.result()
@@ -1220,15 +1305,20 @@ def gm_review_canvas(ack, say, command, client):
             "- `/gm-review-canvas Adidas AG, Oxford Industries`\n"
             "- `/gm-review-canvas Commerce Cloud, Adidas AG, Oxford Industries`\n"
             "- `/gm-review-canvas 006XXXXXXXXXXXX`\n\n"
-            ":bulb: Tip: Cloud name is optional; it defaults to *Commerce Cloud*.\n"
-            "_You can list *up to ~15 accounts* per command (parallel batches of up to 8)._"
+            ":bulb: Tip: Cloud name is optional; it defaults to *Commerce Cloud* "
+            "(or is inferred from the first *Opportunity Id* when you list only `006…` ids).\n"
+            "_You can list several accounts or opp IDs; they run *one at a time* by default "
+            "(set `GM_REVIEW_MAX_CONCURRENT` in `.env` only if your Snowflake pool can handle parallel bursts)._"
         )
         return
+
+    import re as _re_gm_opp_id
 
     from filter_parser import CLOUD_KEYWORDS, parse_filters
 
     filters = parse_filters(text)
     detected_cloud = filters.get("cloud", "Commerce Cloud")
+    cloud_explicit = bool(filters.get("cloud_explicit"))
 
     cloud_lower = {kw.lower() for kw in CLOUD_KEYWORDS}
     raw_parts = [p.strip() for p in text.split(",") if p.strip()]
@@ -1237,6 +1327,22 @@ def gm_review_canvas(ack, say, command, client):
         if part.lower() in cloud_lower:
             continue
         inputs.append(part)
+
+    def _token_is_sf_opportunity_id(token: str) -> bool:
+        return bool(
+            _re_gm_opp_id.match(r"^006[A-Za-z0-9]{12,18}$", (token or "").strip())
+        )
+
+    if (
+        not cloud_explicit
+        and inputs
+        and all(_token_is_sf_opportunity_id(p) for p in inputs)
+    ):
+        from domain.salesforce.org62_client import infer_cloud_from_opportunity_id
+
+        inferred = infer_cloud_from_opportunity_id(inputs[0].strip())
+        if inferred:
+            detected_cloud = inferred
 
     if not inputs:
         say(
@@ -1249,7 +1355,7 @@ def gm_review_canvas(ack, say, command, client):
     say(
         f":hourglass_flowing_sand: Generating GM reviews for *{len(inputs)}* account(s) "
         f"in *{detected_cloud}*…\n"
-        "_This may take 30–60 seconds._"
+        "_Accounts run sequentially by default — large batches may take several minutes._"
     )
 
     def process():
@@ -1262,7 +1368,6 @@ def gm_review_canvas(ack, say, command, client):
 
             workflow = GMReviewWorkflow(
                 call_llm_fn=server.call_llm_gateway_with_retry,
-                max_concurrent=5,
             )
 
             today_hdr = date_type.today().strftime("%A, %B %d, %Y")
@@ -1550,6 +1655,32 @@ def at_risk_canvas(ack, say, command, client):
     import threading
 
     threading.Thread(target=process).start()
+
+
+@app.command("/pulse-now")
+def handle_pulse_now(ack, say, command, client):
+    """
+    Manual trigger for daily pulse — testing and on-demand runs.
+    Usage: /pulse-now
+           /pulse-now C1234567890
+    """
+    ack()
+    try:
+        user_id = command.get("user_id")
+        text = (command.get("text") or "").strip()
+
+        # Optional channel override by ID; otherwise DM the requester.
+        if text and text[0] in ("C", "G", "D"):
+            target_channel = text
+        else:
+            target_channel = user_id
+
+        say("⏳ Running pulse now...")
+        run_daily_pulse(client, target_channel=target_channel)
+        say("✅ Pulse completed.")
+    except Exception as e:
+        log_error(f"pulse-now failed: {e}")
+        say(f":x: Pulse failed: {str(e)}")
 
 
 if __name__ == "__main__":
