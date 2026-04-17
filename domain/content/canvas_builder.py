@@ -1,7 +1,9 @@
+import os
 """
 domain/content/canvas_builder.py
 Canvas generation for Slack (account brief blocks + GM Review markdown).
 """
+import os
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -588,6 +590,27 @@ def build_canvas_row(
     }
 
 
+def build_review_row(
+    opp: dict,
+    account: dict,
+    red_account: dict,
+    snowflake_display: dict,
+    risk_notes: str,
+    recommendation: str,
+    cloud: str = "Commerce Cloud",
+) -> dict:
+    """Alias for list/table outputs (keeps data-only row shape)."""
+    return build_canvas_row(
+        opp=opp,
+        account=account,
+        red_account=red_account,
+        snowflake_display=snowflake_display,
+        risk_notes=risk_notes,
+        recommendation=recommendation,
+        cloud=cloud,
+    )
+
+
 def build_gm_review_canvas_markdown(
     reviews: list,
     cloud: str = "Commerce Cloud",
@@ -647,7 +670,10 @@ def build_gm_review_canvas_markdown(
 
         ari_cat = display.get("ari_category", "Unknown")
         ari_prob = display.get("ari_probability", "N/A")
-        ari_cell = f"{ari_cat} ({ari_prob})"
+        if str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+            ari_cell = "N/A"
+        else:
+            ari_cell = f"{ari_cat} ({ari_prob})"
 
         renewal_aov = float(
             enrichment.get("renewal_aov", {}).get("renewal_aov", 0) or 0

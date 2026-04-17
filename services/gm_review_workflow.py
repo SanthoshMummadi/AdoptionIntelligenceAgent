@@ -183,7 +183,6 @@ class GMReviewWorkflow:
             enrich_account_cached,
             resolve_account_from_snowflake_cached,
         )
-        from domain.content.canvas_builder import build_gm_review_canvas_markdown
         from domain.salesforce.org62_client import resolve_account_enhanced
 
         clear_usage_snapshot_cache()
@@ -312,14 +311,7 @@ class GMReviewWorkflow:
             }
             for r in reviews
         ]
-        combined_canvas = build_gm_review_canvas_markdown(
-            reviews=canvas_reviews,
-            cloud=cloud,
-            filter_label=canvas_filter,
-            today=canvas_today,
-        )
-
-        return {"reviews": reviews, "combined_canvas": combined_canvas}
+        return {"reviews": reviews, "canvas_reviews": canvas_reviews, "combined_canvas": ""}
 
     def _generate_review(
         self,

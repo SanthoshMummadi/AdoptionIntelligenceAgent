@@ -18,6 +18,17 @@ from log_utils import log_debug, log_error, log_structured
 
 load_dotenv()
 
+_RENEWAL_VIEWS_PRIORITY = [
+    "SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW",
+    "SSE_DM_CSG_RPT_PRD.RENEWALS.CI_NEAR_REALTIME_RENEWAL_OPTY_VW",
+    "SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW",
+]
+
+
+def _get_renewal_view() -> str:
+    """Returns first accessible renewal view from priority list."""
+    return _RENEWAL_VIEWS_PRIORITY[0]
+
 def _fmt_exc(e: BaseException) -> str:
     msg = str(e) if e is not None else ""
     if msg:
@@ -325,6 +336,43 @@ def cloud_aov_label(cloud: str | None) -> str:
     parts = c.split()
     first = parts[0] if parts else "Cloud"
     return f"{first} AOV"
+
+
+def _renewal_cloud_filter_sql(cloud: str, alias: str = "") -> str:
+    """Predicate for renewal-view cloud matching against semicolon-style TARGET_CLOUD values."""
+    prefix = f"{alias}." if alias else ""
+    cloud_raw = str(cloud or "").strip()
+    cloud_low = cloud_raw.lower()
+
+    if "financial services" in cloud_low or cloud_raw.upper() == "FSC":
+        return (
+            f"({prefix}TARGET_CLOUD LIKE '%%Core%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%Industries%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%Salesforce Industry%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Financial Services%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%FSC%%')"
+        )
+
+    if "commerce" in cloud_low:
+        return (
+            f"({prefix}TARGET_CLOUD LIKE '%%Commerce Cloud%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%B2C%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%B2B Commerce%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%Order Management%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%OMS%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%Digital%%' "
+            f"OR {prefix}TARGET_CLOUD LIKE '%%Merch%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Commerce%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%B2C%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%B2B%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Order Management%%')"
+        )
+
+    cloud_safe = cloud_raw.replace("'", "''").replace("%", "%%")
+    return (
+        f"({prefix}TARGET_CLOUD LIKE '%%{cloud_safe}%%' "
+        f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%')"
+    )
 
 
 _pool: Queue = Queue(maxsize=POOL_SIZE)
@@ -1301,6 +1349,7 @@ def enrich_account(
     """
     start = time.time()
     account_id_15 = to_15_char_id(account_id)
+    css_skip = str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on")
 
     result = {
         "ari": {
@@ -1397,25 +1446,28 @@ def enrich_account(
             log_debug(f"ARI fetch error: {str(e)[:60]}")
 
     if _hierarchy_usage:
-        _phase1_health()
+        if not css_skip:
+            _phase1_health()
         _phase1_usage()
         _phase1_renew()
-        _phase1_ari()
+        if not css_skip:
+            _phase1_ari()
     else:
         with ThreadPoolExecutor(max_workers=4) as ex:
-            fut_health = ex.submit(get_customer_health, account_id_15)
+            fut_health = ex.submit(get_customer_health, account_id_15) if not css_skip else None
             fut_usage = ex.submit(get_usage_unified, usage_target, cloud)
             fut_aov = (
                 ex.submit(get_renewal_aov, opty_id)
                 if (not renewal_prefetch and opty_id)
                 else None
             )
-            fut_ari = ex.submit(get_ari_score, opty_id) if opty_id else None
+            fut_ari = ex.submit(get_ari_score, opty_id) if (opty_id and not css_skip) else None
 
             try:
-                health_data = fut_health.result(timeout=_tw_health)
-                if health_data:
-                    result["health"] = health_data
+                if fut_health is not None:
+                    health_data = fut_health.result(timeout=_tw_health)
+                    if health_data:
+                        result["health"] = health_data
             except Exception as e:
                 log_debug(f"Health fetch error: {_fmt_exc(e)[:120]}")
 
@@ -1475,7 +1527,7 @@ def enrich_account(
             except Exception as e:
                 log_debug(f"ARI fetch error: {str(e)[:60]}")
 
-    if result["ari"]["category"] == "Unknown":
+    if (not css_skip) and result["ari"]["category"] == "Unknown":
         try:
             att = get_account_attrition_all_cached(account_id_15)
             all_products = filter_products_by_cloud(att.get("all", []), cloud)
@@ -1523,6 +1575,8 @@ def enrich_account_cached(account_id, opty_id=None, cloud=None, **kwargs):
 
 def get_ari_score(opty_id):
     """Get ARI for specific opportunity - CORRECTED: Use 15-char ID and MAX(SNAPSHOT_DT)"""
+    if str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+        return None
     if not opty_id:
         return None
     opty_id_15 = to_15_char_id(opty_id)
@@ -1544,6 +1598,8 @@ def get_ari_score(opty_id):
 
 def get_ari_score_by_account(account_id: str, cloud: str | None = "Commerce Cloud") -> list:
     """ARI rows for account on latest CSS ATTRITION_PREDICTION_ACCT_PRODUCT snapshot."""
+    if str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+        return []
     base = [
         "ACCOUNT_ID = %s",
         "SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM "
@@ -1583,6 +1639,8 @@ def get_customer_health(account_id):
     ``MAX(SNAPSHOT_DT)`` scoped to this ``ACCOUNT_ID`` in the subquery (avoids a
     full-table max). Literals are normalized to Green/Yellow/Red/Unknown below.
     """
+    if str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+        return {}
     sql = """
         SELECT CATEGORY, SUB_CATEGORY,
                OVERALL_SCORE, CATEGORY_SCORE,
@@ -1714,19 +1772,23 @@ def get_renewal_aov(opty_id):
     if not opty_id:
         return {}
     opty_id_15 = to_15_char_id(opty_id)
+    renewal_view = _get_renewal_view()
     pinned = (os.getenv("SNOWFLAKE_RENEWAL_AS_OF_DATE") or "").strip()
     if not pinned:
         pv = _usage_snapshot_cache.get("renewal_as_of_date")
         pinned = str(pv).strip() if pv is not None else ""
 
-    if pinned:
+    if pinned and renewal_view.endswith("WV_CI_RENEWAL_OPTY_SNAP_VW"):
         as_of_fragment = "AND AS_OF_DATE = %s"
         as_of_bind = [pinned]
-    else:
+    elif renewal_view.endswith("WV_CI_RENEWAL_OPTY_SNAP_VW"):
         as_of_fragment = """AND AS_OF_DATE = (
             SELECT MAX(AS_OF_DATE)
             FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
         )"""
+        as_of_bind = []
+    else:
+        as_of_fragment = ""
         as_of_bind = []
 
     sql = f"""
@@ -1756,12 +1818,15 @@ def get_renewal_aov(opty_id):
             AE_ROLE_NM,
             ACCT_CSM,
             RENEWAL_OPTY_OWNR_NM,
+            CONV_PRICE_UPLIFT_FORECAST_AMOUNT,
+            MANAGER_FORECAST_JUDGEMENT,
+            EARLY_RENEWAL_FLAG,
+            DRVD_BU,
             ACCT_AOV_BAND,
             CNTR_AOV_BAND,
             SUCCESS_SEGMENT,
-            SEM_NT,
             SPECIALIST_SL_NT
-        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
+        FROM {renewal_view}
         WHERE RENEWAL_OPTY_ID = %s
         {as_of_fragment}
         LIMIT 1
@@ -1811,7 +1876,6 @@ def get_renewal_aov(opty_id):
             "renewal_status": str(stg or ""),
             "risk_category": r.get("RENEWAL_KEY_RISK_CAT") or "",
             "risk_detail": r.get("RENEWAL_RISK_DETAIL") or "",
-            "sem_notes": r.get("SEM_NT") or "",
             "specialist_notes": r.get("SPECIALIST_SL_NT") or "",
             "renewal_close_date": str(r.get("RENEWAL_CLSD_DT") or ""),
             "renewal_close_month": str(r.get("RENEWAL_CLOSE_MONTH") or ""),
@@ -1838,15 +1902,22 @@ def get_open_renewal_from_snowflake(
     Returns keys aligned with ``get_renewal_aov`` (static fields; Snowflake FCAST as
     ``renewal_atr_snow`` baseline only).
     """
+    if str(os.getenv("SNOWFLAKE_RENEWAL_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+        return None
+
+    renewal_view = _get_renewal_view()
     pinned = (os.getenv("SNOWFLAKE_RENEWAL_AS_OF_DATE") or "").strip()
-    if pinned:
+    if pinned and renewal_view.endswith("WV_CI_RENEWAL_OPTY_SNAP_VW"):
         as_of_fragment = "AND AS_OF_DATE = %s"
         as_of_bind = [pinned]
-    else:
+    elif renewal_view.endswith("WV_CI_RENEWAL_OPTY_SNAP_VW"):
         as_of_fragment = """AND AS_OF_DATE = (
             SELECT MAX(AS_OF_DATE)
             FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
         )"""
+        as_of_bind = []
+    else:
+        as_of_fragment = ""
         as_of_bind = []
 
     is_fsc = (
@@ -1855,19 +1926,9 @@ def get_open_renewal_from_snowflake(
     )
 
     if is_fsc:
-        cloud_filter = (
-            "(TARGET_CLOUD LIKE '%%Core%%' "
-            "OR TARGET_CLOUD LIKE '%%Industries%%' "
-            "OR TARGET_CLOUD LIKE '%%Salesforce Industry%%' "
-            "OR RENEWAL_OPTY_NM LIKE '%%Financial Services%%' "
-            "OR RENEWAL_OPTY_NM LIKE '%%FSC%%')"
-        )
+        cloud_filter = _renewal_cloud_filter_sql(cloud)
     else:
-        cloud_safe = str(cloud).strip().replace("'", "''").replace("%", "%%")
-        cloud_filter = (
-            f"(TARGET_CLOUD LIKE '%%{cloud_safe}%%' "
-            f"OR RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%')"
-        )
+        cloud_filter = _renewal_cloud_filter_sql(cloud)
 
     search_clean = str(search).strip()
     search_safe = search_clean.replace("'", "''").replace("%", "%%")
@@ -1900,7 +1961,7 @@ def get_open_renewal_from_snowflake(
             RENEWAL_CLSD_DT,
             ACCT_AOV_BAND,
             SUCCESS_SEGMENT
-        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
+        FROM {renewal_view}
         WHERE {cloud_filter}
         AND (
             ACCOUNT_NM       LIKE '%%{search_safe}%%'
@@ -2049,6 +2110,8 @@ def get_account_attrition_all(account_id: str) -> dict[str, Any]:
     Returns normalized ``all`` rows plus ``raw`` Snowflake dicts. Callers filter by cloud with
     ``filter_products_by_cloud`` to avoid a second round-trip.
     """
+    if str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+        return {"all": [], "raw": []}
     conditions = [
         "ACCOUNT_ID = %s",
         "SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM "
@@ -2091,6 +2154,8 @@ def get_account_attrition(account_id: str, cloud: str | None = "Commerce Cloud")
     Product-level attrition on latest CSS snapshot.
     ``cloud=None`` (or empty / ``All Clouds``): all products, no APM cloud predicate.
     """
+    if str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+        return []
     conditions = [
         "ACCOUNT_ID = %s",
         "SNAPSHOT_DT = (SELECT MAX(SNAPSHOT_DT) FROM "
@@ -2274,6 +2339,9 @@ def format_enrichment_for_claude(enrichment: dict) -> str:
 
 def _resolve_account_from_snowflake_css(account_name: str) -> Optional[dict]:
     """Last-resort name match on latest CSS attrition snapshot."""
+    if str(os.getenv("SNOWFLAKE_CSS_SKIP") or "").strip() in ("1", "true", "yes", "on"):
+        return None
+
     if not account_name:
         return None
     try:
@@ -2320,14 +2388,17 @@ def resolve_account_from_snowflake(
     if not name:
         return None
 
+    renewal_view = _get_renewal_view()
     pinned = (os.getenv("SNOWFLAKE_RENEWAL_AS_OF_DATE") or "").strip()
-    if pinned:
+    if pinned and renewal_view.endswith("WV_CI_RENEWAL_OPTY_SNAP_VW"):
         as_of_fragment = "AND ren.AS_OF_DATE = %s"
-    else:
+    elif renewal_view.endswith("WV_CI_RENEWAL_OPTY_SNAP_VW"):
         as_of_fragment = """AND ren.AS_OF_DATE = (
                     SELECT MAX(AS_OF_DATE)
                     FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW
                 )"""
+    else:
+        as_of_fragment = ""
 
     search_clean = name.strip()
     search_stripped = re.sub(
@@ -2349,24 +2420,9 @@ def resolve_account_from_snowflake(
             )
             # LIKE literals use %% — Snowflake connector runs sql % params (pyformat).
             if is_fsc:
-                cloud_filter = (
-                    "(ren.TARGET_CLOUD LIKE '%%Core%%' "
-                    "OR ren.TARGET_CLOUD LIKE '%%Industries%%' "
-                    "OR ren.TARGET_CLOUD LIKE '%%Salesforce Industry%%' "
-                    "OR ren.RENEWAL_OPTY_NM LIKE '%%Financial Services%%' "
-                    "OR ren.RENEWAL_OPTY_NM LIKE '%%FSC%%')"
-                )
+                cloud_filter = _renewal_cloud_filter_sql(cloud, alias="ren")
             else:
-                cloud_safe = (
-                    str(cloud)
-                    .strip()
-                    .replace("'", "''")
-                    .replace("%", "%%")
-                )
-                cloud_filter = (
-                    f"(ren.TARGET_CLOUD LIKE '%%{cloud_safe}%%' "
-                    f"OR ren.RENEWAL_OPTY_NM LIKE '%%{cloud_safe}%%')"
-                )
+                cloud_filter = _renewal_cloud_filter_sql(cloud, alias="ren")
 
             sql = f"""
                 SELECT
@@ -2379,11 +2435,16 @@ def resolve_account_from_snowflake(
                     ren.CSG_AREA,
                     ren.CSG_GEO,
                     ren.TARGET_CLOUD
-                FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_SNAP_VW ren
+                FROM {renewal_view} ren
                 WHERE ren.ACCOUNT_NM LIKE %s
                 AND {cloud_filter}
-                AND ren.RENEWAL_STG_NM NOT LIKE '%%Closed%%'
-                AND ren.RENEWAL_STG_NM NOT LIKE '%%Dead%%'
+                AND ren.RENEWAL_STG_NM NOT IN (
+                    'Dead Attrition', '05 Closed', 'Dead - Duplicate',
+                    'Dead - No Decision', 'Dead - No Opportunity',
+                    'NP - Dead Duplicate', '08 - Closed', 'Closed',
+                    'Closed and referral paid', 'Loss - Off Contract',
+                    'UNKNOWN', 'Courtesy'
+                )
                 {as_of_fragment}
                 ORDER BY ren.RENEWAL_AMT_CONV DESC NULLS LAST
                 LIMIT 1

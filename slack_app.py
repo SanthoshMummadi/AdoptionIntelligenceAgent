@@ -1490,6 +1490,209 @@ def gm_review_canvas(ack, say, command, client):
     threading.Thread(target=process).start()
 
 
+def _fmt_short_money(v) -> str:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        s = str(v or "").strip()
+        return s if s else "N/A"
+    x = abs(x)
+    if x >= 1_000_000:
+        return f"${x / 1_000_000:.1f}M"
+    if x >= 1_000:
+        return f"${x / 1_000:.0f}K"
+    return f"${x:,.0f}"
+
+
+def _fmt_short_text(v, limit: int) -> str:
+    s = " ".join(str(v or "").split())
+    if not s:
+        return ""
+    return (s[: limit - 1] + "…") if len(s) > limit else s
+
+
+@app.command("/gm-review-lists")
+def gm_review_lists(ack, say, command, client):
+    """
+    Generate/update GM Review Slack List.
+    Usage: `/gm-review-lists Commerce Cloud, Adidas AG, Oxford Industries`
+    """
+    ack()
+    text = (command.get("text") or "").strip()
+    if not text:
+        say(
+            ":warning: *Usage:*\n"
+            "`/gm-review-lists <Account Names or Opp IDs>`\n"
+            "`/gm-review-lists Commerce Cloud, Acme Corp, Wayne Enterprises`\n"
+            "`/gm-review-lists 006XXXXXXXXXXXX, 006YYYYYYYYYYYY`\n\n"
+            ":bulb: Tip: Cloud is optional (defaults to Commerce Cloud)."
+        )
+        return
+
+    say(":hourglass_flowing_sand: Generating GM Review list…")
+
+    def process():
+        try:
+            from datetime import date as date_type
+
+            from domain.content.list_builder import update_slack_list
+            from filter_parser import CLOUD_KEYWORDS, parse_filters
+            from services.gm_review_bulk_workflow import run_bulk_gm_review
+            from services.gm_review_workflow import GMReviewWorkflow
+
+            filters = parse_filters(text)
+            detected_cloud = filters.get("cloud", "Commerce Cloud")
+            cloud_explicit = bool(filters.get("cloud_explicit"))
+            bulk_mode = os.getenv("GM_REVIEW_BULK_MODE", "0") == "1"
+
+            cloud_lower = {kw.lower() for kw in CLOUD_KEYWORDS}
+            raw_parts = [p.strip() for p in text.split(",") if p.strip()]
+            inputs = [p for p in raw_parts if p.lower() not in cloud_lower]
+
+            if not inputs and not bulk_mode:
+                say(
+                    ":warning: No accounts found in that command.\n"
+                    f"Detected cloud: *{detected_cloud}*"
+                )
+                return
+
+            import re as _re_gm_opp_id
+
+            def _token_is_sf_opportunity_id(token: str) -> bool:
+                return bool(
+                    _re_gm_opp_id.match(r"^006[A-Za-z0-9]{12,18}$", (token or "").strip())
+                )
+
+            if (
+                not cloud_explicit
+                and inputs
+                and all(_token_is_sf_opportunity_id(p) for p in inputs)
+            ):
+                from domain.salesforce.org62_client import infer_cloud_from_opportunity_id
+
+                inferred = infer_cloud_from_opportunity_id(inputs[0].strip())
+                if inferred:
+                    detected_cloud = inferred
+
+            today_hdr = date_type.today().strftime("%A, %B %d, %Y")
+            q = filters.get("quarter") or "Q2"
+            fy = filters.get("fy") or "FY2027"
+            filter_label = f"{detected_cloud} - {q} {fy}"
+
+            if bulk_mode:
+                reviews = run_bulk_gm_review(
+                    detected_cloud,
+                    fy=filters.get("fy"),
+                    opp_ids=filters.get("opp_ids") or [],
+                )
+            else:
+                workflow = GMReviewWorkflow(call_llm_fn=server.call_llm_gateway_with_retry)
+                out = workflow.run(
+                    inputs,
+                    cloud=detected_cloud,
+                    filter_label=filter_label,
+                    today=today_hdr,
+                )
+                reviews = out.get("canvas_reviews") or []
+            if not reviews:
+                say(":x: No reviews generated.")
+                return
+
+            list_id = (os.getenv("GM_REVIEW_LIST_ID") or "").strip()
+            if not list_id:
+                say(":warning: `GM_REVIEW_LIST_ID` not set in `.env` — list not updated.")
+                return
+
+            result = update_slack_list(client, list_id, reviews)
+            say(
+                f":white_check_mark: *GM Review List Updated!*\n"
+                f"- {result.get('updated', 0)} account(s) added\n"
+                f"- Errors: {len(result.get('errors') or [])}\n"
+                f"- Cloud: {detected_cloud}\n"
+                f"- List ID: `{list_id}`"
+            )
+        except Exception as e:
+            say(f":x: Error generating GM Review list: {str(e)[:200]}")
+            import traceback
+
+            traceback.print_exc()
+
+    import threading
+
+    threading.Thread(target=process, daemon=True).start()
+
+
+@app.command("/gm-review-sheet")
+def gm_review_sheet(ack, say, command, client):
+    """
+    Generate GM Review data and export to Google Sheets.
+    Usage: `/gm-review-sheet Commerce Cloud`
+    """
+    ack()
+    text = (command.get("text") or "").strip()
+    if not text:
+        say(
+            ":warning: *Usage:*\n"
+            "`/gm-review-sheet <Cloud or filters>`\n"
+            "`/gm-review-sheet Commerce Cloud`\n"
+            "`/gm-review-sheet Commerce Cloud, FY2027`\n\n"
+            ":bulb: Tip: This command currently runs in bulk mode."
+        )
+        return
+
+    say(":hourglass_flowing_sand: Generating GM Review sheet…")
+
+    def process():
+        try:
+            from datetime import date as date_type
+
+            from domain.integrations.gsheet_exporter import export_to_gsheet
+            from filter_parser import parse_filters
+            from services.gm_review_bulk_workflow import run_bulk_gm_review
+
+            filters = parse_filters(text)
+            detected_cloud = filters.get("cloud", "Commerce Cloud")
+            bulk_mode = os.getenv("GM_REVIEW_BULK_MODE", "0") == "1"
+            if not bulk_mode:
+                say(":x: `/gm-review-sheet` requires `GM_REVIEW_BULK_MODE=1`. Set it in `.env` and restart.")
+                return
+
+            reviews = run_bulk_gm_review(
+                detected_cloud,
+                fy=filters.get("fy"),
+                opp_ids=filters.get("opp_ids") or [],
+            )
+            if not reviews:
+                say(":x: No reviews generated.")
+                return
+
+            sheet_name = date_type.today().strftime("GM Review %Y-%m-%d")
+            sheet_url = export_to_gsheet(
+                reviews,
+                sheet_name=sheet_name,
+                cloud=detected_cloud,
+            )
+            if not sheet_url:
+                say(":warning: Sheet export completed but no URL was returned. Check bot logs.")
+                return
+
+            say(
+                f":white_check_mark: *GM Review Sheet Exported!*\n"
+                f"- Rows: {len(reviews)}\n"
+                f"- Cloud: {detected_cloud}\n"
+                f"- <{sheet_url}|View Sheet>"
+            )
+        except Exception as e:
+            say(f":x: Error generating GM Review sheet: {str(e)[:200]}")
+            import traceback
+
+            traceback.print_exc()
+
+    import threading
+
+    threading.Thread(target=process, daemon=True).start()
+
+
 @app.command("/at-risk-canvas")
 def at_risk_canvas(ack, say, command, client):
     """
@@ -1569,9 +1772,15 @@ def at_risk_canvas(ack, say, command, client):
                 )
                 AND atr.ATTRITION_PROBA_CATEGORY IN ('High', 'Medium')
                 AND atr.ACCOUNT_ID IS NOT NULL
+                AND ren.RENEWAL_STG_NM NOT IN (
+                    'Dead Attrition', '05 Closed', 'Dead - Duplicate',
+                    'Dead - No Decision', 'Dead - No Opportunity',
+                    'NP - Dead Duplicate', '08 - Closed', 'Closed',
+                    'Closed and referral paid', 'Loss - Off Contract',
+                    'UNKNOWN', 'Courtesy'
+                )
                 {where_sql}
                 ORDER BY atr.ATTRITION_PROBA DESC
-                LIMIT 50
             """
 
             cursor.execute(query)
@@ -1587,7 +1796,7 @@ def at_risk_canvas(ack, say, command, client):
                 f"({len(rows)} accounts)\n\n"
             )
 
-            for row in rows[:20]:
+            for row in rows:
                 (
                     account_id,
                     account_name,

@@ -114,7 +114,7 @@ def parse_filters(text: str) -> dict:
     region = next((v for k, v in REGION_MAP.items() if k in t), None)
 
     # FY
-    fy = next((v for k, v in FY_MAP.items() if k in t), "FY2027")
+    fy = next((v for k, v in FY_MAP.items() if k in t), None)
 
     # Quarter
     quarter = next((v for k, v in QUARTER_MAP.items() if k in t), None)
@@ -216,8 +216,15 @@ def parse_filters(text: str) -> dict:
         account_candidate_parts if is_manual else []
     )
 
-    # Opp IDs
-    opp_ids = list(dict.fromkeys(re.findall(r"006[a-zA-Z0-9]{12,18}", text)))
+    # Opp IDs (explicit tokens, 15-18 chars; keep SF opportunity prefix 006)
+    opp_ids: list[str] = []
+    for tok in re.split(r"[\s,]+", text):
+        t_tok = tok.strip()
+        if not t_tok:
+            continue
+        if re.match(r"^[0-9A-Za-z]{15,18}$", t_tok) and t_tok.startswith("006"):
+            opp_ids.append(t_tok)
+    opp_ids = list(dict.fromkeys(opp_ids))
 
     return {
         "cloud":                 cloud,

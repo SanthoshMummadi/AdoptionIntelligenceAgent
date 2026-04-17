@@ -104,6 +104,99 @@ def _safe_cell(value) -> str:
     return str(value).strip()
 
 
+def _adapt_bulk_row_for_sheet(bulk_row: dict) -> dict:
+    """
+    Map run_bulk_gm_review() row shape -> export_to_gsheet() expected shape.
+    """
+    opp_id = bulk_row.get("opportunity_id") or ""
+    atr_val = bulk_row.get("atr") or 0
+    fcast_val = bulk_row.get("forecasted_attrition") or 0
+    cc_aov_val = bulk_row.get("cc_aov") or 0
+    util = bulk_row.get("utilization_rate") or "N/A"
+    territory = bulk_row.get("territory") or ""
+    close_date = bulk_row.get("close_date") or ""
+    stage = bulk_row.get("stage") or ""
+    risk_cat = bulk_row.get("risk_category") or "Unknown"
+    risk_notes = bulk_row.get("risk_detail") or ""
+    red_notes = bulk_row.get("red_notes") or ""
+    days_red = bulk_row.get("days_red") or 0
+    sf_products = bulk_row.get("sf_products") or ""
+    swing = bulk_row.get("swing") or 0
+    ae = bulk_row.get("ae") or ""
+    renewal_mgr = bulk_row.get("renewal_manager") or ""
+    csm = bulk_row.get("csm") or ""
+    renewal_status = bulk_row.get("renewal_status") or ""
+    next_steps = bulk_row.get("next_steps") or ""
+    manager_notes = bulk_row.get("manager_notes") or ""
+
+    renewal_month = close_date[:7] if close_date else ""
+    is_red = bool(days_red or red_notes)
+    red_account = (
+        {
+            "Stage__c": "Red",
+            "days_red": days_red,
+            "Latest_Updates__c": red_notes,
+            "Days_Red__c": days_red,
+        }
+        if is_red
+        else None
+    )
+
+    return {
+        "account_name": bulk_row.get("account") or "Unknown",
+        "account_id": bulk_row.get("account_id") or "",
+        "opportunity_id": opp_id,
+        "opp": {
+            "Id": opp_id,
+            "CloseDate": close_date,
+            "StageName": stage,
+            "Forecasted_Attrition__c": fcast_val,
+            "License_At_Risk_Reason__c": risk_notes,
+            "Swing__c": swing,
+            "PAM_Comment__c": manager_notes,
+            "NextStep": next_steps,
+        },
+        "snowflake_display": {
+            "utilization_rate": util,
+            "csg_territory": territory,
+            "ari_category": risk_cat,
+            "ari_probability": "N/A",
+            "ari_reason": risk_notes,
+            "health_display": "Unknown",
+            "renewal_aov": {
+                "renewal_aov": cc_aov_val,
+                "renewal_atr_snow": atr_val,
+                "csg_territory": territory,
+                "renewal_close_month": renewal_month,
+            },
+        },
+        "enrichment": {
+            "renewal_aov": {
+                "renewal_aov": cc_aov_val,
+                "csg_territory": territory,
+                "renewal_close_month": renewal_month,
+                "ae_name": ae,
+                "renewal_manager": renewal_mgr,
+                "csm_name": csm,
+                "renewal_status": renewal_status,
+            },
+            "health": {
+                "overall_score": None,
+                "overall_literal": "Unknown",
+            },
+            "usage": {
+                "utilization_rate": util,
+            },
+        },
+        "red_account": red_account,
+        "all_products_attrition": [],
+        "recommendation": risk_notes,
+        "adoption_pov": "",
+        "sf_products_direct": bulk_row.get("sf_products") or "",
+        "adoption_pov_direct": bulk_row.get("adoption_pov") or "",
+    }
+
+
 def get_google_creds():
     """Google credentials from env (JSON string) or project-root service account files."""
     creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv(
@@ -144,7 +237,6 @@ def export_to_gsheet(
     """
     from domain.analytics.snowflake_client import (
         calculate_overall_ari,
-        cloud_aov_label,
         fmt_amount,
         get_sf_products_display,
         resolve_money,
@@ -161,6 +253,10 @@ def export_to_gsheet(
 
     sheet_name = sheet_name or date.today().strftime("GM Review %Y-%m-%d")
 
+    # Bulk workflow rows use a different shape than per-account workflow rows.
+    if reviews and "account_name" not in (reviews[0] or {}) and "account" in (reviews[0] or {}):
+        reviews = [_adapt_bulk_row_for_sheet(r) for r in reviews]
+
     try:
         creds = get_google_creds()
         gc = gspread.authorize(creds)
@@ -175,14 +271,7 @@ def export_to_gsheet(
                 ws = sh.add_worksheet(title=sheet_name, rows=500, cols=25)
 
         headers_row = list(HEADERS_22)
-        if reviews:
-            r0 = reviews[0]
-            hdr_cloud = (cloud or r0.get("cloud") or "").strip()
-            if not hdr_cloud:
-                hdr_cloud = "Commerce Cloud"
-            headers_row[2] = cloud_aov_label(hdr_cloud)
-        else:
-            headers_row[2] = "Cloud AOV"
+        headers_row[2] = "Cloud AOV"
 
         existing_row1: list = []
         try:
@@ -219,7 +308,11 @@ def export_to_gsheet(
             red = review.get("red_account")
             all_prods = review.get("all_products_attrition") or []
             recommendation = review.get("recommendation", "")
-            adoption_pov = review.get("adoption_pov") or ""
+            adoption_pov = (
+                review.get("adoption_pov_direct")
+                or review.get("adoption_pov")
+                or ""
+            )
             if not adoption_pov or isinstance(adoption_pov, dict):
                 adoption_pov = ""
             adoption_pov = str(adoption_pov).strip()
@@ -323,7 +416,11 @@ def export_to_gsheet(
             health_display = _strip_slack_emoji(
                 display.get("health_display", "Unknown")
             )
-            sf_products = get_sf_products_display(all_prods)
+            sf_products = (
+                review.get("sf_products_direct")
+                or get_sf_products_display(all_prods)
+                or "N/A"
+            )
             risk_assessment = recommendation
 
             manager_notes = str(opp.get("PAM_Comment__c") or "").strip()
