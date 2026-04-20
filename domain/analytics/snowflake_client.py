@@ -346,11 +346,12 @@ def _renewal_cloud_filter_sql(cloud: str, alias: str = "") -> str:
 
     if "financial services" in cloud_low or cloud_raw.upper() == "FSC":
         return (
-            f"({prefix}TARGET_CLOUD LIKE '%%Core%%' "
-            f"OR {prefix}TARGET_CLOUD LIKE '%%Industries%%' "
-            f"OR {prefix}TARGET_CLOUD LIKE '%%Salesforce Industry%%' "
-            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Financial Services%%' "
-            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%FSC%%')"
+            f"({prefix}RENEWAL_OPTY_NM LIKE '%%Financial Services%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%FSC%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Wealth%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Insurance%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Banking%%' "
+            f"OR {prefix}RENEWAL_OPTY_NM LIKE '%%Lending%%')"
         )
 
     if "commerce" in cloud_low:

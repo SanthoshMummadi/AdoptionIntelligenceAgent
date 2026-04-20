@@ -2,6 +2,7 @@
 domain/intelligence/risk_engine.py
 AI-powered risk analysis — March 30-style themes + LLM prompts, plus RiskEngine for workflows.
 """
+from datetime import datetime
 from typing import Any, Dict
 
 from log_utils import log_debug
@@ -119,6 +120,76 @@ def classify_risk(
         "examples": [],
         "confidence": confidence,
         "actionable": is_actionable(risk_reason),
+    }
+
+
+def build_why_explanation(
+    account: str,
+    atr: float,
+    risk_theme: str,
+    risk_notes: str,
+    utilization_rate: str,
+    days_red: int,
+    close_date: str,
+) -> dict:
+    signals = []
+    confidence = "low"
+
+    if atr >= 1000000:
+        signals.append(f"Renewal ATR -${atr:,.0f}")
+        confidence = "high"
+    elif atr >= 500000:
+        signals.append(f"Renewal ATR -${atr:,.0f}")
+        confidence = "medium"
+
+    util_raw = str(utilization_rate or "0").replace("%", "").strip()
+    try:
+        util = float(util_raw) if util_raw and util_raw != "N/A" else 0.0
+    except ValueError:
+        util = 0.0
+    if util < 10:
+        signals.append(f"Utilization critically low at {utilization_rate}")
+        confidence = "high" if confidence != "low" else "medium"
+    elif util < 30:
+        signals.append(f"Utilization below threshold at {utilization_rate}")
+
+    if days_red > 90:
+        signals.append(f"Red account open {days_red} days")
+        confidence = "high"
+    elif days_red > 30:
+        signals.append(f"Red account open {days_red} days")
+
+    action_map = {
+        "Financial & Contractual":
+            "Escalate to AE — prepare ROI summary and repricing options",
+        "Platform Underutilization":
+            "Schedule guided onboarding — review activation checklist",
+        "Competitive Threat":
+            "Schedule product roadmap review — involve product team",
+        "Business Model Change":
+            "Request executive business review within 7 days",
+        "Technical Challenges":
+            "Engage PS/CSM for technical assessment within 48 hours",
+    }
+    recommended_action = action_map.get(
+        risk_theme,
+        "Schedule CSM outreach within 24 hours"
+    )
+
+    return {
+        "primary_reason": (
+            f"{risk_theme}. "
+            f"{'. '.join(signals[:2])}. "
+            f"Action: {recommended_action}"
+        ),
+        "risk_theme":         risk_theme,
+        "supporting_signals": signals,
+        "confidence":         confidence,
+        "recommended_action": recommended_action,
+        "account":            account,
+        "close_date":         close_date,
+        "generated_at":       datetime.utcnow().isoformat(),
+        "data_sources":       ["snowflake", "org62", "cidm"],
     }
 
 

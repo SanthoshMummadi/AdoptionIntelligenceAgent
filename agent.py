@@ -34,21 +34,6 @@ def build_home_view(_user_id: str, first_name: str) -> dict:
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "📋 Product Brief Analysis", "emoji": True},
-                    "action_id": "module_product_brief",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "🎯 V2MoM Analysis", "emoji": True},
-                    "action_id": "module_v2mom",
-                },
-            ],
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
                     "text": {"type": "plain_text", "text": "⚠️ Attrition Risk", "emoji": True},
                     "action_id": "module_attrition",
                 },

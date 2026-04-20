@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from domain.analytics.bulk_cidm import get_usage_bulk
 from domain.analytics.bulk_renewals import get_atrisk_renewals_bulk
+from domain.intelligence.risk_engine import build_why_explanation
 from log_utils import log_debug
 from domain.salesforce.bulk_org62 import (
     get_opp_dynamic_fields_bulk,
@@ -80,17 +81,60 @@ def _map_canvas_review_to_bulk_row(r: dict, cloud: str) -> dict:
     }
 
 
+def _derive_lifecycle_stage(row: dict) -> str:
+    """
+    Derive lifecycle stage from available signals.
+    New -> Activated -> Expanding -> At-Risk -> Dormant
+    """
+    atr = abs(float(row.get("atr") or 0))
+    
+    # Safe util parsing — handle N/A, empty, None
+    util_raw = str(row.get("utilization_rate") or "0").replace("%", "").strip()
+    try:
+        util = float(util_raw) if util_raw and util_raw != "N/A" else 0.0
+    except ValueError:
+        util = 0.0
+    days_red = int(row.get("days_red") or 0)
+    red_notes = row.get("red_notes") or ""
+
+    # Dormant: very low utilization + no red activity
+    if util < 1.0 and not red_notes and days_red == 0:
+        return "Dormant"
+
+    # At-Risk: negative ATR or red flagged
+    if atr >= 500000 or days_red > 0 or red_notes:
+        return "At-Risk"
+
+    # Expanding: high utilization
+    if util > 70:
+        return "Expanding"
+
+    # Activated: some utilization
+    if util > 10:
+        return "Activated"
+
+    return "New"
+
+
 def run_bulk_gm_review(
     cloud: str = "Commerce Cloud",
     fy: str = None,
     opp_ids: list[str] | None = None,
+    min_attrition: float = 500000,
+    limit: int = 500,
 ) -> list[dict]:
     log_debug(f"Bulk GM Review: cloud={cloud}")
     explicit_opp_ids = list(opp_ids or [])
 
     # Step 1: renewals
     log_debug("Step 1: Fetching renewals...")
-    renewals = get_atrisk_renewals_bulk(cloud, fy, opp_ids=explicit_opp_ids)
+    renewals = get_atrisk_renewals_bulk(
+        cloud,
+        fy,
+        opp_ids=explicit_opp_ids,
+        min_attrition=min_attrition,
+        limit=limit,
+    )
     log_debug(f"  -> {len(renewals)} renewals")
     if not renewals:
         if explicit_opp_ids and len(renewals) == 0:
@@ -155,7 +199,7 @@ def run_bulk_gm_review(
         sf_products = ", ".join(apm_l1_products) if apm_l1_products else "N/A"
         cc_aov_raw = _to_float(r.get("cc_aov") or 0)
 
-        rows.append({
+        row = {
             "account": r["account_name"],
             "account_id": r["account_id"],
             "opportunity_id": r["opp_id_18"],
@@ -186,7 +230,18 @@ def run_bulk_gm_review(
             "latest_commentary": org62.get("description") or "",
             "adoption_pov": build_adoption_pov(usage_rows, cloud=cloud),
             "slack_channel": r["slack_channel"],
-        })
+        }
+        row["lifecycle_stage"] = _derive_lifecycle_stage(row)
+        row["why_explanation"] = build_why_explanation(
+            account=row.get("account", ""),
+            atr=abs(float(row.get("atr") or 0)),
+            risk_theme=row.get("risk_theme") or row.get("risk_category") or "Unspecified",
+            risk_notes=row.get("risk_notes") or "",
+            utilization_rate=row.get("utilization_rate") or "0%",
+            days_red=int(row.get("days_red") or 0),
+            close_date=str(row.get("close_date") or ""),
+        )
+        rows.append(row)
 
     # Safety cap
     MAX_ROWS = int(os.getenv("GM_REVIEW_MAX_ROWS", "1000"))

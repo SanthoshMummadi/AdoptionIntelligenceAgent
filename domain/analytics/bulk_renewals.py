@@ -3,6 +3,7 @@ Bulk Snowflake RENEWALS queries.
 Single query returns ALL at-risk renewals for a cloud.
 """
 import os
+import datetime
 
 from log_utils import log_debug
 from domain.analytics.snowflake_client import run_query
@@ -47,10 +48,24 @@ def _build_renewal_query(
     view: str,
     cloud_filter: str,
     fy_filter: str,
+    fy_lookahead_filter: str,
     atr_filter: str,
     opp_filter: str,
     stg_excl: str,
+    limit: int = 500,
 ) -> str:
+    red_green_select = "RED_GREEN," if view != _SNAP_VIEW else ""
+    red_green_filter = " OR (RED_GREEN = 'Red')" if view != _SNAP_VIEW else ""
+    atr_expr = (atr_filter or "").strip()
+    if atr_expr.upper().startswith("AND "):
+        atr_expr = atr_expr[4:].strip()
+
+    # For explicit opp IDs, do not apply risk/red filters.
+    if opp_filter:
+        risk_and_red_filter = ""
+    else:
+        risk_and_red_filter = f"AND (({atr_expr}){red_green_filter})"
+
     return f"""
         SELECT
             RENEWAL_OPTY_ID,
@@ -74,6 +89,7 @@ def _build_renewal_query(
             CSG_AREA,
             CSG_GEO,
             TARGET_CLOUD,
+            {red_green_select}
             AE_FULL_NM                                AS AE,
             RENEWAL_OPTY_OWNR_NM                      AS RENEWAL_MANAGER,
             ACCT_CSM                                  AS CSM,
@@ -83,13 +99,16 @@ def _build_renewal_query(
             DRVD_BU
         FROM {view}
         WHERE CURR_SNAP = 'Y'
-        {atr_filter}
-        {fy_filter}
         {stg_excl}
         {cloud_filter}
+        {fy_filter}
+        {fy_lookahead_filter}
         {opp_filter}
-        AND (RENEWAL_CLSD_DT >= DATEADD('year', -1, CURRENT_DATE) OR RENEWAL_CLSD_DT IS NULL)
-        ORDER BY RENEWAL_ATR_CONV DESC
+        {risk_and_red_filter}
+        AND (RENEWAL_CLSD_DT >= CURRENT_DATE OR RENEWAL_CLSD_DT IS NULL)
+        ORDER BY RENEWAL_CLSD_DT ASC NULLS LAST,
+                 RENEWAL_FCAST_ATTRITION_CONV ASC NULLS LAST
+        LIMIT {limit}
     """
 
 
@@ -139,6 +158,8 @@ def get_atrisk_renewals_bulk(
     cloud: str,
     fy: str = None,
     opp_ids: list[str] | None = None,
+    min_attrition: float = 500000,
+    limit: int = 500,
 ) -> list[dict]:
     """
     Single query -> ALL at-risk renewals for a cloud.
@@ -151,6 +172,7 @@ def get_atrisk_renewals_bulk(
         opp_filter = f"AND (RENEWAL_OPTY_ID IN ({ids_sql}) OR RENEWAL_OPTY_ID_18 IN ({ids_sql}))"
         cloud_filter = ""
         fy_filter = ""
+        fy_lookahead_filter = ""
         atr_filter = ""
     else:
         opp_filter = ""
@@ -160,12 +182,26 @@ def get_atrisk_renewals_bulk(
             fy_val = str(fy).strip()
             fy_numeric = int(fy_val.replace("FY", "").replace("fy", ""))
             fy_filter = f"AND RENEWAL_FISCAL_YEAR = {fy_numeric}"
-        atr_threshold = float(os.getenv("GM_REVIEW_FCAST_ATTRITION_THRESHOLD", "0"))
-        atr_filter = f"AND RENEWAL_FCAST_ATTRITION_CONV <= {atr_threshold}"
+        current_year = datetime.datetime.now().year
+        current_month = datetime.datetime.now().month
+        # Salesforce FY starts Feb 1, so month>=2 maps to next fiscal year label.
+        current_fy = current_year + 1 if current_month >= 2 else current_year
+        max_fy = current_fy + 1
+        fy_lookahead_filter = f"AND RENEWAL_FISCAL_YEAR <= {max_fy}"
+        # Same threshold for all clouds
+        threshold = float(os.getenv("GM_REVIEW_FCAST_ATTRITION_THRESHOLD", "-500000"))
+        atr_filter = f"AND RENEWAL_FCAST_ATTRITION_CONV <= {threshold}"
 
     def _query(view: str) -> list[dict]:
         q = _build_renewal_query(
-            view, cloud_filter, fy_filter, atr_filter, opp_filter, stg_excl
+            view,
+            cloud_filter,
+            fy_filter,
+            fy_lookahead_filter,
+            atr_filter,
+            opp_filter,
+            stg_excl,
+            limit=limit,
         )
         if view != _SNAP_VIEW:
             q = q.replace("WHERE CURR_SNAP = 'Y'", "WHERE 1=1")
@@ -198,21 +234,32 @@ def get_atrisk_renewals_bulk(
 
 
 def _build_cloud_filter(cloud: str) -> str:
-    """Build TARGET_CLOUD filter for RENEWALS view."""
-    if not cloud or cloud == "All":
+    """Build cloud filter for RENEWALS view."""
+    if not cloud:
         return ""
-    if "Commerce" in cloud:
-        return """AND (TARGET_CLOUD LIKE '%Commerce Cloud%'
-                     OR TARGET_CLOUD LIKE '%B2B Commerce%'
-                     OR TARGET_CLOUD LIKE '%B2C%'
-                     OR TARGET_CLOUD LIKE '%Order Management%')"""
-    elif "Marketing" in cloud:
-        return "AND TARGET_CLOUD LIKE '%Marketing%'"
-    elif "Service" in cloud:
-        return "AND TARGET_CLOUD LIKE '%Service%'"
-    elif "Sales" in cloud:
-        return "AND TARGET_CLOUD LIKE '%Sales%'"
-    elif "Financial" in cloud:
-        return "AND TARGET_CLOUD LIKE '%Financial%'"
-    else:
-        return f"AND TARGET_CLOUD LIKE '%{cloud}%'"
+    c = str(cloud).strip().lower()
+    if c == "all":
+        return ""
+    if "financial services" in c or c == "fsc":
+        snapshot_date = os.getenv("SNOWFLAKE_CIDM_SNAPSHOT_DT", "2026-04-01")
+        return f"""AND ACCT_ID IN (
+        SELECT DISTINCT ACCOUNT_ID
+        FROM SSE_DM_CSG_RPT_PRD.CIDM.WV_CI_ACCT_PRODUCT_APM_VW
+        WHERE APM_L3 IN (
+            'Financial Services Cloud - Sales',
+            'Financial Services Cloud - Service'
+        )
+        AND CURR_SNAP = 'Y'
+    )"""
+    if "commerce" in c:
+        return """AND (
+            TARGET_CLOUD LIKE '%Commerce%'
+            OR TARGET_CLOUD LIKE '%B2C%'
+            OR TARGET_CLOUD LIKE '%B2B Commerce%'
+            OR TARGET_CLOUD LIKE '%Order Management%'
+            OR RENEWAL_OPTY_NM LIKE '%Commerce%'
+            OR RENEWAL_OPTY_NM LIKE '%B2C%'
+            OR RENEWAL_OPTY_NM LIKE '%B2B%'
+        )"""
+    cloud_safe = str(cloud).replace("'", "''")
+    return f"AND (TARGET_CLOUD LIKE '%{cloud_safe}%' OR RENEWAL_OPTY_NM LIKE '%{cloud_safe}%')"

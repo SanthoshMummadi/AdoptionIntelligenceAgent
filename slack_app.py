@@ -6,14 +6,11 @@ import os
 import re
 import sys
 import time
-import io
 import json
 import pickle
 import sqlite3
 from datetime import datetime, timezone
 
-import PyPDF2
-import requests
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
 
@@ -28,6 +25,7 @@ from domain.analytics.snowflake_client import (
     prewarm_renewal_as_of_date,
 )
 from domain.tracking.account_tracker import setup_tracking_tables
+from services.app_home import publish_app_home
 from services.daily_pulse_workflow import run_daily_pulse
 from log_utils import log_error
 
@@ -259,24 +257,6 @@ def clear_session(user_id: str) -> None:
     )
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def download_and_process_pdf(url: str, token: str) -> tuple[str, int]:
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers, timeout=60)
-    if response.status_code != 200:
-        raise Exception(f"Failed to download file: {response.status_code}")
-
-    pdf_file = io.BytesIO(response.content)
-    reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        text += (page.extract_text() or "") + "\n"
-
-    return text.strip(), len(reader.pages)
-
-
 def format_for_slack(text: str) -> str:
     if not text:
         return text
@@ -335,48 +315,6 @@ def split_into_chunks(text: str, max_length: int = 3900) -> list[str]:
 # -------------------------
 # Slack events / actions
 # -------------------------
-@app.event("file_shared")
-def handle_file_upload(event, say, client):
-    try:
-        file_id = event["file_id"]
-        user_id = event["user_id"]
-
-        file_info = client.files_info(file=file_id)
-        file_data = file_info["file"]
-        file_name = file_data["name"]
-        file_type = file_data.get("mimetype", "")
-
-        if "pdf" not in file_type.lower() and not file_name.lower().endswith(".pdf"):
-            say("I can only process PDF files right now. Please upload a PDF product brief.")
-            return
-
-        say(f"📄 Processing *{file_name}*... :hourglass:")
-
-        file_url = file_data["url_private"]
-        text_content, num_pages = download_and_process_pdf(
-            file_url, os.environ.get("SLACK_BOT_TOKEN")
-        )
-
-        brief_name = file_name.replace(".pdf", "").replace(" ", "_")
-        server.upload_brief_text(brief_name, text_content, user_id=user_id)
-
-        user_last_brief[user_id] = brief_name
-        save_last_briefs()
-
-        # Update session snapshot
-        s = get_session(user_id)
-        s["current_brief"] = brief_name
-        s["brief_count"] = len(server.get_user_briefs(user_id))
-
-        say(
-            f"✅ Got it! I've analyzed *{brief_name}* ({num_pages} pages, {len(text_content):,} characters)\n\n"
-            f"*Ask me anything!* Just type naturally - no commands needed."
-        )
-
-    except Exception as e:
-        say(f"❌ Error processing PDF: {str(e)}")
-
-
 @app.event("message")
 def handle_message(event, say, client):
     if event.get("bot_id") or event.get("subtype"):
@@ -490,172 +428,38 @@ def handle_message(event, say, client):
 
 @app.event("app_home_opened")
 def update_home_tab(client, event, logger=None):
-    user_id = event["user"]
-
-    if event.get("tab") == "messages":
+    del logger
+    user_id = event.get("user")
+    if not user_id or event.get("tab") != "home":
         return
+    publish_app_home(client, user_id)
 
-    try:
-        user_info = client.users_info(user=user_id)
-        first_name = user_info["user"]["profile"].get("first_name", "there")
-    except Exception:
-        first_name = "there"
 
-    briefs = server.get_user_briefs(user_id)
-    sess = active_sessions.get(user_id) or {}
-    has_active_session = bool(sess.get("messages"))
+@app.action("refresh_app_home")
+def handle_refresh_app_home(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    publish_app_home(client, user_id)
 
-    # Hub: no briefs yet, or no active DM session (e.g. after clear)
-    show_hub = (not briefs) or (not has_active_session)
 
-    try:
-        if show_hub:
-            from agent import build_home_view
+@app.action("run_gm_review_commerce")
+def handle_run_commerce(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    client.chat_postMessage(
+        channel=user_id,
+        text="⏳ Running Commerce Cloud GM Review... I'll notify you when it's ready!",
+    )
 
-            view = build_home_view(user_id, first_name)
-            client.views_publish(user_id=user_id, view=view)
-        else:
-            active_brief = user_last_brief.get(user_id, list(briefs.keys())[0])
 
-            hour = datetime.now().hour
-            greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
-
-            blocks = [
-                {"type": "header", "text": {"type": "plain_text", "text": f"{greeting}, {first_name} 👋"}},
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": (
-                            f"I'm tracking *{len(briefs)} product brief(s)* for you.\n\n"
-                            f"*Currently analyzing:* {active_brief}"
-                        ),
-                    },
-                },
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "*What do you want to explore?*"}},
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "📊 Adoption Risks", "emoji": True},
-                            "action_id": "quick_adoption_risks",
-                            "value": active_brief,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "🎯 Big Rocks", "emoji": True},
-                            "action_id": "quick_big_rocks",
-                            "value": active_brief,
-                        },
-                    ],
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "📈 Success Metrics", "emoji": True},
-                            "action_id": "quick_metrics",
-                            "value": active_brief,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "👥 Target Audience", "emoji": True},
-                            "action_id": "quick_audience",
-                            "value": active_brief,
-                        },
-                    ],
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "📝 Full Summary", "emoji": True},
-                            "action_id": "quick_summary",
-                            "value": active_brief,
-                            "style": "primary",
-                        },
-                    ],
-                },
-                {"type": "divider"},
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Your Briefs ({len(briefs)}):*"},
-                },
-            ]
-
-            if len(briefs) > 1:
-                brief_buttons = []
-                for brief_name in list(briefs.keys())[:5]:
-                    is_active = brief_name == active_brief
-                    label = f"{'✓ ' if is_active else ''}{brief_name}"
-                    if len(label) > 75:
-                        label = label[:72] + "..."
-                    btn = {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": label, "emoji": True},
-                        "action_id": f"switch_to_{brief_name}",
-                        "value": brief_name,
-                    }
-                    if is_active:
-                        btn["style"] = "primary"
-                    brief_buttons.append(btn)
-                blocks.append({"type": "actions", "elements": brief_buttons})
-            else:
-                blocks.append({
-                    "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": f"• {active_brief}"}],
-                })
-
-            blocks.extend(
-                [
-                    {"type": "divider"},
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "text": {"type": "plain_text", "text": "📎 Upload New Brief", "emoji": True},
-                                "action_id": "upload_new_brief",
-                            },
-                            {
-                                "type": "button",
-                                "text": {"type": "plain_text", "text": "⛔ End Session", "emoji": True},
-                                "action_id": "btn_end_session_home",
-                                "style": "danger",
-                            },
-                        ],
-                    },
-                ]
-            )
-
-            client.views_publish(user_id=user_id, view={"type": "home", "blocks": blocks})
-
-    except SlackApiError as e:
-        err = e.response.get("error") if getattr(e, "response", None) else None
-        if err == "not_enabled":
-            msg = (
-                "App Home is not available for this app (views.publish: not_enabled). "
-                "In api.slack.com: App → App Home → enable a Home tab, Bot Token Scopes → add "
-                "`app_home:write`, then reinstall the app to the workspace."
-            )
-            if logger:
-                logger.warning(msg)
-            else:
-                print(f"⚠️  {msg}")
-        else:
-            if logger:
-                logger.error(f"Error publishing home tab: {e}")
-            else:
-                print(f"Error publishing home tab: {e}")
-    except Exception as e:
-        if logger:
-            logger.error(f"Error publishing home tab: {e}")
-        else:
-            print(f"Error publishing home tab: {e}")
+@app.action("run_gm_review_fsc")
+def handle_run_fsc(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    client.chat_postMessage(
+        channel=user_id,
+        text="⏳ Running FSC GM Review... I'll notify you when it's ready!",
+    )
 
 
 @app.action("upload_product_brief")
@@ -675,44 +479,6 @@ def handle_upload_new_button(ack, body, client):
     client.chat_postMessage(
         channel=user_id,
         text="📄 *Upload another product brief*\n\nDrag and drop a PDF file and I'll add it to your collection.",
-    )
-
-
-@app.action("module_product_brief")
-def handle_module_product_brief(ack, body, client):
-    """Handle Product Brief Analysis module selection."""
-    ack()
-    user_id = body["user"]["id"]
-    client.chat_postMessage(
-        channel=user_id,
-        text=(
-            ":brain: *Product Brief Analysis Module*\n\n"
-            "Upload a product brief PDF and ask me things like:\n"
-            "- What are the key adoption risks?\n"
-            "- Summarize the success metrics\n"
-            "- What are the big rocks for this quarter?\n"
-            "- Who is the target audience?\n\n"
-            "Just send me a PDF to get started!"
-        ),
-    )
-
-
-@app.action("module_v2mom")
-def handle_module_v2mom(ack, body, client):
-    """Handle V2MoM Analysis module selection."""
-    ack()
-    user_id = body["user"]["id"]
-    client.chat_postMessage(
-        channel=user_id,
-        text=(
-            ":dart: *V2MoM Analysis Module*\n\n"
-            "I'll help align your product brief with V2MoM framework:\n"
-            "- Vision alignment\n"
-            "- Value proposition mapping\n"
-            "- Obstacle identification\n"
-            "- Method validation\n\n"
-            "Upload a brief and ask: _'How does this align with our V2MoM?'_"
-        ),
     )
 
 
@@ -1584,6 +1350,8 @@ def gm_review_lists(ack, say, command, client):
                     detected_cloud,
                     fy=filters.get("fy"),
                     opp_ids=filters.get("opp_ids") or [],
+                    min_attrition=filters.get("min_attrition", 500000),
+                    limit=500,
                 )
             else:
                 workflow = GMReviewWorkflow(call_llm_fn=server.call_llm_gateway_with_retry)
@@ -1661,6 +1429,8 @@ def gm_review_sheet(ack, say, command, client):
                 detected_cloud,
                 fy=filters.get("fy"),
                 opp_ids=filters.get("opp_ids") or [],
+                min_attrition=filters.get("min_attrition", 500000),
+                limit=500,
             )
             if not reviews:
                 say(":x: No reviews generated.")

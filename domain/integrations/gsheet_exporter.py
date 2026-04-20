@@ -54,6 +54,8 @@ HEADERS_22 = [
     "CSM",
     "Renewal Status",
     "Latest Commentary",
+    "Lifecycle Stage",
+    "Why Explanation",
     "Exported At",
 ]
 
@@ -451,6 +453,10 @@ def export_to_gsheet(
             if red:
                 latest_update = red.get("Latest_Updates__c", "") or ""
             latest_commentary = specialist_notes or description or latest_update
+            lifecycle_stage = review.get("lifecycle_stage") or "Unknown"
+            why_explanation = str(
+                (review.get("why_explanation") or {}).get("primary_reason") or ""
+            )
 
             opp_id_link = str(
                 review.get("opportunity_id")
@@ -489,6 +495,8 @@ def export_to_gsheet(
                     _safe_cell(csm),
                     _safe_cell(renewal_status),
                     _safe_cell(latest_commentary),
+                    _safe_cell(lifecycle_stage),
+                    _safe_cell(why_explanation),
                     _safe_cell(exported_at),
                 ]
             )

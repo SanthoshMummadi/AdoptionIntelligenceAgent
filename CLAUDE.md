@@ -62,16 +62,38 @@ Requires live Salesforce, Snowflake, and LLM credentials. Tests GM Review workfl
 python3 tests/test_dynamic_accounts.py
 ```
 
+### Run single test
+```bash
+python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
+```
+
 ## Architecture
+
+### Data Flow
+**GM Review** follows this pattern:
+1. **Input:** Account names, opportunity IDs, or cloud + FY filters
+2. **Salesforce query:** Fetch opportunities, dynamic fields, red account flags
+3. **Snowflake enrichment:** Usage (CIDM), renewals, attrition risk, health scores
+4. **LLM analysis:** Risk theme classification + playbook recommendations (with circuit breaker fallback)
+5. **Canvas generation:** Slack Canvas markdown table with formatted results
+6. **Optional export:** Google Sheets export for downstream analysis
+
+**Bulk vs sequential:**
+- Bulk: 3 Snowflake queries → in-memory join → parallel LLM (fast for 50+ accounts)
+- Sequential: Per-account Salesforce + Snowflake → LLM (detailed, works for any input)
 
 ### Entry points
 - **`slack_app.py`** — Slack Bolt app (DMs, hub modules, file ingestion, slash commands including `/gm-review-canvas`, `/at-risk-canvas`)
 - **`server.py`** — FastMCP server (brief CRUD, `query_brief`, `generate_gm_reviews`, `generate_gm_review_canvas`, `health_check`)
 
 ### Core modules
-- **`services/gm_review_workflow.py`** — GM Review orchestration: Salesforce + Snowflake + LLM + canvas markdown
+- **`services/gm_review_workflow.py`** — GM Review orchestration: Salesforce + Snowflake + LLM + canvas markdown (account-by-account)
+- **`services/gm_review_bulk_workflow.py`** — Bulk GM Review: 3 queries → in-memory join → faster for large cloud scans
 - **`domain/salesforce/org62_client.py`** — Salesforce authentication and query execution with concurrency limiting
+- **`domain/salesforce/bulk_org62.py`** — Bulk Salesforce queries for GM Review (dynamic fields, red accounts)
 - **`domain/analytics/snowflake_client.py`** — Snowflake enrichment, connection pooling, attrition queries
+- **`domain/analytics/bulk_cidm.py`** — Bulk CIDM usage queries
+- **`domain/analytics/bulk_renewals.py`** — Bulk Snowflake renewal queries with configurable ATR thresholds
 - **`domain/intelligence/risk_engine.py`** — Risk theme classification, playbook mapping, LLM-generated analysis with fallbacks
 - **`domain/content/canvas_builder.py`** — Slack Canvas markdown generation for GM Review tables
 - **`domain/integrations/gsheet_exporter.py`** — Optional Google Sheets export for GM Review data
@@ -106,6 +128,12 @@ For non-internal URLs, TLS always uses certifi or custom CA bundle.
   - `SNOWFLAKE_RENEWAL_AS_OF_DATE=2026-03-01`
   - `SNOWFLAKE_CIDM_SNAPSHOT_DT=2026-04-01`
 
+### GM Review: Bulk vs Account-by-Account
+- **Bulk workflow** (`gm_review_bulk_workflow.py`) — Snowflake-first: 3 queries, in-memory join, faster for cloud-wide scans
+- **Account-by-account** (`gm_review_workflow.py`) — Salesforce-first: detailed per-account queries, better for small sets or explicit opp IDs
+- **When to use bulk:** Large cloud scans (50+ accounts), FY filters, ATR thresholds
+- **When to use account-by-account:** Specific accounts/opps, need detailed Salesforce fields, custom enrichment
+
 ### GM Review Performance
 - Default: **1 concurrent account** (gentle on Snowflake)
 - Max: **12 concurrent accounts**
@@ -126,6 +154,12 @@ Key timeout environment variables (see `.env.example`):
 - `SNOWFLAKE_USAGE_CIDM_TIMEOUT=45` — CIDM usage queries
 - `SNOWFLAKE_ATTRITION_STATEMENT_TIMEOUT=90` — attrition queries
 - `SNOWFLAKE_CIDM_SNAPSHOT_DT=YYYY-MM-DD` — pin snapshot date to skip MAX during unstable runs
+
+### Bulk GM Review Configuration
+- `GM_REVIEW_FCAST_ATTRITION_THRESHOLD=-500000` — ATR threshold for bulk queries (default: -500k, meaning 500k+ attrition)
+- Bulk queries apply FY lookahead (current FY + 1) and close date filters automatically
+- For Financial Services Cloud: uses CIDM APM_L3 filtering instead of TARGET_CLOUD patterns
+- Result limit: default 500 renewals per bulk query (configurable via `limit` parameter)
 
 ### Daily Pulse Scheduler
 Configured via environment:
