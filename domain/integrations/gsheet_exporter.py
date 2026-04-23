@@ -88,6 +88,13 @@ def _opp_owner_name(opp: dict) -> str:
     return ""
 
 
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _safe_cell(value) -> str:
     """Convert any value to a safe string for Google Sheets."""
     if value is None:
@@ -112,7 +119,14 @@ def _adapt_bulk_row_for_sheet(bulk_row: dict) -> dict:
     """
     opp_id = bulk_row.get("opportunity_id") or ""
     atr_val = bulk_row.get("atr") or 0
-    fcast_val = bulk_row.get("forecasted_attrition") or 0
+    fcast_val = abs(
+        _to_float(
+            bulk_row.get("forecasted_atr")
+            or bulk_row.get("org62_forecasted_attrition")
+            or bulk_row.get("forecasted_attrition")
+            or 0
+        )
+    )
     cc_aov_val = bulk_row.get("cc_aov") or 0
     util = bulk_row.get("utilization_rate") or "N/A"
     territory = bulk_row.get("territory") or ""

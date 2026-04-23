@@ -30,9 +30,13 @@ def _map_canvas_review_to_bulk_row(r: dict, cloud: str) -> dict:
     renewal_aov = enrichment.get("renewal_aov") or {}
     red = r.get("red_account") or {}
 
-    forecasted_atr = opp.get("Forecasted_Attrition__c")
     atr_snow = display.get("renewal_atr") or renewal_aov.get("renewal_atr_snow")
-    atr = abs(_to_float(forecasted_atr or atr_snow or 0))
+    atr = abs(_to_float(
+        r.get("forecasted_atr")
+        or atr_snow
+        or opp.get("Forecasted_Attrition__c")
+        or 0
+    ))
 
     close_date = str(opp.get("CloseDate") or "")
     opportunity_id = str(r.get("opportunity_id") or opp.get("Id") or "")
@@ -206,8 +210,13 @@ def run_bulk_gm_review(
             "cloud": r["cloud"],
             "cc_aov": cc_aov_raw,
             "atr": r["atr"],
+            "forecasted_atr": r.get("forecasted_atr"),
+            "org62_forecasted_attrition": org62.get("forecasted_attrition"),
             "forecasted_attrition": abs(_to_float(
-                org62.get("forecasted_attrition") or r.get("forecasted_atr") or 0
+                r.get("forecasted_atr")
+                or r.get("atr")
+                or org62.get("forecasted_attrition")
+                or 0
             )),
             "territory": r["territory"],
             "close_date": r["close_date"],
