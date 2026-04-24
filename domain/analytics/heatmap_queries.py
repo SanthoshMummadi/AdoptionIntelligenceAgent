@@ -16,6 +16,30 @@ _CLOUD_MAPPING = {
     "Agentforce":         ("Agentforce", "Build, Test, Observe"),
 }
 
+VALID_REGIONS = [
+    "AMER REG", "AMER TMT", "AMER CBS", "AMER PACE",
+    "EMEA Central", "EMEA North", "EMEA South", "France",
+    "UKI", "LATAM", "ANZ", "North Asia", "South Asia",
+    "SMB", "PubSec",
+]
+
+VALID_INDUSTRIES = [
+    "Manufacturing, Automotive & Energy",
+    "Retail & CG",
+    "Technology",
+    "Professional Services",
+    "Healthcare & Life Sciences",
+    "Engineering, Construction, & Real Estate",
+    "Financial Services",
+    "Communications & Media",
+    "Travel, Transportation, & Hospitality",
+    "Education",
+    "Nonprofit",
+    "Agriculture & Mining",
+    "Public Sector",
+    "Other",
+]
+
 
 def get_fy_quarter_dates(fy: str) -> list[dict]:
     """
@@ -72,7 +96,12 @@ def get_fy_quarter_dates(fy: str) -> list[dict]:
     ]
 
 
-def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
+def get_adoption_heatmap_data(
+    cloud: str,
+    fy: str = "FY2027",
+    industry: str | None = None,
+    region: str | None = None,
+) -> dict:
     """
     Returns adoption heatmap data for a given cloud and FY.
 
@@ -84,6 +113,8 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
         {
             "cloud": str,
             "fy": str,
+            "industry": str | None,
+            "region": str | None,
             "quarters": {
                 "Q1": [...],  # list of feature dicts
                 "Q2": [...],
@@ -130,6 +161,8 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
         return {
             "cloud": cloud,
             "fy": fy,
+            "industry": industry,
+            "region": region,
             "quarters": {"Q1": [], "Q2": [], "Q3": [], "Q4": []},
             "summary": {
                 "total_features": 0,
@@ -148,6 +181,8 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
         return {
             "cloud": cloud,
             "fy": fy,
+            "industry": industry,
+            "region": region,
             "quarters": {"Q1": [], "Q2": [], "Q3": [], "Q4": []},
             "summary": {
                 "total_features": 0,
@@ -183,6 +218,8 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
           AND DATA_DT <= %s
           AND DATA_DT >= DATEADD(month, -1, %s)
           AND ORG_PF_ROLLING_28D_MAU > 0
+          AND (%s IS NULL OR INDUSTRY_NM = %s)
+          AND (%s IS NULL OR CSG_REGION_NM = %s)
         GROUP BY
             PRODUCT_FEATURE_GROUP, PRODUCT_FEATURE,
             PRODUCT_FEATURE_ID, PF_OWNER_NAME,
@@ -192,6 +229,30 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
         """
 
         try:
+            # Latest snapshot actually present for this cloud (capped at quarter end).
+            # Avoids assuming all feature groups share the fiscal quarter end date.
+            meta_cur = conn.cursor()
+            meta_cur.execute(
+                """
+                SELECT MAX(DATA_DT)
+                FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+                WHERE PRODUCT_PORTFOLIO = %s
+                  AND PRODUCT_FEATURE_FAMILY = %s
+                  AND DATA_DT <= %s
+                  AND (%s IS NULL OR INDUSTRY_NM = %s)
+                  AND (%s IS NULL OR CSG_REGION_NM = %s)
+                """,
+                (
+                    portfolio, family, snapshot_date,
+                    industry, industry, region, region,
+                ),
+            )
+            meta_row = meta_cur.fetchone()
+            meta_cur.close()
+            actual_snapshot = (
+                str(meta_row[0]) if meta_row and meta_row[0] else snapshot_date
+            )
+
             total_cursor = conn.cursor()
             total_cursor.execute(
                 """
@@ -201,15 +262,26 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
                   AND PRODUCT_FEATURE_FAMILY = %s
                   AND DATA_DT <= %s
                   AND DATA_DT >= DATEADD(month, -1, %s)
+                  AND (%s IS NULL OR INDUSTRY_NM = %s)
+                  AND (%s IS NULL OR CSG_REGION_NM = %s)
                 """,
-                (portfolio, family, snapshot_date, snapshot_date),
+                (
+                    portfolio, family, actual_snapshot, actual_snapshot,
+                    industry, industry, region, region,
+                ),
             )
             total_row = total_cursor.fetchone()
             total_accounts = int((total_row[0] if total_row else 0) or 1)
             total_cursor.close()
 
             cursor = conn.cursor()
-            cursor.execute(query, (portfolio, family, snapshot_date, snapshot_date))
+            cursor.execute(
+                query,
+                (
+                    portfolio, family, actual_snapshot, actual_snapshot,
+                    industry, industry, region, region,
+                ),
+            )
             rows = cursor.fetchall()
             cursor.close()
 
@@ -290,6 +362,8 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
     return {
         "cloud": cloud,
         "fy": fy,
+        "industry": industry,
+        "region": region,
         "quarters": {
             "Q1": quarter_results.get("Q1", []),
             "Q2": quarter_results.get("Q2", []),
@@ -319,7 +393,9 @@ def get_feature_account_movers(
 
     Args:
         feature_id:    PRODUCT_FEATURE_ID from RPT_PRODUCTUSAGE_PFT_ORG_METRICS
-        snapshot_date: Current snapshot date string e.g. '2026-04-22'
+        snapshot_date: Optional cap: only dates <= this are used. Pass the feature
+                       row's data_dt from the heatmap when available; else callers
+                       may pass an empty string to use the true latest for the feature.
         portfolio:     e.g. 'Commerce'
         family:        e.g. 'B2B Commerce'
         top_n:         Number of movers/losers to return (default 5)
@@ -351,18 +427,48 @@ def get_feature_account_movers(
         conn = get_pdp_snowflake_connection()
         cur = conn.cursor()
 
-        # Get prior snapshot date — latest date before current
-        cur.execute("""
+        # Current snapshot: latest load date for this feature (not portfolio-wide).
+        snap_in = (snapshot_date or "").strip()
+        if snap_in:
+            cur.execute(
+                """
+                SELECT MAX(DATA_DT)
+                FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+                WHERE PRODUCT_FEATURE_ID = %s
+                  AND DATA_DT <= %s
+                """,
+                (feature_id, snap_in),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT MAX(DATA_DT)
+                FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+                WHERE PRODUCT_FEATURE_ID = %s
+                """,
+                (feature_id,),
+            )
+        row0 = cur.fetchone()
+        actual_snapshot = str(row0[0]) if row0 and row0[0] else None
+        if not actual_snapshot:
+            cur.close()
+            return {"top_movers": [], "top_losers": []}
+
+        # Prior snapshot — latest date strictly before current, for the same feature
+        cur.execute(
+            """
             SELECT MAX(DATA_DT)
             FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
-            WHERE PRODUCT_PORTFOLIO    = %s
-              AND PRODUCT_FEATURE_FAMILY = %s
+            WHERE PRODUCT_FEATURE_ID = %s
               AND DATA_DT < %s
-        """, (portfolio, family, snapshot_date))
+            """,
+            (feature_id, actual_snapshot),
+        )
         row = cur.fetchone()
         prior_date = str(row[0]) if row and row[0] else None
 
         if not prior_date:
+            cur.close()
             return {"top_movers": [], "top_losers": []}
 
         # Query current + prior MAU per account for this feature
@@ -406,7 +512,7 @@ def get_feature_account_movers(
             WHERE p.mau_prior > 0
               AND c.mau_current > 0
             ORDER BY mau_change_pct DESC
-        """, (feature_id, snapshot_date, feature_id, prior_date))
+        """, (feature_id, actual_snapshot, feature_id, prior_date))
 
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]

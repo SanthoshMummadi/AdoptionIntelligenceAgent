@@ -28,8 +28,8 @@ from domain.analytics.snowflake_client import (
 from domain.tracking.account_tracker import setup_tracking_tables
 from services.app_home import publish_app_home
 from services.adoption_heatmap_workflow import (
-    run_adoption_heatmap,
     get_available_clouds,
+    classify_adoption_intent,
 )
 from services.daily_pulse_workflow import run_daily_pulse
 from domain.content.heatmap_builder import (
@@ -41,6 +41,8 @@ from domain.analytics.heatmap_queries import (
     get_adoption_heatmap_data,
     get_feature_account_movers,
     _CLOUD_MAPPING,
+    VALID_REGIONS,
+    VALID_INDUSTRIES,
 )
 from log_utils import log_error
 
@@ -331,6 +333,26 @@ def split_into_chunks(text: str, max_length: int = 3900) -> list[str]:
 
 
 # -------------------------
+# Conversational AI - Adoption intent keywords
+# -------------------------
+ADOPTION_KEYWORDS = [
+    "adoption", "heatmap", "b2b commerce", "b2b",
+    "cart", "checkout", "pricing", "search",
+    "shipping", "payments", "buyer groups",
+    "buyer messaging", "promotions", "subscriptions",
+    "tax", "agentforce for shopping", "pft",
+    "feature group", "mau", "movers", "declining",
+    "analytics", "buyer", "commerce adoption"
+]
+
+
+def _is_adoption_query(text: str) -> bool:
+    """Quick check before calling LLM - commerce-specific keywords only."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in ADOPTION_KEYWORDS)
+
+
+# -------------------------
 # Slack events / actions
 # -------------------------
 @app.event("message")
@@ -371,12 +393,11 @@ def handle_message(event, say, client):
             feature_name = best["feature"]
             try:
                 best_feature_id = best.get("feature_id")
-                best_snapshot_dt = best.get("data_dt", "2026-04-22")
                 portfolio, family = _CLOUD_MAPPING.get(cloud, ("Commerce", "B2B Commerce"))
 
                 movers_data = get_feature_account_movers(
                     feature_id=best_feature_id,
-                    snapshot_date=best_snapshot_dt,
+                    snapshot_date=best.get("data_dt") or "",
                     portfolio=portfolio,
                     family=family,
                 )
@@ -399,8 +420,298 @@ def handle_message(event, say, client):
                 )
             return
 
+    # -------------------------
+    # Conversational adoption query handling (new in adoption-claude branch)
+    # -------------------------
     user = event["user"]
+    ts = event.get("ts", "")
 
+    # Only respond to adoption queries in DMs or when bot is mentioned
+    is_dm = channel.startswith("D")
+
+    # Check if bot is mentioned (need to get bot user ID first)
+    is_mentioned = False
+    try:
+        auth_response = client.auth_test()
+        bot_user_id = auth_response.get("user_id", "")
+        is_mentioned = f"<@{bot_user_id}>" in text if bot_user_id else False
+    except Exception:
+        bot_user_id = ""
+        is_mentioned = False
+
+    # If this is a potential adoption query and in the right context (DM or mentioned)
+    if (is_dm or is_mentioned) and _is_adoption_query(text):
+        # Show typing indicator
+        try:
+            client.reactions_add(channel=channel, timestamp=ts, name="hourglass_flowing_sand")
+        except Exception:
+            pass  # Reaction add might fail if message is too old
+
+        def handle_adoption_query():
+            """Background thread for adoption query handling."""
+            try:
+                # Classify intent using LLM gateway
+                from server import call_llm_gateway_with_retry
+                intent = classify_adoption_intent(text, call_llm_fn=call_llm_gateway_with_retry)
+
+                if intent["type"] == "not_adoption":
+                    # Not an adoption query - let it fall through to normal handling
+                    try:
+                        client.reactions_remove(
+                            channel=channel, timestamp=ts, name="hourglass_flowing_sand"
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                cloud = intent.get("cloud") or "Commerce B2B"
+                fy = intent.get("fy") or "FY2027"
+
+                # Route based on intent type
+                if intent["type"] == "heatmap_summary":
+                    # Generate full heatmap
+                    result = get_adoption_heatmap_data(cloud, fy)
+                    quarters = result.get("quarters", {})
+                    features = []
+                    for q in ["Q4", "Q3", "Q2", "Q1"]:
+                        if quarters.get(q):
+                            features = quarters[q]
+                            break
+
+                    if features:
+                        blocks = build_adoption_heatmap_blocks(features, cloud, fy)
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            blocks=blocks,
+                            text=f"{cloud} adoption summary for {fy}"
+                        )
+
+                        # Store context so thread replies work
+                        HEATMAP_CONTEXT[channel] = {
+                            "cloud":    cloud,
+                            "fy":       fy,
+                            "industry": None,
+                            "region":   None,
+                            "features": features,  # all features
+                            "ts":       ts,        # root message ts
+                            "created":  datetime.now(tz=timezone.utc).timestamp(),
+                        }
+                        print(
+                            f"Conversational context stored: {cloud} heatmap summary "
+                            f"— {len(features)} features"
+                        )
+                    else:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            text=f":mag: No adoption data found for {cloud} {fy}"
+                        )
+
+                elif intent["type"] == "group_drilldown":
+                    group = intent.get("feature_group")
+                    if not group:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            text=(
+                                "Which feature group would you like to explore?\n\n"
+                                "Options: Cart, Search, Pricing, Checkout, Shipping, "
+                                "Payments, Buyer Groups, Promotions, Subscriptions, etc."
+                            )
+                        )
+                        return
+
+                    # Get data and filter for the feature group
+                    result = get_adoption_heatmap_data(cloud, fy)
+                    quarters = result.get("quarters", {})
+                    all_features = []
+                    for q in ["Q4", "Q3", "Q2", "Q1"]:
+                        if quarters.get(q):
+                            all_features = quarters[q]
+                            break
+
+                    # Filter for matching group (case-insensitive)
+                    group_lower = group.lower()
+                    matching = [
+                        f for f in all_features
+                        if f.get("feature_group", "").lower() == group_lower
+                    ]
+
+                    if matching:
+                        blocks = build_group_drilldown_blocks(matching, group, cloud, fy)
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            blocks=blocks,
+                            text=f"{group} drill-down for {cloud} {fy}"
+                        )
+
+                        # Store context so thread replies work
+                        HEATMAP_CONTEXT[channel] = {
+                            "cloud":    cloud,
+                            "fy":       fy,
+                            "industry": None,
+                            "region":   None,
+                            "features": matching,  # features for this group
+                            "ts":       ts,        # root message ts
+                            "created":  datetime.now(tz=timezone.utc).timestamp(),
+                        }
+                        print(
+                            f"Conversational context stored: {group} "
+                            f"— {len(matching)} features"
+                        )
+                    else:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            text=f":mag: No data found for feature group *{group}* in {cloud} {fy}"
+                        )
+
+                elif intent["type"] == "feature_detail":
+                    feature = intent.get("feature")
+                    if not feature:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            text=(
+                                "Which specific feature would you like details on?\n"
+                                "Try: 'Show me Cart Domain' or 'Tell me about Checkout API'"
+                            )
+                        )
+                        return
+
+                    # Search for the feature
+                    result = get_adoption_heatmap_data(cloud, fy)
+                    quarters = result.get("quarters", {})
+                    all_features = []
+                    for q in ["Q4", "Q3", "Q2", "Q1"]:
+                        if quarters.get(q):
+                            all_features = quarters[q]
+                            break
+
+                    feature_lower = feature.lower()
+                    matches = [
+                        f for f in all_features
+                        if feature_lower in f.get("feature", "").lower()
+                    ]
+
+                    if matches:
+                        best = max(matches, key=lambda f: f.get("score", 0))
+                        portfolio, family = _CLOUD_MAPPING.get(cloud, ("Commerce", "B2B Commerce"))
+
+                        try:
+                            movers_data = get_feature_account_movers(
+                                feature_id=best.get("feature_id"),
+                                snapshot_date=best.get("data_dt") or "",
+                                portfolio=portfolio,
+                                family=family,
+                            )
+                            blocks, color = build_feature_detail_blocks(
+                                feature=best, movers=movers_data, cloud=cloud, fy=fy
+                            )
+                            client.chat_postMessage(
+                                channel=channel,
+                                thread_ts=ts,
+                                attachments=[{"color": color, "blocks": blocks}],
+                                text=f":mag: *{best['feature']}* — feature detail"
+                            )
+                        except Exception as e:
+                            print(f"Feature detail failed: {e}")
+                            client.chat_postMessage(
+                                channel=channel,
+                                thread_ts=ts,
+                                text=f":x: Failed to get details for *{best['feature']}*"
+                            )
+                    else:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            text=f":mag: Feature *{feature}* not found in {cloud} {fy}"
+                        )
+
+                elif intent["type"] == "top_movers":
+                    group = intent.get("feature_group")
+                    response_text = "Top movers analysis coming soon!"
+                    if group:
+                        response_text = f"Top movers for *{group}* coming soon!"
+
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text=f":chart_with_upwards_trend: {response_text}\n\n"
+                             "This will show accounts with the biggest adoption changes."
+                    )
+
+                elif intent["type"] == "feature_owner":
+                    feature = intent.get("feature") or intent.get("feature_group")
+                    owner_text = f"Looking up owner for *{feature}*..." if feature else "Owner lookup coming soon!"
+
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text=f":bust_in_silhouette: {owner_text}\n\n"
+                             "This will show the PM and engineering owner."
+                    )
+
+                elif intent["type"] in ["industry_filter", "region_filter"]:
+                    filter_val = intent.get("industry") or intent.get("region")
+                    filter_type = "industry" if intent["type"] == "industry_filter" else "region"
+
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text=(
+                            f":mag: Filtering by {filter_type}: *{filter_val}*\n\n"
+                            f"This will show {cloud} adoption data filtered for {filter_val}.\n"
+                            "(Region/industry filters coming soon — currently showing all data)"
+                        )
+                    )
+                else:
+                    # Unknown intent type
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text=(
+                            ":thinking_face: I'm not sure how to help with that.\n\n"
+                            "Try asking:\n"
+                            "• 'Show me Commerce B2B adoption'\n"
+                            "• 'How is Cart performing?'\n"
+                            "• 'What are the top movers in Search?'"
+                        )
+                    )
+
+            except Exception as e:
+                print(f"Adoption query handler error: {e}")
+                log_error(f"Conversational adoption error: {e}")
+                try:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text=(
+                            ":x: Something went wrong processing your adoption query.\n\n"
+                            "Try using `/adoption-heatmap Commerce B2B` instead."
+                        )
+                    )
+                except Exception:
+                    pass
+
+            finally:
+                # Remove typing indicator
+                try:
+                    client.reactions_remove(
+                        channel=channel, timestamp=ts, name="hourglass_flowing_sand"
+                    )
+                except Exception:
+                    pass
+
+        # Run adoption query in background thread
+        threading.Thread(target=handle_adoption_query, daemon=True).start()
+        return  # Don't fall through to normal message handling
+
+    # -------------------------
+    # Normal message handling continues below
+    # -------------------------
     session = get_session(user)
     session["messages"].append({"timestamp": event.get("ts"), "text": text, "user": user})
 
@@ -1116,6 +1427,110 @@ def attrition_risk_cmd(ack, say, command, client):
         say(f"❌ Error: {str(e)}")
 
 
+def _parse_heatmap_filters(text: str) -> dict:
+    """
+    Parses slash command text into cloud, fy, industry, region.
+
+    Examples:
+        "Commerce B2B"
+            → cloud="Commerce B2B", fy="FY2027",
+              industry=None, region=None
+
+        "Commerce B2B FY2027 Retail"
+            → cloud="Commerce B2B", fy="FY2027",
+              industry="Retail & CG", region=None
+
+        "Commerce B2B FY2027 EMEA North"
+            → cloud="Commerce B2B", fy="FY2027",
+              industry=None, region="EMEA North"
+
+        "Commerce B2B FY2027 Retail EMEA"
+            → cloud="Commerce B2B", fy="FY2027",
+              industry="Retail & CG", region="EMEA North"
+    """
+    tokens = text.strip().split()
+    fy = next(
+        (t.upper() for t in tokens if t.upper().startswith("FY20")),
+        "FY2027"
+    )
+    remaining = [t for t in tokens if not t.upper().startswith("FY20")]
+
+    # Match region — check multi-word regions first
+    region = None
+    for r in sorted(VALID_REGIONS, key=len, reverse=True):
+        r_tokens = r.lower().split()
+        for i in range(len(remaining) - len(r_tokens) + 1):
+            if [t.lower() for t in remaining[i : i + len(r_tokens)]] == r_tokens:
+                region = r
+                remaining = remaining[:i] + remaining[i + len(r_tokens) :]
+                break
+        if region:
+            break
+
+    # Match industry — check multi-word industries first
+    industry = None
+    for ind in sorted(VALID_INDUSTRIES, key=len, reverse=True):
+        ind_tokens = ind.lower().split()
+        for i in range(len(remaining) - len(ind_tokens) + 1):
+            if [t.lower() for t in remaining[i : i + len(ind_tokens)]] == ind_tokens:
+                industry = ind
+                remaining = remaining[:i] + remaining[i + len(ind_tokens) :]
+                break
+        if industry:
+            break
+
+    # First word of an industry (e.g. "Retail" → "Retail & CG") — prefer tokens at end
+    if not industry and remaining:
+        for i in range(len(remaining) - 1, -1, -1):
+            tl = remaining[i].lower()
+            if len(tl) < 3:
+                continue
+            for ind in sorted(VALID_INDUSTRIES, key=len, reverse=True):
+                first_w = re.split(r"[\s,&]+", ind)[0].lower()
+                if first_w and tl == first_w:
+                    industry = ind
+                    remaining = remaining[:i] + remaining[i + 1 :]
+                    break
+            if industry:
+                break
+
+    # Also match partial industry names (e.g. "Retail" → "Retail & CG")
+    if not industry and remaining:
+        partial = " ".join(remaining).lower()
+        for ind in VALID_INDUSTRIES:
+            if partial in ind.lower() or ind.lower().startswith(partial):
+                # Check it's not a cloud token
+                if not any(
+                    partial in c.lower()
+                    for c in _CLOUD_MAPPING.keys()
+                ):
+                    industry = ind
+                    remaining = []
+                    break
+
+    # Trailing short region tokens (e.g. "EMEA" is not a full CSG name but
+    # commonly typed after an industry)
+    _region_short: dict[str, str] = {
+        "emea": "EMEA North",
+        "amer": "AMER REG",
+    }
+    if not region and remaining:
+        last = remaining[-1].lower()
+        if last in _region_short:
+            region = _region_short[last]
+            remaining = remaining[:-1]
+
+    # Everything left is the cloud name
+    cloud = " ".join(remaining).strip() or "Commerce B2B"
+
+    return {
+        "cloud": cloud,
+        "fy": fy,
+        "industry": industry,
+        "region": region,
+    }
+
+
 def _clean_stale_heatmap_context():
     """Remove heatmap context entries older than 4 hours."""
     cutoff = datetime.now(tz=timezone.utc).timestamp() - (4 * 3600)
@@ -1132,15 +1547,12 @@ def handle_adoption_heatmap(ack, body, client, logger):
     ack()
     _clean_stale_heatmap_context()
 
-    # Parse input: "/adoption-heatmap Commerce B2B FY2027"
-    text = (body.get("text") or "").strip()
-    tokens = text.split()
-    fy = next(
-        (t.upper() for t in tokens if t.upper().startswith("FY20")),
-        "FY2027"
-    )
-    cloud_tokens = [t for t in tokens if not t.upper().startswith("FY20")]
-    cloud = " ".join(cloud_tokens).strip() or "Commerce B2B"
+    # Parse: cloud, FY, optional industry/region
+    parsed = _parse_heatmap_filters((body.get("text") or "").strip())
+    cloud = parsed["cloud"]
+    fy = parsed["fy"]
+    industry = parsed["industry"]
+    region = parsed["region"]
     channel = body["channel_id"]
     user = body["user_id"]
 
@@ -1158,23 +1570,36 @@ def handle_adoption_heatmap(ack, body, client, logger):
         return
 
     # Loading indicator
+    filter_parts = []
+    if industry:
+        filter_parts.append(industry)
+    if region:
+        filter_parts.append(region)
+    filter_str = f"  ·  {' · '.join(filter_parts)}" if filter_parts else ""
     client.chat_postEphemeral(
         channel=channel,
         user=user,
-        text=f":hourglass_flowing_sand: Building heatmap for *{cloud}* {fy}..."
+        text=(
+            f":hourglass_flowing_sand: Building heatmap for "
+            f"*{cloud}* {fy}{filter_str}..."
+        )
     )
 
     def _run_heatmap_async():
         try:
             # Generate scored features for latest quarter
-            result = get_adoption_heatmap_data(cloud, fy)
+            result = get_adoption_heatmap_data(
+                cloud, fy, industry=industry, region=region
+            )
             quarters = result.get("quarters", {})
             features = next(
                 (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"]
                  if quarters.get(q)),
                 []
             )
-            blocks = build_adoption_heatmap_blocks(features, cloud, fy)
+            blocks = build_adoption_heatmap_blocks(
+                features, cloud, fy, industry=industry, region=region
+            )
 
             # Post heatmap to channel
             response = client.chat_postMessage(
@@ -1187,6 +1612,8 @@ def handle_adoption_heatmap(ack, body, client, logger):
             HEATMAP_CONTEXT[channel] = {
                 "cloud": cloud,
                 "fy": fy,
+                "industry": industry,
+                "region": region,
                 "features": features,
                 "ts": response["ts"],
                 "created": datetime.now(tz=timezone.utc).timestamp(),
@@ -1242,7 +1669,7 @@ def handle_heatmap_drilldown(ack, body, client, logger):
     )
     movers_data = get_feature_account_movers(
         feature_id=worst.get("feature_id"),
-        snapshot_date=worst.get("data_dt", "2026-04-22"),
+        snapshot_date=worst.get("data_dt") or "",
         portfolio=portfolio,
         family=family,
     )
@@ -1301,7 +1728,7 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
     )
     movers_data = get_feature_account_movers(
         feature_id=feature_id,
-        snapshot_date=matched.get("data_dt", "2026-04-22"),
+        snapshot_date=matched.get("data_dt") or "",
         portfolio=portfolio,
         family=family,
     )
@@ -1368,6 +1795,29 @@ def handle_heatmap_compare(ack, body, client, logger):
             f"reply with the feature name in this thread."
         )
     )
+
+    ctx = HEATMAP_CONTEXT.get(channel)
+    if ctx:
+        result = get_adoption_heatmap_data(
+            ctx.get("cloud", "Commerce B2B"),
+            ctx.get("fy", "FY2027"),
+            industry=ctx.get("industry"),
+            region=ctx.get("region"),
+        )
+        quarters = result.get("quarters", {})
+        all_features = next(
+            (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"] if quarters.get(q)),
+            [],
+        )
+        HEATMAP_CONTEXT[channel] = {
+            **ctx,
+            "features": all_features,
+        }
+        logger.info(
+            f"Compare context expanded to {len(all_features)} features "
+            f"for cross-group comparison"
+        )
+
     logger.info(f"Compare prompt posted for {feature_nm}")
 
 
@@ -1403,7 +1853,7 @@ def handle_heatmap_back_to_group(ack, body, client, logger):
     )
     movers_data = get_feature_account_movers(
         feature_id=worst.get("feature_id"),
-        snapshot_date=worst.get("data_dt", "2026-04-22"),
+        snapshot_date=worst.get("data_dt") or "",
         portfolio=portfolio,
         family=family,
     )
