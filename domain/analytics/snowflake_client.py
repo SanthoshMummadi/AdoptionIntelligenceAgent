@@ -516,6 +516,81 @@ def get_snowflake_connection() -> Any:
         ) from e
 
 
+def get_pdp_snowflake_connection() -> Any:
+    """
+    Get PDP Snowflake connection for DM_PRODUCT_PRD.GLD_ANALYTICS queries.
+
+    On adoption branch: uses personal credentials (externalbrowser SSO)
+    On other branches: uses service account key-pair auth
+
+    Returns:
+        Snowflake connection object
+    """
+    import subprocess
+
+    # Check if we're on adoption branch
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        current_branch = result.stdout.strip()
+        is_adoption_branch = (current_branch == "adoption")
+    except Exception:
+        # Can't determine branch - default to service account
+        is_adoption_branch = False
+
+    base_params = _snowflake_conn_params()
+
+    # Override with PDP-specific database/schema/warehouse
+    base_params["database"] = os.getenv("PDP_SNOWFLAKE_DATABASE", "DM_PRODUCT_PRD")
+    base_params["schema"] = os.getenv("PDP_SNOWFLAKE_SCHEMA", "GLD_ANALYTICS")
+    base_params["warehouse"] = os.getenv("PDP_SNOWFLAKE_WAREHOUSE", "DEMO_WH")
+
+    if is_adoption_branch:
+        # Use personal credentials with externalbrowser SSO
+        base_params["user"] = os.getenv("PDP_SNOWFLAKE_USER", "smummadi@salesforce.com")
+        base_params["role"] = os.getenv(
+            "PDP_SNOWFLAKE_ROLE",
+            "SNF_DM_PRODUCT_PRD_GLD_ANALYTICS_ANALYST_USR"
+        )
+        base_params["authenticator"] = "externalbrowser"
+        # Remove private_key if present (force SSO)
+        base_params.pop("private_key", None)
+        base_params.pop("password", None)
+        log_debug("[PDP] Using personal credentials (adoption branch)")
+    else:
+        # Use service account credentials (key-pair or password)
+        # Role already set from base_params if PDP_SNOWFLAKE_ROLE not in env
+        pdp_role = os.getenv("PDP_SNOWFLAKE_ROLE")
+        if pdp_role:
+            base_params["role"] = pdp_role
+        log_debug("[PDP] Using service account credentials")
+
+    try:
+        conn = snowflake.connector.connect(**base_params)
+        log_debug("[PDP] Snowflake connection established")
+        return conn
+    except Exception as e:
+        log_error(f"[PDP] Connection failed: {e}")
+        raise
+
+
+def return_pdp_connection(conn: Any) -> None:
+    """Close PDP connection (not pooled)."""
+    if conn is None:
+        return
+    try:
+        if not conn.is_closed():
+            conn.close()
+            log_debug("[PDP] Connection closed")
+    except Exception as e:
+        log_debug(f"[PDP] Error closing connection: {str(e)[:60]}")
+
+
 def _product_atr_amount(p: dict) -> float:
     """ABS attrition pipeline from raw Snowflake row or normalized get_account_attrition dict."""
     try:

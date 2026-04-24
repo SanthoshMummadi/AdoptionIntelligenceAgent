@@ -75,12 +75,17 @@ python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
 2. **Salesforce query:** Fetch opportunities, dynamic fields, red account flags
 3. **Snowflake enrichment:** Usage (CIDM), renewals, attrition risk, health scores
 4. **LLM analysis:** Risk theme classification + playbook recommendations (with circuit breaker fallback)
-5. **Canvas generation:** Slack Canvas markdown table with formatted results
+5. **Canvas generation:** Slack Canvas markdown table or List update with formatted results
 6. **Optional export:** Google Sheets export for downstream analysis
 
 **Bulk vs sequential:**
-- Bulk: 3 Snowflake queries → in-memory join → parallel LLM (fast for 50+ accounts)
-- Sequential: Per-account Salesforce + Snowflake → LLM (detailed, works for any input)
+- **Bulk** (`gm_review_bulk_workflow.py`): 
+  - 3 Snowflake queries (renewals with parent rollup + CIDM + Salesforce fields) → in-memory join → parallel LLM
+  - Groups by `COMBO_COMPANY_ID` for parent-level aggregation
+  - Fast for 50+ parent accounts, cloud-wide scans
+- **Sequential** (`gm_review_workflow.py`):
+  - Per-account Salesforce + Snowflake → LLM
+  - Detailed per-opportunity grain, works for any input (names, opp IDs)
 
 ### Entry points
 - **`slack_app.py`** — Slack Bolt app (DMs, hub modules, file ingestion, slash commands including `/gm-review-canvas`, `/at-risk-canvas`)
@@ -129,10 +134,18 @@ For non-internal URLs, TLS always uses certifi or custom CA bundle.
   - `SNOWFLAKE_CIDM_SNAPSHOT_DT=2026-04-01`
 
 ### GM Review: Bulk vs Account-by-Account
-- **Bulk workflow** (`gm_review_bulk_workflow.py`) — Snowflake-first: 3 queries, in-memory join, faster for cloud-wide scans
-- **Account-by-account** (`gm_review_workflow.py`) — Salesforce-first: detailed per-account queries, better for small sets or explicit opp IDs
-- **When to use bulk:** Large cloud scans (50+ accounts), FY filters, ATR thresholds
-- **When to use account-by-account:** Specific accounts/opps, need detailed Salesforce fields, custom enrichment
+- **Bulk workflow** (`gm_review_bulk_workflow.py`) — Snowflake-first with parent-level rollup:
+  - Groups by `COMBO_COMPANY_ID` (parent company) instead of per-opportunity
+  - 3 Snowflake queries (renewals + CIDM + Salesforce dynamic fields) → in-memory join
+  - Filters at parent level: Commerce AOV for Commerce Cloud, total AOV for others
+  - Faster for cloud-wide scans (50+ parent accounts)
+  - Used by `/gm-review-lists` and `/gm-review-sheet`
+- **Account-by-account** (`gm_review_workflow.py`) — Salesforce-first per-opportunity:
+  - Detailed per-account queries with full enrichment
+  - Better for small sets, explicit account names, or specific opp IDs
+  - Used by `/gm-review-canvas`
+- **When to use bulk:** Large cloud scans with FY filters, ATR thresholds, parent-level reporting
+- **When to use account-by-account:** Specific accounts/opps, need granular per-opportunity detail, custom enrichment
 
 ### GM Review Performance
 - Default: **1 concurrent account** (gentle on Snowflake)
@@ -157,9 +170,15 @@ Key timeout environment variables (see `.env.example`):
 
 ### Bulk GM Review Configuration
 - `GM_REVIEW_FCAST_ATTRITION_THRESHOLD=-500000` — ATR threshold for bulk queries (default: -500k, meaning 500k+ attrition)
+- **Parent-level rollup:** Bulk queries group by `COMBO_COMPANY_ID` (parent company) rather than per-opportunity
+  - Commerce Cloud: filters for positive Commerce AOV at parent level
+  - Other clouds: filters for positive total AOV at parent level
+  - Aggregates forecasted attrition across all child opportunities
+- **Stage exclusions:** Automatically excludes dead/closed stages: "05 Closed", "Dead Attrition", "Dead - Duplicate", "Dead - No Decision", "Dead - No Opportunity", "NP - Dead Duplicate", "08 - Closed", "Closed", "Loss - Off Contract", "UNKNOWN", "Courtesy"
 - Bulk queries apply FY lookahead (current FY + 1) and close date filters automatically
 - For Financial Services Cloud: uses CIDM APM_L3 filtering instead of TARGET_CLOUD patterns
 - Result limit: default 500 renewals per bulk query (configurable via `limit` parameter)
+- **Data sources:** `WV_CI_RENEWAL_OPTY_VW` (primary), `WV_CI_ACCT_PRODUCT_APM_VW` (APM), `WV_AV_USAGE_EXTRACT_VW` (usage)
 
 ### Daily Pulse Scheduler
 Configured via environment:
@@ -172,7 +191,9 @@ Started automatically on bot startup via APScheduler.
 ## Common Commands
 
 ### Slack slash commands
-- `/gm-review-canvas <accounts or opp IDs>` — Generate AI Council Review canvas with optional cloud token
+- `/gm-review-canvas <accounts or opp IDs>` — Generate AI Council Review canvas with optional cloud token (account-by-account)
+- `/gm-review-lists <cloud or filters>` — Bulk GM Review with Slack List update (parent-level rollup)
+- `/gm-review-sheet <cloud or filters>` — Bulk GM Review with Google Sheets export (parent-level rollup)
 - `/at-risk-canvas <optional filters>` — Generate at-risk renewal canvas
 - `/attrition-risk <Account Name>` — Get attrition risk summary from Excel model
 - `/attrition-clouds` — List available cloud filters
