@@ -34,8 +34,6 @@ from services.adoption_heatmap_workflow import (
 from services.daily_pulse_workflow import run_daily_pulse
 from domain.content.heatmap_builder import (
     build_adoption_heatmap_blocks,
-    build_product_drilldown_canvas,
-    build_movers_section,
     build_group_drilldown_blocks,
     build_feature_detail_blocks,
 )
@@ -371,15 +369,7 @@ def handle_message(event, say, client):
 
             best = max(matches, key=lambda f: f.get("score", 0))
             feature_name = best["feature"]
-            product_data = [
-                f for f in features
-                if f.get("feature") == feature_name
-            ]
-
             try:
-                drilldown_md = build_product_drilldown_canvas(
-                    product_data, feature_name, cloud, fy
-                )
                 best_feature_id = best.get("feature_id")
                 best_snapshot_dt = best.get("data_dt", "2026-04-22")
                 portfolio, family = _CLOUD_MAPPING.get(cloud, ("Commerce", "B2B Commerce"))
@@ -390,22 +380,15 @@ def handle_message(event, say, client):
                     portfolio=portfolio,
                     family=family,
                 )
-                movers_section = build_movers_section(movers_data)
-                full_canvas = drilldown_md + movers_section
+                blocks, color = build_feature_detail_blocks(
+                    feature=best, movers=movers_data, cloud=cloud, fy=fy
+                )
 
                 client.chat_postMessage(
                     channel=channel,
                     text=f":mag: *{feature_name}* — drill-down",
                     thread_ts=thread_ts,
-                    blocks=[
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": full_canvas[:2900],
-                            },
-                        }
-                    ],
+                    attachments=[{"color": color, "blocks": blocks}]
                 )
                 print(f"Drilldown posted for {feature_name} in {cloud} {fy}")
             except Exception as e:
@@ -1324,7 +1307,7 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
     )
 
     # Build Layer 3 blocks
-    blocks = build_feature_detail_blocks(
+    blocks, color = build_feature_detail_blocks(
         feature=matched,
         movers=movers_data,
         cloud=cloud,
@@ -1335,7 +1318,7 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
         channel=channel,
         thread_ts=message_ts,
         text=f":mag: {feature_nm} · Account Detail",
-        blocks=blocks
+        attachments=[{"color": color, "blocks": blocks}]
     )
     logger.info(
         f"Feature detail posted: {feature_nm} — "

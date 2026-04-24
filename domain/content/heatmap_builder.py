@@ -556,6 +556,46 @@ def build_adoption_heatmap_blocks(
     return blocks
 
 
+STATUS_COLORS = {
+    "green": "#2EB67D",
+    "amber": "#ECB22E",
+    "red": "#E01E5A",
+}
+
+STATUS_BADGES = {
+    "green": ":white_check_mark: HEALTHY",
+    "amber": ":warning: WATCH",
+    "red": ":rotating_light: CRITICAL",
+}
+
+STATUS_EMOJI = {
+    "green": ":large_green_circle:",
+    "amber": ":large_yellow_circle:",
+    "red": ":red_circle:",
+}
+
+
+def _score_bar(score: int) -> str:
+    filled = round(score / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+def _trend_arrow(trend) -> str:
+    if trend is None:
+        return "→ no prior data"
+    if trend > 0:
+        return f":arrow_upper_right: +{trend:.1f}%"
+    return f":arrow_lower_right: {trend:.1f}%"
+
+
+def _status_from_score(score: int) -> str:
+    if score >= 70:
+        return "green"
+    if score >= 40:
+        return "amber"
+    return "red"
+
+
 def build_group_drilldown_blocks(
     group_features: list,
     group_name: str,
@@ -564,198 +604,80 @@ def build_group_drilldown_blocks(
     movers_data: dict = None,
 ) -> list:
     """
-    Builds Slack Block Kit blocks for group drill-down.
-    Posted as a thread reply when Drill down button is clicked
-    or group name is typed.
-
-    Args:
-        group_features: list of scored feature dicts for this group
-        group_name:     e.g. "Cart"
-        cloud:          e.g. "Commerce B2B"
-        fy:             e.g. "FY2027"
-        movers_data:    optional output of get_feature_account_movers()
-
-    Returns:
-        list of Slack Block Kit blocks
+    Layer 2 — Group drill-down blocks.
+    One section per feature with score bar + account detail button.
     """
-    from collections import defaultdict
-    del defaultdict
-
-    # Sort features: worst first
-    sorted_features = sorted(
-        group_features,
-        key=lambda f: f.get("score", 0)
-    )
-
-    # Group summary
-    green_n = sum(1 for f in group_features if f["status"] == "green")
-    amber_n = sum(1 for f in group_features if f["status"] == "amber")
-    red_n = sum(1 for f in group_features if f["status"] == "red")
+    del movers_data
+    sorted_features = sorted(group_features, key=lambda f: f.get("score", 0))
+    green_n = sum(1 for f in group_features if f.get("status") == "green")
+    amber_n = sum(1 for f in group_features if f.get("status") == "amber")
+    red_n = sum(1 for f in group_features if f.get("status") == "red")
     avg_score = round(
-        sum(f["score"] for f in group_features) / len(group_features)
+        sum(f.get("score", 0) for f in group_features) / len(group_features)
     ) if group_features else 0
-    total_accts = max(
-        (f.get("account_count", 0) for f in group_features), default=0
-    )
-
-    # Group status
-    if red_n > 0:
-        group_status = "red"
-        group_emoji = ":red_circle:"
-    elif amber_n > 0:
-        group_status = "amber"
-        group_emoji = ":large_yellow_circle:"
-    else:
-        group_status = "green"
-        group_emoji = ":large_green_circle:"
-    del group_status
+    total_accts = sum(f.get("account_count", 0) for f in group_features)
+    total_mau = sum(f.get("mau", 0) for f in group_features)
 
     blocks = []
-
-    # Header
     blocks.append({
         "type": "header",
-        "text": {
-            "type": "plain_text",
-            "text": f"{group_name} · {cloud} · {fy}",
-            "emoji": True
-        }
+        "text": {"type": "plain_text", "text": f"{group_name} · {cloud} · {fy}", "emoji": True},
     })
-
-    # Group summary
     blocks.append({
         "type": "section",
         "text": {
             "type": "mrkdwn",
             "text": (
-                f"{group_emoji} *{avg_score}% avg adoption*  ·  "
-                f"{len(group_features)} features  ·  "
-                f"{total_accts:,} accounts\n"
+                f"*{avg_score}% avg*  ·  "
+                f"*{len(group_features)} feature{'s' if len(group_features) != 1 else ''}*  ·  "
+                f"*{total_accts:,} accounts*  ·  "
+                f"*{total_mau:,} MAU*\n"
                 f"{green_n} :large_green_circle:  "
                 f"{amber_n} :large_yellow_circle:  "
                 f"{red_n} :red_circle:"
-            )
-        }
+            ),
+        },
     })
-
     blocks.append({"type": "divider"})
 
-    # Feature rows — one section per feature
     for f in sorted_features:
         score = f.get("score", 0)
-        acct_count = f.get("account_count", 0)
+        status = f.get("status") or _status_from_score(score)
+        emoji = STATUS_EMOJI.get(status, ":white_circle:")
+        feature_nm = f.get("feature", "")
+        accts = f.get("account_count", 0)
         mau = f.get("mau", 0)
         trend = f.get("trend")
-        owner = f.get("owner", "Unassigned")
-        status = f.get("status", "")
-        emoji = f.get("emoji", ":white_circle:")
-        feature_nm = f.get("feature", "")
-        description = f.get("description", "")
-        del status
-
-        # Trend string
-        if trend is None:
-            trend_str = "— no prior data"
-        elif trend > 0:
-            trend_str = f":small_red_triangle: +{trend:.1f}%"
-        else:
-            trend_str = f":small_red_triangle_down: {trend:.1f}%"
-
-        # Truncate description to 120 chars
-        desc_preview = ""
-        if description:
-            desc_preview = (
-                description[:117] + "…"
-                if len(description) > 120
-                else description
-            )
-
+        bar = _score_bar(score)
+        trend_str = _trend_arrow(trend)
+        feature_id = f.get("feature_id", "")
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
                     f"{emoji} *{feature_nm}*\n"
-                    f"Score: *{score}%*  ·  "
-                    f"{acct_count:,} accounts  ·  "
-                    f"{mau:,} MAU  ·  "
-                    f"Trend: {trend_str}\n"
-                    f"Owner: {owner}"
-                    + (f"\n_{desc_preview}_" if desc_preview else "")
-                )
+                    f"{bar}  *{score}%*\n"
+                    f":busts_in_silhouette: {accts:,} accounts  ·  "
+                    f":bar_chart: {mau:,} MAU  ·  "
+                    f"{trend_str}"
+                ),
             },
             "accessory": {
                 "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "Account detail ↗",
-                    "emoji": True
-                },
+                "text": {"type": "plain_text", "text": "Account detail ↗", "emoji": True},
                 "action_id": "heatmap_feature_detail",
-                "value": f"{f.get('feature_id', '')}|{f.get('feature', '')}|{cloud}|{fy}"
-            }
+                "value": f"{feature_id}|{feature_nm}|{cloud}|{fy}",
+            },
         })
 
-    blocks.append({"type": "divider"})
-
-    # Movers section — if provided
-    if movers_data:
-        top_movers = movers_data.get("top_movers", [])
-        top_losers = movers_data.get("top_losers", [])
-
-        if top_movers:
-            mover_lines = [":chart_with_upwards_trend: *Top Movers*"]
-            for i, a in enumerate(top_movers, 1):
-                badge = " `NEW`" if a.get("mau_prior", 0) < 5 else ""
-                mover_lines.append(
-                    f"{i}. :large_green_circle: *{a['acct_nm']}*{badge}  "
-                    f"+{a['mau_change_pct']:.1f}%  ·  "
-                    f"{a['mau_current']:,} MAU"
-                    + (f"  ·  {a['csm_name']}"
-                       if a.get('csm_name') != '—' else "")
-                )
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "\n".join(mover_lines)
-                }
-            })
-
-        if top_losers:
-            loser_lines = [":chart_with_downwards_trend: *Losing Ground*"]
-            for a in top_losers:
-                loser_lines.append(
-                    f":red_circle: *{a['acct_nm']}*  "
-                    f"{a['mau_change_pct']:.1f}%  ·  "
-                    f"{a['mau_current']:,} MAU"
-                    + (f"  ·  {a['csm_name']}"
-                       if a.get('csm_name') != 'Unassigned' else "")
-                )
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "\n".join(loser_lines)
-                }
-            })
-
-        if top_movers or top_losers:
-            blocks.append({"type": "divider"})
-
-    # Footer
     blocks.append({
         "type": "context",
         "elements": [{
             "type": "mrkdwn",
-            "text": (
-                "_Click *Account detail ↗* on any feature to see "
-                "top mover and loser accounts  ·  "
-                "Reply with a feature name for full drill-down_"
-            )
-        }]
+            "text": "_Reply with a feature name for the full feature drill-down_",
+        }],
     })
-
     return blocks
 
 
@@ -764,28 +686,17 @@ def build_feature_detail_blocks(
     movers: dict,
     cloud: str,
     fy: str,
-) -> list:
+) -> tuple[list, str]:
     """
-    Layer 3 — Full feature intelligence brief.
-    Matches the PM Intelligence Hub design:
-    - Header + status badge
-    - 4 KPI tiles
-    - Usage trend sparkline (emoji bars)
-    - Root cause analysis
-    - Support case themes
-    - Voice of Customer
-    - Precedent accounts
-    - Owner card
-    - At-risk accounts
-    - Recommended action
-    - Action buttons
+    Layer 3 — Feature intelligence brief blocks.
+    Returns (blocks, color) tuple for use with attachments.
     """
 
     score = feature.get("score", 0)
-    status = feature.get("status", "")
+    status = feature.get("status") or _status_from_score(score)
     feature_nm = feature.get("feature", "")
     group_nm = feature.get("feature_group", "")
-    owner = feature.get("owner", "Unassigned")
+    owner = feature.get("owner", "—")
     acct_count = feature.get("account_count", 0)
     mau = feature.get("mau", 0)
     transactions = feature.get("transactions", 0)
@@ -800,68 +711,14 @@ def build_feature_detail_blocks(
     top_movers = movers.get("top_movers", [])
     top_losers = movers.get("top_losers", [])
 
-    # Status badge
-    status_badge = {
-        "green": "🟢 HEALTHY",
-        "amber": "🟡 WATCH",
-        "red": "🔴 CRITICAL",
-    }.get(status, "⚪ UNKNOWN")
-
-    # Trend string
-    if trend is None:
-        trend_str = "— no prior data"
-        trend_icon = "—"
-    elif trend > 0:
-        trend_str = f"+{trend:.1f}% vs last month"
-        trend_icon = f":small_red_triangle: +{trend:.1f}%"
-    else:
-        trend_str = f"{trend:.1f}% vs last month"
-        trend_icon = f":small_red_triangle_down: {trend:.1f}%"
-
-    # Usage sparkline — 13 emoji blocks
-    # Approximate trend visually using penetration + trend
-    def _sparkline(penetration: float, trend: float | None) -> str:
-        """
-        Builds a 13-block emoji sparkline showing usage direction.
-        Uses penetration as current level, trend to show direction.
-        """
-        base = penetration * 100  # 0-100
-        blocks = 13
-
-        # Simulate 13 weeks of data points
-        if trend is None:
-            # Flat line at current level
-            points = [base] * blocks
-        elif trend > 0:
-            # Growing — start lower, end at current
-            start = max(0, base - abs(trend) * 0.5)
-            points = [
-                start + (base - start) * (i / (blocks - 1))
-                for i in range(blocks)
-            ]
-        else:
-            # Declining — start higher, end at current
-            start = min(100, base + abs(trend) * 0.5)
-            points = [
-                start + (base - start) * (i / (blocks - 1))
-                for i in range(blocks)
-            ]
-
-        # Map each point to emoji
-        def _point_emoji(v: float) -> str:
-            if v >= 70:
-                return ":large_green_circle:"
-            if v >= 30:
-                return ":large_yellow_circle:"
-            return ":red_circle:"
-
-        return "".join(_point_emoji(p) for p in points)
-
-    sparkline = _sparkline(penetration, trend)
+    status_emoji = STATUS_EMOJI.get(status, ":white_circle:")
+    status_badge = STATUS_BADGES.get(status, ":white_circle: UNKNOWN")
+    color = STATUS_COLORS.get(status, "#AAAAAA")
+    bar = _score_bar(score)
+    trend_str = _trend_arrow(trend)
 
     blocks_out = []
 
-    # -- HEADER --
     blocks_out.append({
         "type": "header",
         "text": {
@@ -872,69 +729,44 @@ def build_feature_detail_blocks(
     })
 
     blocks_out.append({
-        "type": "context",
-        "elements": [{
+        "type": "section",
+        "text": {
             "type": "mrkdwn",
             "text": (
-                f"{status_badge}  ·  "
-                f"{cloud}  ·  {group_nm}  ·  "
-                f"{availability}  ·  {fy}  ·  "
-                f"as of {data_dt}"
+                f"*{status_badge}*  ·  {cloud}  ·  "
+                f"{group_nm}  ·  {availability}  ·  "
+                f"{fy}  ·  _as of {data_dt}_"
             )
-        }]
+        }
     })
-
-    blocks_out.append({"type": "divider"})
-
-    # -- 4 KPI TILES --
     blocks_out.append({
         "type": "section",
         "fields": [
             {
                 "type": "mrkdwn",
-                "text": (
-                    f"*:bar_chart: Current Adoption*\n"
-                    f"*{score}%*  ·  {acct_count:,} accounts"
-                )
+                "text": f"*Adoption*\n{bar} {score}%"
             },
             {
                 "type": "mrkdwn",
-                "text": (
-                    f"*:chart_with_downwards_trend: 30-day Trend*\n"
-                    f"*{trend_icon}*"
-                )
+                "text": f"*Accounts*\n:busts_in_silhouette: {acct_count:,}"
             },
             {
                 "type": "mrkdwn",
-                "text": (
-                    f"*:gear: MAU (28d rolling)*\n"
-                    f"*{mau:,}*  ·  {transactions:,} txns"
-                )
+                "text": f"*MAU (28d)*\n:bar_chart: {mau:,}"
             },
             {
                 "type": "mrkdwn",
-                "text": (
-                    f"*:dart: Penetration*\n"
-                    f"*{penetration * 100:.1f}%*  of provisioned accounts"
-                )
+                "text": f"*Penetration*\n:dart: {penetration * 100:.1f}%"
+            },
+            {
+                "type": "mrkdwn",
+                "text": f"*Transactions*\n:arrows_counterclockwise: {transactions:,}"
+            },
+            {
+                "type": "mrkdwn",
+                "text": f"*Trend*\n{trend_str}"
             },
         ]
-    })
-
-    blocks_out.append({"type": "divider"})
-
-    # -- USAGE TREND SPARKLINE --
-    blocks_out.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"*:clock1: Usage Trend  _(13-week)_*\n"
-                f"{sparkline}\n"
-                f"_{trend_str}  ·  "
-                f"Utilization: {utilization * 100:.1f}%_"
-            )
-        }
     })
 
     blocks_out.append({"type": "divider"})
@@ -947,7 +779,7 @@ def build_feature_detail_blocks(
         "text": {
             "type": "mrkdwn",
             "text": (
-                "*:mag: Why Analysis*\n"
+                "*Why Analysis*\n"
                 + "\n".join(
                     f"{i+1}. {rc}"
                     for i, rc in enumerate(root_causes)
@@ -962,10 +794,10 @@ def build_feature_detail_blocks(
     if top_movers:
         mover_lines = ["*:chart_with_upwards_trend: Top Movers*"]
         for i, a in enumerate(top_movers, 1):
-            badge = " `NEW`" if a.get("mau_prior", 0) < 5 else ""
+            badge = " `NEW`" if a.get("mau_prior", 99) < 5 else ""
             csm = (
                 f"  ·  {a['csm_name']}"
-                if a.get("csm_name") and a["csm_name"] not in {"Unassigned", "—"}
+                if a.get("csm_name") not in ("—", None)
                 else ""
             )
             region = (
@@ -1004,7 +836,7 @@ def build_feature_detail_blocks(
         for i, a in enumerate(top_losers, 1):
             csm = (
                 f"  ·  {a['csm_name']}"
-                if a.get("csm_name") and a["csm_name"] != "Unassigned"
+                if a.get("csm_name") not in ("—", None)
                 else ""
             )
             region = (
@@ -1050,38 +882,25 @@ def build_feature_detail_blocks(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:speech_balloon: About this Feature*\n_{desc_preview}_"
+                "text": f"*About this feature*\n_{desc_preview}_"
             }
         })
-        blocks_out.append({"type": "divider"})
-
-    # -- OWNER CARD --
-    blocks_out.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"*:bust_in_silhouette: Feature Owner*\n"
-                f"*{owner}*  ·  {group_nm}  ·  {cloud}"
-            )
-        }
-    })
-
     blocks_out.append({"type": "divider"})
-
-    # -- RECOMMENDED ACTION --
     action_text = _recommended_action(score, trend, acct_count, top_losers)
     blocks_out.append({
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": f"*:bulb: Recommended Action*\n{action_text}"
+            "text": (
+                f"*Feature Owner*\n:bust_in_silhouette: {owner}\n"
+                f"{group_nm}  ·  {cloud}"
+            )
         }
-    })
-
-    blocks_out.append({"type": "divider"})
-
-    # -- ACTION BUTTONS --
+    },)
+    blocks_out[-1]["fields"] = [
+        blocks_out[-1].pop("text"),
+        {"type": "mrkdwn", "text": f"*Recommended Action*\n{action_text}"},
+    ]
     blocks_out.append({
         "type": "actions",
         "elements": [
@@ -1119,20 +938,19 @@ def build_feature_detail_blocks(
         ]
     })
 
-    # -- FOOTER --
     blocks_out.append({
         "type": "context",
         "elements": [{
             "type": "mrkdwn",
             "text": (
-                f"_PDP 2.0  ·  "
-                f"RPT_PRODUCTUSAGE_PFT_ORG_METRICS  ·  "
-                f"{data_dt}_"
+                f":bulb: _PDP 2.0  ·  {data_dt}  ·  "
+                "Reply with account name for deep dive_"
             )
         }]
     })
 
-    return blocks_out
+    del status_emoji, utilization
+    return blocks_out, color
 
 
 def _infer_root_causes(
