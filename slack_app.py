@@ -26,7 +26,13 @@ from domain.analytics.snowflake_client import (
 )
 from domain.tracking.account_tracker import setup_tracking_tables
 from services.app_home import publish_app_home
+from services.adoption_heatmap_workflow import (
+    run_adoption_heatmap,
+    get_available_clouds,
+)
 from services.daily_pulse_workflow import run_daily_pulse
+from domain.content.heatmap_builder import build_product_drilldown_canvas
+from domain.analytics.heatmap_queries import get_adoption_heatmap_data
 from log_utils import log_error
 
 slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -38,6 +44,9 @@ if not slack_bot_token:
 
 app = App(token=slack_bot_token)
 _pulse_scheduler = None
+# In-memory context store for heatmap thread replies
+# Shape: { channel_id: { cloud, fy, features, ts, created } }
+HEATMAP_CONTEXT: dict = {}
 
 
 def on_startup():
@@ -321,6 +330,67 @@ def handle_message(event, say, client):
         return
 
     text = event.get("text", "").strip()
+    channel = event.get("channel")
+    thread_ts = event.get("thread_ts")
+
+    # Heatmap thread-reply flow (only for replies in tracked heatmap threads)
+    if thread_ts and channel:
+        ctx = HEATMAP_CONTEXT.get(channel)
+        if ctx and ctx.get("ts") == thread_ts:
+            features = ctx.get("features", [])
+            cloud = ctx.get("cloud", "")
+            fy = ctx.get("fy", "")
+            text_lower = text.lower()
+            matches = [
+                f for f in features
+                if text_lower in f.get("feature", "").lower()
+                or f.get("feature_group", "").lower() in text_lower
+            ]
+
+            if not matches:
+                feature_names = [f["feature"] for f in features[:10]]
+                say(
+                    thread_ts=thread_ts,
+                    text=(
+                        f":mag: Feature *'{text}'* not found.\n"
+                        f"Try one of: {', '.join(feature_names)}"
+                    ),
+                )
+                return
+
+            best = max(matches, key=lambda f: f.get("score", 0))
+            feature_name = best["feature"]
+            product_data = [
+                f for f in features
+                if f.get("feature") == feature_name
+            ]
+
+            try:
+                drilldown_md = build_product_drilldown_canvas(
+                    product_data, feature_name, cloud, fy
+                )
+                say(
+                    thread_ts=thread_ts,
+                    text=f":mag: *{feature_name}* — drill-down",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": drilldown_md[:2900],
+                            },
+                        }
+                    ],
+                )
+                print(f"Drilldown posted for {feature_name} in {cloud} {fy}")
+            except Exception as e:
+                print(f"Drilldown failed for {feature_name}: {e}")
+                say(
+                    thread_ts=thread_ts,
+                    text=f":x: Drill-down failed for *{feature_name}*: {str(e)}",
+                )
+            return
+
     user = event["user"]
 
     session = get_session(user)
@@ -1036,6 +1106,104 @@ def attrition_risk_cmd(ack, say, command, client):
 
     except Exception as e:
         say(f"❌ Error: {str(e)}")
+
+
+def _clean_stale_heatmap_context():
+    """Remove heatmap context entries older than 4 hours."""
+    cutoff = datetime.now(tz=timezone.utc).timestamp() - (4 * 3600)
+    stale = [
+        k for k, v in HEATMAP_CONTEXT.items()
+        if v.get("created", 0) < cutoff
+    ]
+    for k in stale:
+        del HEATMAP_CONTEXT[k]
+
+
+@app.command("/adoption-heatmap")
+async def handle_adoption_heatmap(ack, body, client, logger):
+    await ack()
+    _clean_stale_heatmap_context()
+
+    # Parse input: "/adoption-heatmap Commerce B2B FY2027"
+    text = (body.get("text") or "").strip()
+    tokens = text.split()
+    fy = next(
+        (t.upper() for t in tokens if t.upper().startswith("FY20")),
+        "FY2027"
+    )
+    cloud_tokens = [t for t in tokens if not t.upper().startswith("FY20")]
+    cloud = " ".join(cloud_tokens).strip() or "Commerce B2B"
+    channel = body["channel_id"]
+    user = body["user_id"]
+
+    # Validate cloud
+    valid_clouds = get_available_clouds()
+    if cloud not in valid_clouds:
+        await client.chat_postEphemeral(
+            channel=channel,
+            user=user,
+            text=(
+                f":x: Unknown cloud *{cloud}*.\n"
+                f"Valid options: {', '.join(valid_clouds)}"
+            )
+        )
+        return
+
+    # Loading indicator
+    await client.chat_postEphemeral(
+        channel=channel,
+        user=user,
+        text=f":hourglass_flowing_sand: Building heatmap for *{cloud}* {fy}..."
+    )
+
+    try:
+        # Generate canvas markdown
+        canvas_md = run_adoption_heatmap(cloud, fy)
+
+        # Post heatmap to channel
+        response = await client.chat_postMessage(
+            channel=channel,
+            text=f":bar_chart: *{cloud} Adoption Heatmap · {fy}*",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": canvas_md[:2900]
+                    }
+                }
+            ]
+        )
+
+        # Fetch scored features for thread reply context
+        result = get_adoption_heatmap_data(cloud, fy)
+        quarters = result.get("quarters", {})
+        features = next(
+            (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"]
+             if quarters.get(q)),
+            []
+        )
+
+        # Store context keyed by channel_id
+        HEATMAP_CONTEXT[channel] = {
+            "cloud": cloud,
+            "fy": fy,
+            "features": features,
+            "ts": response["ts"],
+            "created": datetime.now(tz=timezone.utc).timestamp(),
+        }
+        logger.info(
+            f"Heatmap posted for {cloud} {fy} — "
+            f"{len(features)} features stored in context"
+        )
+
+    except Exception as e:
+        logger.error(f"Heatmap command failed: {e}")
+        await client.chat_postEphemeral(
+            channel=channel,
+            user=user,
+            text=f":x: Heatmap generation failed: {str(e)}"
+        )
 
 
 @app.command("/attrition-clouds")
