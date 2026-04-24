@@ -1,4 +1,4 @@
-from slack_bolt import App
+from slack_bolt import App, BoltContext
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import threading
 import json
 import pickle
 import sqlite3
@@ -31,8 +32,18 @@ from services.adoption_heatmap_workflow import (
     get_available_clouds,
 )
 from services.daily_pulse_workflow import run_daily_pulse
-from domain.content.heatmap_builder import build_product_drilldown_canvas
-from domain.analytics.heatmap_queries import get_adoption_heatmap_data
+from domain.content.heatmap_builder import (
+    build_adoption_heatmap_blocks,
+    build_product_drilldown_canvas,
+    build_movers_section,
+    build_group_drilldown_blocks,
+    build_feature_detail_blocks,
+)
+from domain.analytics.heatmap_queries import (
+    get_adoption_heatmap_data,
+    get_feature_account_movers,
+    _CLOUD_MAPPING,
+)
 from log_utils import log_error
 
 slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -369,15 +380,29 @@ def handle_message(event, say, client):
                 drilldown_md = build_product_drilldown_canvas(
                     product_data, feature_name, cloud, fy
                 )
-                say(
-                    thread_ts=thread_ts,
+                best_feature_id = best.get("feature_id")
+                best_snapshot_dt = best.get("data_dt", "2026-04-22")
+                portfolio, family = _CLOUD_MAPPING.get(cloud, ("Commerce", "B2B Commerce"))
+
+                movers_data = get_feature_account_movers(
+                    feature_id=best_feature_id,
+                    snapshot_date=best_snapshot_dt,
+                    portfolio=portfolio,
+                    family=family,
+                )
+                movers_section = build_movers_section(movers_data)
+                full_canvas = drilldown_md + movers_section
+
+                client.chat_postMessage(
+                    channel=channel,
                     text=f":mag: *{feature_name}* — drill-down",
+                    thread_ts=thread_ts,
                     blocks=[
                         {
                             "type": "section",
                             "text": {
                                 "type": "mrkdwn",
-                                "text": drilldown_md[:2900],
+                                "text": full_canvas[:2900],
                             },
                         }
                     ],
@@ -1120,8 +1145,8 @@ def _clean_stale_heatmap_context():
 
 
 @app.command("/adoption-heatmap")
-async def handle_adoption_heatmap(ack, body, client, logger):
-    await ack()
+def handle_adoption_heatmap(ack, body, client, logger):
+    ack()
     _clean_stale_heatmap_context()
 
     # Parse input: "/adoption-heatmap Commerce B2B FY2027"
@@ -1139,7 +1164,7 @@ async def handle_adoption_heatmap(ack, body, client, logger):
     # Validate cloud
     valid_clouds = get_available_clouds()
     if cloud not in valid_clouds:
-        await client.chat_postEphemeral(
+        client.chat_postEphemeral(
             channel=channel,
             user=user,
             text=(
@@ -1150,60 +1175,265 @@ async def handle_adoption_heatmap(ack, body, client, logger):
         return
 
     # Loading indicator
-    await client.chat_postEphemeral(
+    client.chat_postEphemeral(
         channel=channel,
         user=user,
         text=f":hourglass_flowing_sand: Building heatmap for *{cloud}* {fy}..."
     )
 
-    try:
-        # Generate canvas markdown
-        canvas_md = run_adoption_heatmap(cloud, fy)
+    def _run_heatmap_async():
+        try:
+            # Generate scored features for latest quarter
+            result = get_adoption_heatmap_data(cloud, fy)
+            quarters = result.get("quarters", {})
+            features = next(
+                (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"]
+                 if quarters.get(q)),
+                []
+            )
+            blocks = build_adoption_heatmap_blocks(features, cloud, fy)
 
-        # Post heatmap to channel
-        response = await client.chat_postMessage(
+            # Post heatmap to channel
+            response = client.chat_postMessage(
+                channel=channel,
+                text=f":bar_chart: {cloud} Adoption Heatmap · {fy}",
+                blocks=blocks
+            )
+
+            # Store context keyed by channel_id
+            HEATMAP_CONTEXT[channel] = {
+                "cloud": cloud,
+                "fy": fy,
+                "features": features,
+                "ts": response["ts"],
+                "created": datetime.now(tz=timezone.utc).timestamp(),
+            }
+            logger.info(
+                f"Heatmap posted for {cloud} {fy} — "
+                f"{len(features)} features stored in context"
+            )
+
+        except Exception as e:
+            logger.error(f"Heatmap command failed: {e}")
+            client.chat_postEphemeral(
+                channel=channel,
+                user=user,
+                text=f":x: Heatmap generation failed: {str(e)}"
+            )
+
+    threading.Thread(target=_run_heatmap_async, daemon=True).start()
+
+
+@app.action("heatmap_drilldown")
+def handle_heatmap_drilldown(ack, body, client, logger):
+    ack()
+
+    value = body["actions"][0]["value"]
+    parts = value.split("|")
+    group_name = parts[0]
+    cloud = parts[1]
+    fy = parts[2]
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+
+    # Get features for this group from context
+    ctx = HEATMAP_CONTEXT.get(channel)
+    features = ctx.get("features", []) if ctx else []
+    group_features = [
+        f for f in features
+        if f.get("feature_group") == group_name
+    ]
+
+    if not group_features:
+        client.chat_postMessage(
             channel=channel,
-            text=f":bar_chart: *{cloud} Adoption Heatmap · {fy}*",
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": canvas_md[:2900]
-                    }
-                }
-            ]
+            thread_ts=message_ts,
+            text=f":x: No features found for group *{group_name}*"
         )
+        return
 
-        # Fetch scored features for thread reply context
-        result = get_adoption_heatmap_data(cloud, fy)
-        quarters = result.get("quarters", {})
-        features = next(
-            (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"]
-             if quarters.get(q)),
-            []
-        )
+    # Fetch movers for worst feature in group
+    worst = min(group_features, key=lambda f: f.get("score", 100))
+    portfolio, family = _CLOUD_MAPPING.get(
+        cloud, ("Commerce", "B2B Commerce")
+    )
+    movers_data = get_feature_account_movers(
+        feature_id=worst.get("feature_id"),
+        snapshot_date=worst.get("data_dt", "2026-04-22"),
+        portfolio=portfolio,
+        family=family,
+    )
 
-        # Store context keyed by channel_id
-        HEATMAP_CONTEXT[channel] = {
-            "cloud": cloud,
-            "fy": fy,
-            "features": features,
-            "ts": response["ts"],
-            "created": datetime.now(tz=timezone.utc).timestamp(),
-        }
-        logger.info(
-            f"Heatmap posted for {cloud} {fy} — "
-            f"{len(features)} features stored in context"
-        )
+    # Build and post Layer 2 blocks
+    drilldown_blocks = build_group_drilldown_blocks(
+        group_features, group_name, cloud, fy, movers_data
+    )
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=message_ts,
+        text=f":mag: {group_name} drill-down",
+        blocks=drilldown_blocks
+    )
+    logger.info(
+        f"Group drilldown posted: {group_name} "
+        f"— {len(group_features)} features, "
+        f"{len(movers_data.get('top_movers', []))} movers, "
+        f"{len(movers_data.get('top_losers', []))} losers"
+    )
 
-    except Exception as e:
-        logger.error(f"Heatmap command failed: {e}")
-        await client.chat_postEphemeral(
+
+@app.action("heatmap_feature_detail")
+def handle_heatmap_feature_detail(ack, body, client, logger):
+    ack()
+
+    value = body["actions"][0]["value"]
+    parts = value.split("|")
+    feature_id = parts[0]
+    feature_nm = parts[1]
+    cloud = parts[2]
+    fy = parts[3]
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+
+    # Get context
+    ctx = HEATMAP_CONTEXT.get(channel)
+    features = ctx.get("features", []) if ctx else []
+
+    # Find the feature
+    matched = next(
+        (f for f in features if f.get("feature_id") == feature_id),
+        None
+    )
+    if not matched:
+        client.chat_postMessage(
             channel=channel,
-            user=user,
-            text=f":x: Heatmap generation failed: {str(e)}"
+            thread_ts=message_ts,
+            text=f":x: Feature *{feature_nm}* not found in context."
         )
+        return
+
+    # Fetch movers
+    portfolio, family = _CLOUD_MAPPING.get(
+        cloud, ("Commerce", "B2B Commerce")
+    )
+    movers_data = get_feature_account_movers(
+        feature_id=feature_id,
+        snapshot_date=matched.get("data_dt", "2026-04-22"),
+        portfolio=portfolio,
+        family=family,
+    )
+
+    # Build Layer 3 blocks
+    blocks = build_feature_detail_blocks(
+        feature=matched,
+        movers=movers_data,
+        cloud=cloud,
+        fy=fy,
+    )
+
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=message_ts,
+        text=f":mag: {feature_nm} · Account Detail",
+        blocks=blocks
+    )
+    logger.info(
+        f"Feature detail posted: {feature_nm} — "
+        f"{len(movers_data.get('top_movers', []))} movers, "
+        f"{len(movers_data.get('top_losers', []))} losers"
+    )
+
+
+@app.action("heatmap_message_owner")
+def handle_heatmap_message_owner(ack, body, client, logger):
+    ack()
+    value = body["actions"][0]["value"]
+    parts = value.split("|")
+    feature_nm = parts[1]
+    owner = parts[2]
+    cloud = parts[3]
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=message_ts,
+        text=(
+            f":envelope: *Draft message to {owner}*\n\n"
+            f"> Hi {owner.split()[0]}, I was reviewing adoption data "
+            f"for *{feature_nm}* in {cloud} and wanted to connect. "
+            f"Are you available for a quick sync this week?\n\n"
+            f"_Copy and send this via Slack DM_"
+        )
+    )
+    logger.info(f"Message owner draft posted for {owner} re: {feature_nm}")
+
+
+@app.action("heatmap_compare")
+def handle_heatmap_compare(ack, body, client, logger):
+    ack()
+    value = body["actions"][0]["value"]
+    parts = value.split("|")
+    feature_nm = parts[1]
+    cloud = parts[2]
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=message_ts,
+        text=(
+            f":bar_chart: To compare *{feature_nm}* with another feature, "
+            f"reply with the feature name in this thread."
+        )
+    )
+    logger.info(f"Compare prompt posted for {feature_nm}")
+
+
+@app.action("heatmap_back_to_group")
+def handle_heatmap_back_to_group(ack, body, client, logger):
+    ack()
+    value = body["actions"][0]["value"]
+    parts = value.split("|")
+    group_nm = parts[0]
+    cloud = parts[1]
+    fy = parts[2]
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+
+    ctx = HEATMAP_CONTEXT.get(channel)
+    features = ctx.get("features", []) if ctx else []
+    group_feats = [
+        f for f in features
+        if f.get("feature_group") == group_nm
+    ]
+
+    if not group_feats:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=message_ts,
+            text=f":x: Group *{group_nm}* not found in context."
+        )
+        return
+
+    worst = min(group_feats, key=lambda f: f.get("score", 100))
+    portfolio, family = _CLOUD_MAPPING.get(
+        cloud, ("Commerce", "B2B Commerce")
+    )
+    movers_data = get_feature_account_movers(
+        feature_id=worst.get("feature_id"),
+        snapshot_date=worst.get("data_dt", "2026-04-22"),
+        portfolio=portfolio,
+        family=family,
+    )
+    drilldown_blocks = build_group_drilldown_blocks(
+        group_feats, group_nm, cloud, fy, movers_data
+    )
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=message_ts,
+        text=f":mag: {group_nm} — back to group",
+        blocks=drilldown_blocks
+    )
+    logger.info(f"Back to group posted: {group_nm}")
 
 
 @app.command("/attrition-clouds")

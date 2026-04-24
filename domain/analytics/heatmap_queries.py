@@ -304,3 +304,146 @@ def get_adoption_heatmap_data(cloud: str, fy: str = "FY2027") -> dict:
             "latest_dt": latest_dt,
         }
     }
+
+
+def get_feature_account_movers(
+    feature_id: str,
+    snapshot_date: str,
+    portfolio: str,
+    family: str,
+    top_n: int = 5
+) -> dict:
+    """
+    Returns top mover and top loser accounts for a given feature
+    by comparing current vs prior month MAU.
+
+    Args:
+        feature_id:    PRODUCT_FEATURE_ID from RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+        snapshot_date: Current snapshot date string e.g. '2026-04-22'
+        portfolio:     e.g. 'Commerce'
+        family:        e.g. 'B2B Commerce'
+        top_n:         Number of movers/losers to return (default 5)
+
+    Returns:
+        {
+            "top_movers": [...],   # accounts with biggest MAU growth
+            "top_losers": [...],   # accounts with biggest MAU drop
+        }
+
+    Each account dict:
+        {
+            "acct_nm":        str,
+            "acct_id":        str,
+            "csm_name":       str,
+            "csg_region":     str,
+            "mau_current":    int,
+            "mau_prior":      int,
+            "mau_change_pct": float,
+        }
+    """
+    from domain.analytics.snowflake_client import (
+        get_pdp_snowflake_connection,
+        return_pdp_connection,
+    )
+
+    conn = None
+    try:
+        conn = get_pdp_snowflake_connection()
+        cur = conn.cursor()
+
+        # Get prior snapshot date — latest date before current
+        cur.execute("""
+            SELECT MAX(DATA_DT)
+            FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+            WHERE PRODUCT_PORTFOLIO    = %s
+              AND PRODUCT_FEATURE_FAMILY = %s
+              AND DATA_DT < %s
+        """, (portfolio, family, snapshot_date))
+        row = cur.fetchone()
+        prior_date = str(row[0]) if row and row[0] else None
+
+        if not prior_date:
+            return {"top_movers": [], "top_losers": []}
+
+        # Query current + prior MAU per account for this feature
+        cur.execute("""
+            WITH current_snap AS (
+                SELECT
+                    ACCT_ID,
+                    MAX(ACCT_NM)                        AS acct_nm,
+                    MAX(CSM_NAME)                       AS csm_name,
+                    MAX(CSG_REGION_NM)                  AS csg_region,
+                    SUM(ORG_PF_ROLLING_28D_MAU)         AS mau_current
+                FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+                WHERE PRODUCT_FEATURE_ID    = %s
+                  AND DATA_DT               = %s
+                  AND ORG_PF_ROLLING_28D_MAU > 10
+                GROUP BY ACCT_ID
+            ),
+            prior_snap AS (
+                SELECT
+                    ACCT_ID,
+                    SUM(ORG_PF_ROLLING_28D_MAU)         AS mau_prior
+                FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+                WHERE PRODUCT_FEATURE_ID    = %s
+                  AND DATA_DT               = %s
+                  AND ORG_PF_ROLLING_28D_MAU > 10
+                GROUP BY ACCT_ID
+            )
+            SELECT
+                c.ACCT_ID,
+                c.acct_nm,
+                c.csm_name,
+                c.csg_region,
+                c.mau_current,
+                p.mau_prior,
+                ROUND(
+                    (c.mau_current - p.mau_prior)
+                    / NULLIF(p.mau_prior, 0) * 100
+                , 1)                                    AS mau_change_pct
+            FROM current_snap c
+            JOIN prior_snap p ON c.ACCT_ID = p.ACCT_ID
+            WHERE p.mau_prior > 0
+              AND c.mau_current > 0
+            ORDER BY mau_change_pct DESC
+        """, (feature_id, snapshot_date, feature_id, prior_date))
+
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        cur.close()
+
+        all_accounts = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            all_accounts.append({
+                "acct_nm":        str(d["ACCT_NM"] or ""),
+                "acct_id":        str(d["ACCT_ID"] or ""),
+                "csm_name":       str(d["CSM_NAME"] or "Unassigned"),
+                "csg_region":     str(d["CSG_REGION"] or ""),
+                "mau_current":    int(d["MAU_CURRENT"] or 0),
+                "mau_prior":      int(d["MAU_PRIOR"] or 0),
+                "mau_change_pct": float(d["MAU_CHANGE_PCT"] or 0.0),
+            })
+
+        # Split into movers and losers
+        top_movers = [a for a in all_accounts if a["mau_change_pct"] > 0][:top_n]
+        top_losers = sorted(
+            [a for a in all_accounts if a["mau_change_pct"] < 0],
+            key=lambda x: x["mau_change_pct"]
+        )[:top_n]
+
+        return {
+            "top_movers": top_movers,
+            "top_losers": top_losers,
+        }
+
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(
+            f"[PDP] get_feature_account_movers failed: {e}"
+        )
+        return {"top_movers": [], "top_losers": []}
+
+    finally:
+        if conn:
+            return_pdp_connection(conn)
