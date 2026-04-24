@@ -138,6 +138,13 @@ For non-internal URLs, TLS always uses certifi or custom CA bundle.
   - `SNOWFLAKE_RENEWAL_AS_OF_DATE=2026-03-01`
   - `SNOWFLAKE_CIDM_SNAPSHOT_DT=2026-04-01`
 
+### PDP Snowflake Authentication
+**PDP 2.0 Authentication:**
+- **adoption branch:** personal credentials (`externalbrowser` SSO — requires browser popup)
+- **production/other branches:** service account (no browser interaction needed)
+- Branch detection is automatic in `get_pdp_snowflake_connection()`
+- **NEVER commit personal credentials to non-adoption branches**
+
 ### GM Review: Bulk vs Account-by-Account
 - **Bulk workflow** (`gm_review_bulk_workflow.py`) — Snowflake-first with parent-level rollup:
   - Groups by `COMBO_COMPANY_ID` (parent company) instead of per-opportunity
@@ -201,6 +208,17 @@ The `/adoption-heatmap` command provides interactive product adoption analysis:
 4. **Data source:** PDP Snowflake (`DM_PRODUCT_PRD.GLD_ANALYTICS`) via `domain/analytics/heatmap_queries.py`
 5. **Scoring:** Combines adoption rate, active accounts, and product breadth into composite score
 
+**Color coding thresholds (industry standard 70/30):**
+- **green** ≥70% — Healthy
+- **amber** 30-69% — Watch
+- **red** <30% — Critical
+
+**Composite score weights:**
+- 60% utilization (used/provisioned)
+- 30% penetration (accounts using/total accounts)
+- 10% trend (% change vs prior quarter)
+  - Redistributed 70/30 if no prior quarter data
+
 **Implementation notes:**
 - Heatmap context expires after 1 hour to prevent stale lookups
 - Feature matching uses case-insensitive substring search across feature name and feature group
@@ -209,7 +227,22 @@ The `/adoption-heatmap` command provides interactive product adoption analysis:
 ## Common Commands
 
 ### Slack slash commands
-- `/adoption-heatmap <cloud> [fy]` — Generate product adoption heatmap for a cloud/FY with interactive thread-based drilldown
+- `/adoption-heatmap <cloud> [fy] [industry] [region]` — Generate product adoption heatmap for a cloud/FY with interactive thread-based drilldown
+  
+  **Supported filters:**
+  ```
+  /adoption-heatmap Commerce B2B
+  /adoption-heatmap Commerce B2B FY2027
+  /adoption-heatmap Commerce B2B FY2027 Retail
+  /adoption-heatmap Commerce B2B FY2027 EMEA North
+  /adoption-heatmap Commerce B2B FY2027 Manufacturing AMER REG
+  ```
+  
+  **Filter dimensions:**
+  - **Industry:** Manufacturing, Retail & CG, Technology, Healthcare, Financial Services, etc.
+  - **Region:** AMER REG, EMEA North, EMEA South, UKI, LATAM, ANZ, North Asia, South Asia, SMB, PubSec
+  - **FY:** FY2027 (default), FY2026, FY2028
+
 - `/gm-review-canvas <accounts or opp IDs>` — Generate AI Council Review canvas with optional cloud token (account-by-account)
 - `/gm-review-lists <cloud or filters>` — Bulk GM Review with Slack List update (parent-level rollup)
 - `/gm-review-sheet <cloud or filters>` — Bulk GM Review with Google Sheets export (parent-level rollup)
