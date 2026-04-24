@@ -372,10 +372,10 @@ def build_adoption_heatmap_blocks(
     for f in scored_data:
         groups[f["feature_group"]].append(f)
 
-    # Summary counts
-    green_n = sum(1 for f in scored_data if f["status"] == "green")
-    amber_n = sum(1 for f in scored_data if f["status"] == "amber")
-    red_n = sum(1 for f in scored_data if f["status"] == "red")
+    # Summary counts (score-based bands)
+    green_n = sum(1 for f in scored_data if f.get("score", 0) >= 60)
+    amber_n = sum(1 for f in scored_data if 40 <= f.get("score", 0) < 60)
+    red_n = sum(1 for f in scored_data if f.get("score", 0) < 40)
     total = len(scored_data)
     accounts = max((f.get("account_count", 0) for f in scored_data), default=0)
 
@@ -413,6 +413,29 @@ def build_adoption_heatmap_blocks(
         key=lambda x: (status_order[_group_status(x[1])], -_group_avg_score(x[1]))
     )
 
+    GROUP_EMOJI = {
+        "Markets/I18n": ":earth_africa:",
+        "Buyer Groups": ":busts_in_silhouette:",
+        "Pricing": ":label:",
+        "Search": ":mag:",
+        "Setup & User Tools": ":gear:",
+        "Cart": ":shopping_trolley:",
+        "Shipping": ":package:",
+        "Product & Catalog": ":clipboard:",
+        "B2B Payments": ":moneybag:",
+        "Shopper Experience & Profiles": ":shopping_bags:",
+        "Promotions": ":dart:",
+        "Checkout": ":credit_card:",
+        "Import/Export Tools": ":inbox_tray:",
+        "Payments": ":credit_card:",
+        "Agentforce for Shopping": ":robot_face:",
+        "Analytics": ":bar_chart:",
+        "Buyer Messaging": ":speech_balloon:",
+        "Data Cloud for Commerce": ":cloud:",
+        "Subscriptions": ":arrows_counterclockwise:",
+        "Tax": ":receipt:",
+    }
+
     # Strongest / needs attention
     all_sorted = sorted(scored_data, key=lambda f: f["score"], reverse=True)
     strongest = all_sorted[0] if all_sorted else None
@@ -430,7 +453,7 @@ def build_adoption_heatmap_blocks(
         "type": "header",
         "text": {
             "type": "plain_text",
-            "text": f":bar_chart: {cloud} · Adoption Heatmap · {fy}",
+            "text": f":chart_with_upwards_trend: {cloud} · Adoption Heatmap · {fy}",
             "emoji": True
         }
     })
@@ -464,22 +487,26 @@ def build_adoption_heatmap_blocks(
 
     # Group rows with drill-down buttons
     for group_name, features in sorted_groups:
-        status = _group_status(features)
         avg_score = _group_avg_score(features)
         count = len(features)
-        emoji = {
-            "red": ":red_circle:",
-            "amber": ":large_yellow_circle:",
-            "green": ":large_green_circle:",
-        }[status]
+        total_group_accts = max(
+            (f.get("account_count", 0) for f in features),
+            default=0
+        )
+        group_emoji = GROUP_EMOJI.get(group_name, ":bookmark_tabs:")
+        filled = round(avg_score / 10)
+        score_bar = "█" * filled + "░" * (10 - filled)
+        trend_badge = "`NEW`"
 
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"{emoji} *{group_name}*"
-                    f"    {count} features · {avg_score}% avg"
+                    f"{group_emoji} *{group_name}*  {trend_badge}\n"
+                    f"{score_bar}  {avg_score}% avg  ·  "
+                    f"{count} feature{'s' if count != 1 else ''}  ·  "
+                    f"{total_group_accts:,} accounts"
                 )
             },
             "accessory": {
@@ -678,13 +705,14 @@ def build_group_drilldown_blocks(
 
         if top_movers:
             mover_lines = [":chart_with_upwards_trend: *Top Movers*"]
-            for a in top_movers:
+            for i, a in enumerate(top_movers, 1):
+                badge = " `NEW`" if a.get("mau_prior", 0) < 5 else ""
                 mover_lines.append(
-                    f":large_green_circle: *{a['acct_nm']}*  "
+                    f"{i}. :large_green_circle: *{a['acct_nm']}*{badge}  "
                     f"+{a['mau_change_pct']:.1f}%  ·  "
                     f"{a['mau_current']:,} MAU"
                     + (f"  ·  {a['csm_name']}"
-                       if a.get('csm_name') != 'Unassigned' else "")
+                       if a.get('csm_name') != '—' else "")
                 )
             blocks.append({
                 "type": "section",
@@ -934,9 +962,10 @@ def build_feature_detail_blocks(
     if top_movers:
         mover_lines = ["*:chart_with_upwards_trend: Top Movers*"]
         for i, a in enumerate(top_movers, 1):
+            badge = " `NEW`" if a.get("mau_prior", 0) < 5 else ""
             csm = (
                 f"  ·  {a['csm_name']}"
-                if a.get("csm_name") and a["csm_name"] != "Unassigned"
+                if a.get("csm_name") and a["csm_name"] not in {"Unassigned", "—"}
                 else ""
             )
             region = (
@@ -944,7 +973,7 @@ def build_feature_detail_blocks(
                 if a.get("csg_region") else ""
             )
             mover_lines.append(
-                f"{i}. :large_green_circle: *{a['acct_nm']}*  "
+                f"{i}. :large_green_circle: *{a['acct_nm']}*{badge}  "
                 f"+{a['mau_change_pct']:.1f}%  ·  "
                 f"{a['mau_current']:,} MAU"
                 f"{region}{csm}"

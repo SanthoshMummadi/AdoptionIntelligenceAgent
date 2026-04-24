@@ -117,10 +117,10 @@ def calculate_adoption_score(
     utilization_score = utilization * 100  # 0-100
 
     # --- Penetration: account_count with usage / total accounts ---
-    # For PDP 2.0: account_count = accounts with ORG_PF_ROLLING_28D_MAU > 0
-    # We treat account_count as numerator, use activated as denominator proxy
-    # If activated = 0, fall back to provisioned
-    denominator = activated if activated > 0 else provisioned
+    # For PDP 2.0, provisioned should be total in-scope accounts.
+    # Use provisioned as denominator to avoid 100% inflation when
+    # activated/account_count are both populated from active accounts.
+    denominator = provisioned if provisioned > 0 else activated
     penetration = (account_count / denominator) if denominator > 0 else 0.0
     penetration = min(penetration, 1.0)  # cap at 100%
     penetration_score = penetration * 100  # 0-100

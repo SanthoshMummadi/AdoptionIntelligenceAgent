@@ -418,7 +418,7 @@ def get_feature_account_movers(
             all_accounts.append({
                 "acct_nm":        str(d["ACCT_NM"] or ""),
                 "acct_id":        str(d["ACCT_ID"] or ""),
-                "csm_name":       str(d["CSM_NAME"] or "Unassigned"),
+                "csm_name":       str(d["CSM_NAME"] or "—"),
                 "csg_region":     str(d["CSG_REGION"] or ""),
                 "mau_current":    int(d["MAU_CURRENT"] or 0),
                 "mau_prior":      int(d["MAU_PRIOR"] or 0),

@@ -27,7 +27,8 @@ Copy `.env.example` to `.env` and configure:
 - **Slack:** `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
 - **LLM:** `LLM_GATEWAY_API_KEY`, `LLM_MODEL=claude-3-7-sonnet`
 - **Salesforce:** Session-based (`SF_ACCESS_TOKEN` + `SF_INSTANCE_URL`) or username-based (`SF_USERNAME` + `SF_PASSWORD`)
-- **Snowflake:** `SNOWFLAKE_USER`, `SNOWFLAKE_ACCOUNT` (+ connector secrets)
+- **Snowflake (CSG):** `SNOWFLAKE_USER`, `SNOWFLAKE_ACCOUNT` (+ connector secrets)
+- **Snowflake (PDP):** `PDP_SNOWFLAKE_USER`, `PDP_SNOWFLAKE_ROLE`, `PDP_SNOWFLAKE_DATABASE=DM_PRODUCT_PRD`, `PDP_SNOWFLAKE_SCHEMA=GLD_ANALYTICS` (for adoption heatmap)
 - **Tableau:** `TABLEAU_SERVER`, `TABLEAU_SITE`, `TABLEAU_TOKEN_NAME`, `TABLEAU_TOKEN_SECRET`
 
 **Important:** For production, `server.py` validates required env vars at startup. To skip for tests/scripts: set `PRODUCT_ADOPTION_SKIP_ENV_VALIDATION=1` or run from `tests/` directory.
@@ -94,13 +95,17 @@ python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
 ### Core modules
 - **`services/gm_review_workflow.py`** — GM Review orchestration: Salesforce + Snowflake + LLM + canvas markdown (account-by-account)
 - **`services/gm_review_bulk_workflow.py`** — Bulk GM Review: 3 queries → in-memory join → faster for large cloud scans
+- **`services/adoption_heatmap_workflow.py`** — Adoption heatmap orchestration: PDP Snowflake → feature scoring → canvas generation
+- **`services/daily_pulse_workflow.py`** — Scheduled daily pulse execution (APScheduler)
 - **`domain/salesforce/org62_client.py`** — Salesforce authentication and query execution with concurrency limiting
 - **`domain/salesforce/bulk_org62.py`** — Bulk Salesforce queries for GM Review (dynamic fields, red accounts)
 - **`domain/analytics/snowflake_client.py`** — Snowflake enrichment, connection pooling, attrition queries
 - **`domain/analytics/bulk_cidm.py`** — Bulk CIDM usage queries
 - **`domain/analytics/bulk_renewals.py`** — Bulk Snowflake renewal queries with configurable ATR thresholds
+- **`domain/analytics/heatmap_queries.py`** — PDP Snowflake queries for product adoption metrics
 - **`domain/intelligence/risk_engine.py`** — Risk theme classification, playbook mapping, LLM-generated analysis with fallbacks
 - **`domain/content/canvas_builder.py`** — Slack Canvas markdown generation for GM Review tables
+- **`domain/content/heatmap_builder.py`** — Heatmap canvas generation and product drilldown formatting
 - **`domain/integrations/gsheet_exporter.py`** — Optional Google Sheets export for GM Review data
 
 ### Persistence (treat as sensitive)
@@ -188,9 +193,23 @@ Configured via environment:
 
 Started automatically on bot startup via APScheduler.
 
+### Adoption Heatmap with Thread Drilldown
+The `/adoption-heatmap` command provides interactive product adoption analysis:
+1. **Initial canvas:** Top features by adoption score for a cloud/FY with summary metrics
+2. **Thread-based drilldown:** Reply with a feature name in the thread to get per-product detail
+3. **Context tracking:** `slack_app.py` maintains in-memory `HEATMAP_CONTEXT` dict keyed by channel, storing cloud/FY/features/thread_ts
+4. **Data source:** PDP Snowflake (`DM_PRODUCT_PRD.GLD_ANALYTICS`) via `domain/analytics/heatmap_queries.py`
+5. **Scoring:** Combines adoption rate, active accounts, and product breadth into composite score
+
+**Implementation notes:**
+- Heatmap context expires after 1 hour to prevent stale lookups
+- Feature matching uses case-insensitive substring search across feature name and feature group
+- Drilldown shows per-product metrics: accounts, adoption %, feature group, and relative contribution
+
 ## Common Commands
 
 ### Slack slash commands
+- `/adoption-heatmap <cloud> [fy]` — Generate product adoption heatmap for a cloud/FY with interactive thread-based drilldown
 - `/gm-review-canvas <accounts or opp IDs>` — Generate AI Council Review canvas with optional cloud token (account-by-account)
 - `/gm-review-lists <cloud or filters>` — Bulk GM Review with Slack List update (parent-level rollup)
 - `/gm-review-sheet <cloud or filters>` — Bulk GM Review with Google Sheets export (parent-level rollup)
@@ -198,6 +217,7 @@ Started automatically on bot startup via APScheduler.
 - `/attrition-risk <Account Name>` — Get attrition risk summary from Excel model
 - `/attrition-clouds` — List available cloud filters
 - `/risk-mapping <optional theme>` — Show risk theme to playbook mappings
+- `/pulse-now` — Trigger daily pulse immediately (manual override)
 - `/tableau-test` — Test Tableau integration
 
 ### Module switching in DM
