@@ -217,8 +217,27 @@ def build_adoption_pov(usage_data: list, cloud: str = "Commerce Cloud") -> str:
 
 def get_canvas_url(canvas_id: str) -> str:
     """Build canvas URL."""
-    team_id = "T2E6RHTM0"
+    team_id = os.environ.get("SLACK_TEAM_ID", "T2E6RHTM0")
     return f"https://salesforce.enterprise.slack.com/docs/{team_id}/{canvas_id}"
+
+
+def update_canvas_markdown(client, canvas_id: str, markdown: str) -> dict:
+    """Replace entire canvas body with new markdown (canvases.edit)."""
+    return client.api_call(
+        "canvases.edit",
+        json={
+            "canvas_id": canvas_id,
+            "changes": [
+                {
+                    "operation": "replace_all",
+                    "document_content": {
+                        "type": "markdown",
+                        "markdown": markdown,
+                    },
+                }
+            ],
+        },
+    )
 
 
 def create_canvas(client, title: str, markdown: str, user_id: str) -> str:

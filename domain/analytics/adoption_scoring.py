@@ -1,3 +1,5 @@
+from domain.analytics.threshold_config import get_thresholds
+
 """
 domain/analytics/adoption_scoring.py
 
@@ -53,7 +55,8 @@ def calculate_adoption_score(
     activated: int,
     used: int,
     account_count: int,
-    prev_quarter_used: int = None
+    prev_quarter_used: int = None,
+    cloud_family: str = "",
 ) -> dict:
     """
     Calculates composite adoption score for one product/quarter cell.
@@ -158,10 +161,11 @@ def calculate_adoption_score(
     # --- Clamp final score to 0-100 ---
     score = max(0, min(100, round(score)))
 
-    # --- Status thresholds ---
-    if score >= 70:
+    # --- Status thresholds (cloud configurable) ---
+    thresholds = get_thresholds(cloud_family or "")
+    if score >= thresholds["green"]:
         status = "green"
-    elif score >= 30:
+    elif score >= thresholds["yellow"]:
         status = "amber"
     else:
         status = "red"
@@ -203,3 +207,13 @@ def score_to_emoji(status: str) -> str:
         "amber": ":large_yellow_circle:",
         "red":   ":red_circle:",
     }.get(status, ":white_circle:")
+
+
+def build_gus_url(feature_id: str) -> str:
+    """Returns Product Feature GUS URL for a feature ID."""
+    if not feature_id:
+        return ""
+    return (
+        "https://gus.lightning.force.com/lightning/r/"
+        f"Product_Feature__c/{feature_id}/view"
+    )

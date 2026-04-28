@@ -1,0 +1,9 @@
+source venv/bin/activate
+	
+
+sf org login web --instance-url https://org62.my.salesforce.com --alias org62
+sf org display --target-org org62 --json
+
+IndustriesAdoption@1
+
+		

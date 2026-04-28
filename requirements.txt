@@ -28,6 +28,8 @@ fastmcp>=0.1.0
 
 # Data processing
 pandas>=2.0.0
+matplotlib>=3.8.0
+PyYAML>=6.0.0
 
 # Tableau
 tableauserverclient>=0.25.0

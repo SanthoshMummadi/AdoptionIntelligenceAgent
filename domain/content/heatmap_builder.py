@@ -9,6 +9,8 @@ Standard library only.
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from domain.analytics.adoption_scoring import score_to_emoji
+from domain.analytics.heatmap_queries import resolve_cloud
+from domain.analytics.threshold_config import get_thresholds
 
 _MAX_HEATMAP_CHARS = 3000
 _MAX_DRILLDOWN_CHARS = 1500
@@ -31,6 +33,13 @@ def _safe_cell(text: str, length: int) -> str:
     """Truncate and remove pipe chars that break markdown tables."""
     clean = str(text).replace("|", "/").replace("\n", " ")
     return _truncate(clean, length)
+
+
+def _feature_link(feature: dict) -> str:
+    """Returns Slack hyperlink if GUS URL available, else plain name."""
+    if feature.get("gus_url"):
+        return f"<{feature['gus_url']}|{feature['feature']}>"
+    return feature.get("feature", "")
 
 
 def _trend_arrow(trend) -> str:
@@ -92,6 +101,8 @@ def build_adoption_heatmap_canvas(
     scored_data: list,
     cloud: str,
     fy: str,
+    industry: str | None = None,
+    region: str | None = None,
 ) -> str:
     """
     Takes scored heatmap data and returns Slack Canvas markdown string.
@@ -162,12 +173,24 @@ def build_adoption_heatmap_canvas(
     top_score = round(_avg_score(top_product))
     bottom_score = round(_avg_score(bottom_product))
 
+    filter_parts_c: list[str] = []
+    if industry:
+        filter_parts_c.append(industry)
+    if region:
+        filter_parts_c.append(region)
+    filter_label_c = (
+        "  ·  " + "  ·  ".join(filter_parts_c) if filter_parts_c else "  ·  Global"
+    )
+
     lines = []
 
     # Section 1 — Header
     lines += [
         f"# {cloud} · Adoption Heatmap · {fy}",
-        f"_{total_accounts:,} accounts · {total_products} products · {_now_ist()}_",
+        (
+            f"_{total_accounts:,} accounts · {total_products} products · "
+            f"{_now_ist()}{filter_label_c}_"
+        ),
         "",
     ]
 
@@ -227,6 +250,81 @@ def build_adoption_heatmap_canvas(
         )
 
     return canvas
+
+
+def build_heatmap_canvas_markdown(
+    features: list[dict],
+    cloud: str,
+    fy: str,
+    thresholds: dict | None = None,
+    snapshot_date: str = "",
+    total_accounts: int = 0,
+) -> str:
+    """
+    Builds canvas markdown for App Home heatmap canvas.
+    Shows Feature Group | Usage % | Trend | Threshold
+    No quarterly breakdown — single latest snapshot.
+    """
+    from collections import defaultdict
+
+    t = thresholds or {"green": 20.0, "yellow": 5.0}
+
+    # Aggregate by feature group
+    groups = defaultdict(list)
+    for f in features:
+        group = f.get("feature_group") or f.get("group") or "Unknown"
+        groups[group].append(f)
+
+    rows = ""
+    for group_name, feats in sorted(
+        groups.items(),
+        key=lambda x: sum(
+            float(f.get("score") or f.get("adoption_pct") or 0) for f in x[1]
+        )
+        / len(x[1]),
+        reverse=True,
+    ):
+        avg_pct = sum(
+            float(f.get("score") or f.get("adoption_pct") or 0) for f in feats
+        ) / max(len(feats), 1)
+
+        avg_trend = sum(
+            float(f.get("trend") or 0) for f in feats
+        ) / max(len(feats), 1)
+
+        # Threshold badge
+        if avg_pct > t["green"]:
+            threshold = ":large_green_circle: Above"
+        elif avg_pct >= t["yellow"]:
+            threshold = ":large_yellow_circle: Watch"
+        else:
+            threshold = ":red_circle: Below"
+
+        # Trend arrow
+        if avg_trend > 2:
+            trend = f"↑ +{avg_trend:.0f}%"
+        elif avg_trend < -2:
+            trend = f"↓ {avg_trend:.0f}%"
+        else:
+            trend = "→ Stable"
+
+        gcell = _safe_cell(str(group_name), 80)
+        rows += f"| {gcell} | {avg_pct:.0f}% | {trend} | {threshold} |\n"
+
+    body = f"""# {cloud} Adoption Heatmap · {fy}
+
+_{snapshot_date} · {total_accounts:,} accounts · {len(features)} features_
+
+| Feature Group | Usage % | Trend | Threshold |
+|---|---|---|---|
+{rows}
+---
+_Thresholds: :large_green_circle: >{t['green']}% Healthy · :large_yellow_circle: {t['yellow']}–{t['green']}% Watch · :red_circle: <{t['yellow']}% Critical_
+_Source: PDP 2.0 · RPT\\_PRODUCTUSAGE\\_PFT\\_ORG\\_METRICS_
+"""
+    if len(body) > _MAX_HEATMAP_CHARS:
+        return body[: _MAX_HEATMAP_CHARS - 60] + "\n\n_(Canvas truncated.)_"
+    return body
 
 
 def build_product_drilldown_canvas(
@@ -356,10 +454,49 @@ def build_movers_section(movers_data: dict) -> str:
     return "\n".join(lines)
 
 
+def build_home_loading_blocks(cloud: str) -> list:
+    """Home tab loading state while heatmap data is fetched."""
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"⏳ Loading {cloud} heatmap..."},
+        }
+    ]
+
+
+def build_home_cloud_header(cloud: str) -> list:
+    """Home tab header for selected cloud heatmap."""
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"📊 {cloud} Adoption Heatmap"},
+        },
+        {"type": "divider"},
+    ]
+
+
+def build_home_refresh_button(cloud: str) -> list:
+    """Home tab refresh action for the currently selected cloud."""
+    return [
+        {"type": "divider"},
+        {
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🔄 Refresh"},
+                "action_id": "home_cloud_select",
+                "value": cloud,
+            }],
+        },
+    ]
+
+
 def build_adoption_heatmap_blocks(
     scored_data: list,
     cloud: str,
     fy: str,
+    industry: str | None = None,
+    region: str | None = None,
 ) -> list:
     """
     Builds Slack Block Kit blocks for adoption heatmap.
@@ -367,15 +504,18 @@ def build_adoption_heatmap_blocks(
     """
     from collections import defaultdict
 
+    _, cloud_family = resolve_cloud(cloud)
+    thresholds = get_thresholds(cloud_family)
+
     # Group features by feature_group
     groups = defaultdict(list)
     for f in scored_data:
         groups[f["feature_group"]].append(f)
 
-    # Summary counts (score-based bands)
-    green_n = sum(1 for f in scored_data if f.get("score", 0) >= 60)
-    amber_n = sum(1 for f in scored_data if 40 <= f.get("score", 0) < 60)
-    red_n = sum(1 for f in scored_data if f.get("score", 0) < 40)
+    # Summary counts (status-based to match cloud threshold config)
+    green_n = sum(1 for f in scored_data if f.get("status") == "green")
+    amber_n = sum(1 for f in scored_data if f.get("status") == "amber")
+    red_n = sum(1 for f in scored_data if f.get("status") == "red")
     total = len(scored_data)
     accounts = max((f.get("account_count", 0) for f in scored_data), default=0)
 
@@ -445,6 +585,16 @@ def build_adoption_heatmap_blocks(
     now = datetime.now(tz=ZoneInfo("Asia/Kolkata"))
     ts = now.strftime("%b %d %Y %H:%M IST")
 
+    # Build filter label (industry/region) for header context
+    filter_parts: list[str] = []
+    if industry:
+        filter_parts.append(industry)
+    if region:
+        filter_parts.append(region)
+    filter_label = (
+        "  ·  " + "  ·  ".join(filter_parts) if filter_parts else "  ·  Global"
+    )
+
     # --- Build blocks ---
     blocks = []
 
@@ -464,7 +614,10 @@ def build_adoption_heatmap_blocks(
         "elements": [{
             "type": "mrkdwn",
             "text": (
-                f"{accounts:,} accounts · {total} features · {ts}"
+                f"{accounts:,} accounts  ·  "
+                f"{total} features  ·  "
+                f"{ts}"
+                f"{filter_label}"
             )
         }]
     })
@@ -481,6 +634,17 @@ def build_adoption_heatmap_blocks(
                 f"*{red_n}* :red_circle: Critical"
             )
         }
+    })
+    blocks.append({
+        "type": "context",
+        "elements": [{
+            "type": "mrkdwn",
+            "text": (
+                f":large_green_circle: >={thresholds['green']:.1f}% Healthy  ·  "
+                f":large_yellow_circle: >={thresholds['yellow']:.1f}% Watch  ·  "
+                f":red_circle: <{thresholds['yellow']:.1f}% Critical"
+            ),
+        }],
     })
 
     blocks.append({"type": "divider"})
@@ -504,9 +668,9 @@ def build_adoption_heatmap_blocks(
                 "type": "mrkdwn",
                 "text": (
                     f"{group_emoji} *{group_name}*  {trend_badge}\n"
-                    f"{score_bar}  {avg_score}% avg  ·  "
+                    f"{total_group_accts:,} accounts  ·  "
                     f"{count} feature{'s' if count != 1 else ''}  ·  "
-                    f"{total_group_accts:,} accounts"
+                    f"{score_bar}  {avg_score:.0f}% avg"
                 )
             },
             "accessory": {
@@ -527,12 +691,12 @@ def build_adoption_heatmap_blocks(
     summary_text = ""
     if strongest:
         summary_text += (
-            f":trophy: *Strongest:* {strongest['feature']} "
+            f":trophy: *Strongest:* {_feature_link(strongest)} "
             f"({strongest['score']}%)"
         )
     if weakest:
         summary_text += (
-            f"\n:warning: *Needs attention:* {weakest['feature']} "
+            f"\n:warning: *Needs attention:* {_feature_link(weakest)} "
             f"({weakest['score']}%)"
         )
     if summary_text:
@@ -605,7 +769,7 @@ def build_group_drilldown_blocks(
 ) -> list:
     """
     Layer 2 — Group drill-down blocks.
-    One section per feature with score bar + account detail button.
+    One section per feature with score bar + feature detail button.
     """
     del movers_data
     sorted_features = sorted(group_features, key=lambda f: f.get("score", 0))
@@ -615,8 +779,6 @@ def build_group_drilldown_blocks(
     avg_score = round(
         sum(f.get("score", 0) for f in group_features) / len(group_features)
     ) if group_features else 0
-    total_accts = sum(f.get("account_count", 0) for f in group_features)
-    total_mau = sum(f.get("mau", 0) for f in group_features)
 
     blocks = []
     blocks.append({
@@ -629,10 +791,8 @@ def build_group_drilldown_blocks(
             "type": "mrkdwn",
             "text": (
                 f"*{avg_score}% avg*  ·  "
-                f"*{len(group_features)} feature{'s' if len(group_features) != 1 else ''}*  ·  "
-                f"*{total_accts:,} accounts*  ·  "
-                f"*{total_mau:,} MAU*\n"
-                f"{green_n} :large_green_circle:  "
+                f"*{len(group_features)} feature{'s' if len(group_features) != 1 else ''}*"
+                f"\n{green_n} :large_green_circle:  "
                 f"{amber_n} :large_yellow_circle:  "
                 f"{red_n} :red_circle:"
             ),
@@ -645,7 +805,6 @@ def build_group_drilldown_blocks(
         status = f.get("status") or _status_from_score(score)
         emoji = STATUS_EMOJI.get(status, ":white_circle:")
         feature_nm = f.get("feature", "")
-        accts = f.get("account_count", 0)
         mau = f.get("mau", 0)
         trend = f.get("trend")
         bar = _score_bar(score)
@@ -656,16 +815,15 @@ def build_group_drilldown_blocks(
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"{emoji} *{feature_nm}*\n"
+                    f"{emoji} *{_feature_link(f)}*\n"
                     f"{bar}  *{score}%*\n"
-                    f":busts_in_silhouette: {accts:,} accounts  ·  "
                     f":bar_chart: {mau:,} MAU  ·  "
                     f"{trend_str}"
                 ),
             },
             "accessory": {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "Account detail ↗", "emoji": True},
+                "text": {"type": "plain_text", "text": "Feature detail ↗", "emoji": True},
                 "action_id": "heatmap_feature_detail",
                 "value": f"{feature_id}|{feature_nm}|{cloud}|{fy}",
             },
@@ -733,8 +891,9 @@ def build_feature_detail_blocks(
         "text": {
             "type": "mrkdwn",
             "text": (
-                f"*{status_badge}*  ·  {cloud}  ·  "
-                f"{group_nm}  ·  {availability}  ·  "
+                f"*{_feature_link(feature)}*\n"
+                f"_{group_nm}_  ·  {status_emoji}  {status_badge}  ·  "
+                f"{cloud}  ·  {availability}  ·  "
                 f"{fy}  ·  _as of {data_dt}_"
             )
         }

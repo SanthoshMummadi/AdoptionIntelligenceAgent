@@ -2,18 +2,33 @@
 domain/analytics/heatmap_queries.py
 Snowflake queries for adoption heatmap visualization.
 """
+import difflib
+
 from log_utils import log_debug, log_error
 
 # Cloud mapping: (PRODUCT_PORTFOLIO, PRODUCT_FEATURE_FAMILY)
 _CLOUD_MAPPING = {
-    "Commerce B2B":       ("Commerce", "B2B Commerce"),
-    "Commerce OMS":       ("Commerce", "Order Management"),
-    "B2B Commerce":       ("Commerce", "B2B Commerce"),
-    "Order Management":   ("Commerce", "Order Management"),
-    "Financial Services": ("Industries", "Financial Services Cloud"),
-    "Sales Cloud":        ("Sales Cloud", "Sales Cloud"),
-    "Service Cloud":      ("Service Cloud", "Service Cloud Core"),
-    "Agentforce":         ("Agentforce", "Build, Test, Observe"),
+    # User input (fuzzy)       -> (PRODUCT_PORTFOLIO, PRODUCT_FEATURE_FAMILY)
+    "Commerce B2B":            ("Commerce", "B2B Commerce"),
+    "B2B Commerce":            ("Commerce", "B2B Commerce"),
+    "Sales Cloud":             ("Sales Cloud", "Sales Cloud"),
+    "Financial Services":      ("Industries", "Financial Services Cloud"),
+    "FSC":                     ("Industries", "Financial Services Cloud"),
+    "Agentforce":              ("Agentforce", "Runtime & Trust"),
+    "Agentforce Runtime & Trust": ("Agentforce", "Runtime & Trust"),
+    "Agentforce Build, Test, Observe": ("Agentforce", "Build, Test, Observe"),
+    "Agentforce Agent Types":  ("Agentforce", "Agent Types"),
+    "Agentforce IT Service":   ("Service Cloud", "Agentforce IT Service"),
+    # Fuzzy aliases
+    "agentforce runtime":      ("Agentforce", "Runtime & Trust"),
+    "runtime & trust":         ("Agentforce", "Runtime & Trust"),
+    "agentforce bto":          ("Agentforce", "Build, Test, Observe"),
+    "build test observe":      ("Agentforce", "Build, Test, Observe"),
+    "agent types":             ("Agentforce", "Agent Types"),
+    "agentforce itsm":         ("Service Cloud", "Agentforce IT Service"),
+    "itsm":                    ("Service Cloud", "Agentforce IT Service"),
+    "it service":              ("Service Cloud", "Agentforce IT Service"),
+    "agentforce it service":   ("Service Cloud", "Agentforce IT Service"),
 }
 
 VALID_REGIONS = [
@@ -39,6 +54,61 @@ VALID_INDUSTRIES = [
     "Public Sector",
     "Other",
 ]
+
+
+def resolve_cloud(user_input: str) -> tuple:
+    """
+    Maps fuzzy user input to exact PDP 2.0
+    (PRODUCT_PORTFOLIO, PRODUCT_FEATURE_FAMILY) tuple.
+    """
+    normalized = str(user_input or "").strip().lower()
+    if not normalized:
+        raise ValueError(
+            f"Unknown cloud: '{user_input}'. Try: {list(_CLOUD_MAPPING.keys())}"
+        )
+
+    for key, value in _CLOUD_MAPPING.items():
+        if normalized == key.lower():
+            return value
+
+    for key, value in _CLOUD_MAPPING.items():
+        if normalized in key.lower() or key.lower() in normalized:
+            return value
+
+    keys = list(_CLOUD_MAPPING.keys())
+    closest = difflib.get_close_matches(str(user_input), keys, n=1, cutoff=0.5)
+    if closest:
+        return _CLOUD_MAPPING[closest[0]]
+
+    raise ValueError(
+        f"Unknown cloud: '{user_input}'. Try: {list(_CLOUD_MAPPING.keys())}"
+    )
+
+
+def resolve_cloud_key(user_input: str) -> str:
+    """Returns the canonical cloud key label for display/logging."""
+    normalized = str(user_input or "").strip().lower()
+    if not normalized:
+        raise ValueError(
+            f"Unknown cloud: '{user_input}'. Try: {list(_CLOUD_MAPPING.keys())}"
+        )
+
+    for key in _CLOUD_MAPPING:
+        if normalized == key.lower():
+            return key
+
+    for key in _CLOUD_MAPPING:
+        if normalized in key.lower() or key.lower() in normalized:
+            return key
+
+    keys = list(_CLOUD_MAPPING.keys())
+    closest = difflib.get_close_matches(str(user_input), keys, n=1, cutoff=0.5)
+    if closest:
+        return closest[0]
+
+    raise ValueError(
+        f"Unknown cloud: '{user_input}'. Try: {list(_CLOUD_MAPPING.keys())}"
+    )
 
 
 def get_fy_quarter_dates(fy: str) -> list[dict]:
@@ -133,17 +203,18 @@ def get_adoption_heatmap_data(
     Raises:
         ValueError: If cloud is not in _CLOUD_MAPPING
     """
-    from domain.analytics.adoption_scoring import calculate_adoption_score, score_to_emoji
+    from domain.analytics.adoption_scoring import (
+        build_gus_url,
+        calculate_adoption_score,
+        score_to_emoji,
+    )
 
-    # STEP B1 — Validate cloud input
-    if cloud not in _CLOUD_MAPPING:
-        raise ValueError(
-            f"Unknown cloud: {cloud}. "
-            f"Valid options: {list(_CLOUD_MAPPING.keys())}"
-        )
-
-    portfolio, family = _CLOUD_MAPPING[cloud]
-    log_debug(f"[PDP] Fetching heatmap: {cloud} ({portfolio}/{family}) for {fy}")
+    # STEP B1 — Resolve cloud input (supports fuzzy aliases)
+    canonical_cloud = resolve_cloud_key(cloud)
+    portfolio, family = resolve_cloud(cloud)
+    log_debug(
+        f"[PDP] Fetching heatmap: {canonical_cloud} ({portfolio}/{family}) for {fy}"
+    )
 
     # STEP B2 — Get quarter date ranges
     quarters = get_fy_quarter_dates(fy)
@@ -312,13 +383,15 @@ def get_adoption_heatmap_data(
                     activated=int(row[6] or 0),        # ACCOUNT_COUNT
                     used=int(row[6] or 0),             # ACCOUNT_COUNT
                     account_count=int(row[6] or 0),    # ACCOUNT_COUNT
-                    prev_quarter_used=prev_q_accounts
+                    prev_quarter_used=prev_q_accounts,
+                    cloud_family=family,
                 )
 
                 features.append({
                     "feature_group":   row[0] or "",
                     "feature":         str(row[1] or "").replace("|", "/"),
                     "feature_id":      row[2] or "",
+                    "gus_url":         build_gus_url(row[2] or ""),
                     "owner":           row[3] or "Unassigned",
                     "description":     row[4] or "",
                     "availability":    row[5] or "",
@@ -360,7 +433,7 @@ def get_adoption_heatmap_data(
 
     # STEP B6 — Return
     return {
-        "cloud": cloud,
+        "cloud": canonical_cloud,
         "fy": fy,
         "industry": industry,
         "region": region,

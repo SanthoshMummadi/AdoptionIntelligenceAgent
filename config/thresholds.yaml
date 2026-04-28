@@ -1,0 +1,43 @@
+# Adoption Health Thresholds
+# Updated by: Product Leaders only
+# To update: edit this file and redeploy
+#
+# B2B Commerce thresholds — updated 2026-04-27
+# Source: Demo feedback from Santhosh
+
+clouds:
+  B2B Commerce:
+    green: 20.0
+    yellow: 5.0
+    red: 0.0
+    updated_by: Santhosh Reddy Mummadi
+    updated_on: "2026-04-27"
+    note: "Adjusted from default 70/30 based on demo feedback"
+
+  Sales Cloud:
+    green: 70.0
+    yellow: 30.0
+    red: 0.0
+    updated_by: default
+    updated_on: "2026-04-27"
+    note: "Default — pending input from Sales Cloud PM"
+
+  Financial Services Cloud:
+    green: 70.0
+    yellow: 30.0
+    red: 0.0
+    updated_by: default
+    updated_on: "2026-04-27"
+    note: "Default — pending input from FSC PM"
+
+  Agentforce:
+    green: 70.0
+    yellow: 30.0
+    red: 0.0
+    updated_by: default
+    updated_on: "2026-04-27"
+    note: "Default — pending input from Agentforce PM"
+
+  Agentforce IT Service:
+    green: 15.0
+    yellow: 5.0
