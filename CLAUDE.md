@@ -52,14 +52,15 @@ npx @modelcontextprotocol/inspector python server.py
 
 ## Testing
 
-### Run end-to-end tests
+### Run all tests
+```bash
+python3 -m pytest tests/ -v
+```
+Requires live Salesforce, Snowflake, and LLM credentials.
+
+### Run specific test file
 ```bash
 python3 tests/test_commerce_cloud_e2e.py
-```
-Requires live Salesforce, Snowflake, and LLM credentials. Tests GM Review workflow (Section 5: WF-* tests).
-
-### Run dynamic account tests
-```bash
 python3 tests/test_dynamic_accounts.py
 ```
 
@@ -67,6 +68,8 @@ python3 tests/test_dynamic_accounts.py
 ```bash
 python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
 ```
+
+**Note:** E2E tests (Section 5: WF-* in `test_commerce_cloud_e2e.py`) validate the full GM Review workflow with live integrations.
 
 ## Architecture
 
@@ -89,8 +92,19 @@ python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
   - Detailed per-opportunity grain, works for any input (names, opp IDs)
 
 ### Entry points
-- **`slack_app.py`** — Slack Bolt app (DMs, hub modules, file ingestion, slash commands including `/gm-review-canvas`, `/at-risk-canvas`)
+- **`slack_app.py`** — Slack Bolt app (DMs, hub modules, file ingestion, slash commands including `/gm-review-canvas`, `/at-risk-canvas`, App Home dashboard)
 - **`server.py`** — FastMCP server (brief CRUD, `query_brief`, `generate_gm_reviews`, `generate_gm_review_canvas`, `health_check`)
+
+### Domain organization
+```
+domain/
+├── analytics/      — Snowflake queries, CIDM, renewals, heatmap data
+├── content/        — Canvas/List builders, formatting, prompts
+├── integrations/   — Google Sheets, external APIs
+├── intelligence/   — Risk classification, playbook mapping
+├── salesforce/     — Org62 client, bulk queries
+└── tracking/       — Account watchlist, change detection
+```
 
 ### Core modules
 - **`services/gm_review_workflow.py`** — GM Review orchestration: Salesforce + Snowflake + LLM + canvas markdown (account-by-account)
@@ -107,6 +121,8 @@ python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
 - **`domain/content/canvas_builder.py`** — Slack Canvas markdown generation for GM Review tables
 - **`domain/content/heatmap_builder.py`** — Heatmap canvas generation and product drilldown formatting
 - **`domain/integrations/gsheet_exporter.py`** — Optional Google Sheets export for GM Review data
+- **`domain/tracking/account_tracker.py`** — Watchlist tracking for adoption score changes
+- **`services/app_home.py`** — App Home dashboard blocks and publishing logic
 
 ### Persistence (treat as sensitive)
 - **`storage/user_briefs.pkl`** — Per-user brief text (pickle format)
@@ -140,10 +156,12 @@ For non-internal URLs, TLS always uses certifi or custom CA bundle.
 
 ### PDP Snowflake Authentication
 **PDP 2.0 Authentication:**
-- **adoption branch:** personal credentials (`externalbrowser` SSO — requires browser popup)
-- **production/other branches:** service account (no browser interaction needed)
+- **Current branch (adoption):** Uses personal credentials (`externalbrowser` SSO — requires browser popup for authentication)
+- **Production/other branches:** Service account (no browser interaction needed)
 - Branch detection is automatic in `get_pdp_snowflake_connection()`
 - **NEVER commit personal credentials to non-adoption branches**
+
+**Note:** When working on the adoption branch, the first PDP query will trigger a browser authentication popup. Subsequent queries reuse the authenticated session.
 
 ### GM Review: Bulk vs Account-by-Account
 - **Bulk workflow** (`gm_review_bulk_workflow.py`) — Snowflake-first with parent-level rollup:
@@ -200,6 +218,15 @@ Configured via environment:
 
 Started automatically on bot startup via APScheduler.
 
+### Watchlist Tracking
+Monitors adoption score changes and alerts on significant drops:
+- `WATCHLIST_ALERT_FREQUENCY=daily` — alert frequency (or `weekly`)
+- `WATCHLIST_DROP_THRESHOLD=15` — percentage drop to trigger alert
+- `WATCHLIST_MIN_SCORE=5` — minimum score to track (excludes low-value accounts)
+- `WATCHLIST_DEMO_MODE=false` — set `true` for minute-level testing
+
+Implementation in `domain/tracking/account_tracker.py` with SQLite persistence (`bot_history.db`).
+
 ### Adoption Heatmap with Thread Drilldown
 The `/adoption-heatmap` command provides interactive product adoption analysis:
 1. **Initial canvas:** Top features by adoption score for a cloud/FY with summary metrics
@@ -252,6 +279,17 @@ The `/adoption-heatmap` command provides interactive product adoption analysis:
 - `/risk-mapping <optional theme>` — Show risk theme to playbook mappings
 - `/pulse-now` — Trigger daily pulse immediately (manual override)
 - `/tableau-test` — Test Tableau integration
+
+### App Home dashboard
+Access via Slack App Home (click bot name → Home tab):
+- **At-risk counts:** Commerce Cloud + Financial Services Cloud renewal summaries
+- **Top red accounts:** Accounts flagged as red in Salesforce
+- **Interactive actions:**
+  - `Refresh` — Update dashboard data
+  - `Run GM Review (Commerce)` — Trigger bulk Commerce review
+  - `Run GM Review (FSC)` — Trigger bulk FSC review
+
+Implementation: `services/app_home.py` publishes blocks on `app_home_opened` event.
 
 ### Module switching in DM
 - "switch to product brief" or "product brief analysis"

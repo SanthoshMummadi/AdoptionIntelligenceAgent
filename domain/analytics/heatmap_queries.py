@@ -3,6 +3,9 @@ domain/analytics/heatmap_queries.py
 Snowflake queries for adoption heatmap visualization.
 """
 import difflib
+import os
+import threading
+from cachetools import TTLCache
 
 from log_utils import log_debug, log_error
 
@@ -54,6 +57,43 @@ VALID_INDUSTRIES = [
     "Public Sector",
     "Other",
 ]
+
+_HEATMAP_CACHE = TTLCache(
+    maxsize=200,
+    ttl=int(os.getenv("HEATMAP_CACHE_TTL_SECONDS", "86400")),
+)  # 24h default (daily PDP snapshot)
+_MOVERS_CACHE = TTLCache(maxsize=500, ttl=86400)  # 24h TTL (daily snapshot)
+_IN_FLIGHT: dict[str, threading.Event] = {}
+_IN_FLIGHT_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
+_MOVERS_CACHE_LOCK = threading.Lock()
+
+
+def _movers_cache_key(
+    feature_id: str,
+    snapshot_date: str,
+    portfolio: str,
+    family: str,
+    top_n: int,
+    timeout: int,
+) -> str:
+    return (
+        f"{feature_id}|{snapshot_date or 'latest'}|"
+        f"{portfolio}|{family}|{top_n}|{timeout}"
+    )
+
+
+def movers_cache_contains(
+    feature_id: str,
+    snapshot_date: str,
+    portfolio: str,
+    family: str,
+    top_n: int = 5,
+    timeout: int = 8,
+) -> bool:
+    key = _movers_cache_key(feature_id, snapshot_date, portfolio, family, top_n, timeout)
+    with _MOVERS_CACHE_LOCK:
+        return key in _MOVERS_CACHE
 
 
 def resolve_cloud(user_input: str) -> tuple:
@@ -166,11 +206,12 @@ def get_fy_quarter_dates(fy: str) -> list[dict]:
     ]
 
 
-def get_adoption_heatmap_data(
+def _fetch_from_snowflake(
     cloud: str,
     fy: str = "FY2027",
     industry: str | None = None,
     region: str | None = None,
+    account_id: str | None = None,
 ) -> dict:
     """
     Returns adoption heatmap data for a given cloud and FY.
@@ -214,10 +255,16 @@ def get_adoption_heatmap_data(
     portfolio, family = resolve_cloud(cloud)
     log_debug(
         f"[PDP] Fetching heatmap: {canonical_cloud} ({portfolio}/{family}) for {fy}"
+        f"{' acct=' + account_id if account_id else ''}"
     )
 
     # STEP B2 — Get quarter date ranges
-    quarters = get_fy_quarter_dates(fy)
+    all_quarters = get_fy_quarter_dates(fy)
+    if account_id:
+        # Account drill-down runs frequently; fetch latest quarter only to reduce load.
+        quarters = [q for q in all_quarters if q["quarter"] == "Q1"]
+    else:
+        quarters = all_quarters
 
     # STEP B3 — Query each quarter
     quarter_results = {}
@@ -289,6 +336,7 @@ def get_adoption_heatmap_data(
           AND DATA_DT <= %s
           AND DATA_DT >= DATEADD(month, -1, %s)
           AND ORG_PF_ROLLING_28D_MAU > 0
+          AND (%s IS NULL OR ACCT_ID = %s)
           AND (%s IS NULL OR INDUSTRY_NM = %s)
           AND (%s IS NULL OR CSG_REGION_NM = %s)
         GROUP BY
@@ -310,11 +358,13 @@ def get_adoption_heatmap_data(
                 WHERE PRODUCT_PORTFOLIO = %s
                   AND PRODUCT_FEATURE_FAMILY = %s
                   AND DATA_DT <= %s
+                  AND (%s IS NULL OR ACCT_ID = %s)
                   AND (%s IS NULL OR INDUSTRY_NM = %s)
                   AND (%s IS NULL OR CSG_REGION_NM = %s)
                 """,
                 (
                     portfolio, family, snapshot_date,
+                    account_id, account_id,
                     industry, industry, region, region,
                 ),
             )
@@ -333,11 +383,13 @@ def get_adoption_heatmap_data(
                   AND PRODUCT_FEATURE_FAMILY = %s
                   AND DATA_DT <= %s
                   AND DATA_DT >= DATEADD(month, -1, %s)
+                  AND (%s IS NULL OR ACCT_ID = %s)
                   AND (%s IS NULL OR INDUSTRY_NM = %s)
                   AND (%s IS NULL OR CSG_REGION_NM = %s)
                 """,
                 (
                     portfolio, family, actual_snapshot, actual_snapshot,
+                    account_id, account_id,
                     industry, industry, region, region,
                 ),
             )
@@ -350,6 +402,7 @@ def get_adoption_heatmap_data(
                 query,
                 (
                     portfolio, family, actual_snapshot, actual_snapshot,
+                    account_id, account_id,
                     industry, industry, region, region,
                 ),
             )
@@ -381,7 +434,7 @@ def get_adoption_heatmap_data(
                 score_data = calculate_adoption_score(
                     provisioned=total_accounts,
                     activated=int(row[6] or 0),        # ACCOUNT_COUNT
-                    used=int(row[6] or 0),             # ACCOUNT_COUNT
+                    used=int(row[8] or 0),             # MAU
                     account_count=int(row[6] or 0),    # ACCOUNT_COUNT
                     prev_quarter_used=prev_q_accounts,
                     cloud_family=family,
@@ -453,12 +506,75 @@ def get_adoption_heatmap_data(
     }
 
 
+def get_adoption_heatmap_data(
+    cloud: str,
+    fy: str = "FY2027",
+    industry: str | None = None,
+    region: str | None = None,
+    account_id: str | None = None,
+) -> dict:
+    """
+    Cached + deduplicated wrapper around Snowflake heatmap fetch.
+    """
+    cache_key = (
+        f"{cloud}|{fy}|{account_id or 'all'}|"
+        f"{industry or 'all'}|{region or 'all'}"
+    )
+
+    with _CACHE_LOCK:
+        cached = _HEATMAP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    should_fetch = False
+    with _IN_FLIGHT_LOCK:
+        event = _IN_FLIGHT.get(cache_key)
+        if event is None:
+            event = threading.Event()
+            _IN_FLIGHT[cache_key] = event
+            should_fetch = True
+
+    if should_fetch:
+        try:
+            result = _fetch_from_snowflake(
+                cloud=cloud,
+                fy=fy,
+                industry=industry,
+                region=region,
+                account_id=account_id,
+            )
+            with _CACHE_LOCK:
+                _HEATMAP_CACHE[cache_key] = result
+            return result
+        finally:
+            event.set()
+            with _IN_FLIGHT_LOCK:
+                _IN_FLIGHT.pop(cache_key, None)
+
+    event.wait(timeout=60)
+    with _CACHE_LOCK:
+        cached_after_wait = _HEATMAP_CACHE.get(cache_key)
+    if cached_after_wait is not None:
+        return cached_after_wait
+    result = _fetch_from_snowflake(
+        cloud=cloud,
+        fy=fy,
+        industry=industry,
+        region=region,
+        account_id=account_id,
+    )
+    with _CACHE_LOCK:
+        _HEATMAP_CACHE[cache_key] = result
+    return result
+
+
 def get_feature_account_movers(
     feature_id: str,
     snapshot_date: str,
     portfolio: str,
     family: str,
-    top_n: int = 5
+    top_n: int = 5,
+    timeout: int = 8,
 ) -> dict:
     """
     Returns top mover and top loser accounts for a given feature
@@ -495,10 +611,24 @@ def get_feature_account_movers(
         return_pdp_connection,
     )
 
+    if timeout is None:
+        timeout = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
+    cache_key = _movers_cache_key(
+        feature_id, snapshot_date, portfolio, family, top_n, int(timeout)
+    )
+    with _MOVERS_CACHE_LOCK:
+        cached = _MOVERS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     conn = None
     try:
         conn = get_pdp_snowflake_connection()
         cur = conn.cursor()
+        safe_timeout = max(3, int(timeout))
+        cur.execute(
+            f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {safe_timeout}"
+        )
 
         # Current snapshot: latest load date for this feature (not portfolio-wide).
         snap_in = (snapshot_date or "").strip()
@@ -525,7 +655,10 @@ def get_feature_account_movers(
         actual_snapshot = str(row0[0]) if row0 and row0[0] else None
         if not actual_snapshot:
             cur.close()
-            return {"top_movers": [], "top_losers": []}
+            result = {"top_movers": [], "top_losers": []}
+            with _MOVERS_CACHE_LOCK:
+                _MOVERS_CACHE[cache_key] = result
+            return result
 
         # Prior snapshot — latest date strictly before current, for the same feature
         cur.execute(
@@ -542,7 +675,10 @@ def get_feature_account_movers(
 
         if not prior_date:
             cur.close()
-            return {"top_movers": [], "top_losers": []}
+            result = {"top_movers": [], "top_losers": []}
+            with _MOVERS_CACHE_LOCK:
+                _MOVERS_CACHE[cache_key] = result
+            return result
 
         # Query current + prior MAU per account for this feature
         cur.execute("""
@@ -611,10 +747,13 @@ def get_feature_account_movers(
             key=lambda x: x["mau_change_pct"]
         )[:top_n]
 
-        return {
+        result = {
             "top_movers": top_movers,
             "top_losers": top_losers,
         }
+        with _MOVERS_CACHE_LOCK:
+            _MOVERS_CACHE[cache_key] = result
+        return result
 
     except Exception as e:
         import logging

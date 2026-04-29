@@ -498,225 +498,195 @@ def build_adoption_heatmap_blocks(
     industry: str | None = None,
     region: str | None = None,
     title: str | None = None,
+    total_accounts: int = 0,
+    snapshot_date: str | None = None,
 ) -> list:
     """
-    Builds Slack Block Kit blocks for adoption heatmap.
-    Returns list of blocks ready for client.chat_postMessage(blocks=...)
+    Main adoption heatmap — all accounts view.
+    Structure: Header → Focus Now → Strong Areas → All Groups (ranked)
     """
     from collections import defaultdict
 
-    _, cloud_family = resolve_cloud(cloud)
-    thresholds = get_thresholds(cloud_family)
+    del industry, region
+    features = scored_data
 
-    # Group features by feature_group
+    if not features:
+        return [{"type": "section", "text": {"type": "mrkdwn",
+            "text": f":x: No adoption data found for *{cloud}* · {fy}"}}]
+
+    t = {"green": 20.0, "yellow": 5.0}
+
     groups = defaultdict(list)
-    for f in scored_data:
-        groups[f["feature_group"]].append(f)
+    for f in features:
+        groups[f.get("feature_group", "Unknown")].append(f)
 
-    # Summary counts (status-based to match cloud threshold config)
-    green_n = sum(1 for f in scored_data if f.get("status") == "green")
-    amber_n = sum(1 for f in scored_data if f.get("status") == "amber")
-    red_n = sum(1 for f in scored_data if f.get("status") == "red")
-    total = len(scored_data)
-    accounts = max((f.get("account_count", 0) for f in scored_data), default=0)
-
-    # Pulse bar — 10 blocks proportional to red/amber/green
-    def _pulse_bar(green, amber, red, total, length=10):
-        if total == 0:
-            return ":white_circle:" * length
-        g = round(green / total * length)
-        a = round(amber / total * length)
-        r = length - g - a
-        return (
-            ":red_circle:" * max(0, r) +
-            ":large_yellow_circle:" * max(0, a) +
-            ":large_green_circle:" * max(0, g)
-        )
-
-    pulse = _pulse_bar(green_n, amber_n, red_n, total)
-
-    # Group health status — worst feature in group drives color
-    def _group_status(features):
-        if any(f["status"] == "red" for f in features):
-            return "red"
-        if any(f["status"] == "amber" for f in features):
-            return "amber"
-        return "green"
-
-    def _group_avg_score(features):
-        scores = [f["score"] for f in features]
-        return round(sum(scores) / len(scores)) if scores else 0
-
-    # Sort groups: red first, then amber, then green
-    status_order = {"red": 0, "amber": 1, "green": 2}
-    sorted_groups = sorted(
-        groups.items(),
-        key=lambda x: (status_order[_group_status(x[1])], -_group_avg_score(x[1]))
-    )
-
-    GROUP_EMOJI = {
-        "Markets/I18n": ":earth_africa:",
-        "Buyer Groups": ":busts_in_silhouette:",
-        "Pricing": ":label:",
-        "Search": ":mag:",
-        "Setup & User Tools": ":gear:",
-        "Cart": ":shopping_trolley:",
-        "Shipping": ":package:",
-        "Product & Catalog": ":clipboard:",
-        "B2B Payments": ":moneybag:",
-        "Shopper Experience & Profiles": ":shopping_bags:",
-        "Promotions": ":dart:",
-        "Checkout": ":credit_card:",
-        "Import/Export Tools": ":inbox_tray:",
-        "Payments": ":credit_card:",
-        "Agentforce for Shopping": ":robot_face:",
-        "Analytics": ":bar_chart:",
-        "Buyer Messaging": ":speech_balloon:",
-        "Data Cloud for Commerce": ":cloud:",
-        "Subscriptions": ":arrows_counterclockwise:",
-        "Tax": ":receipt:",
-    }
-
-    # Strongest / needs attention
-    all_sorted = sorted(scored_data, key=lambda f: f["score"], reverse=True)
-    strongest = all_sorted[0] if all_sorted else None
-    weakest = all_sorted[-1] if all_sorted else None
-
-    # Timestamp
-    now = datetime.now(tz=ZoneInfo("Asia/Kolkata"))
-    ts = now.strftime("%b %d %Y %H:%M IST")
-
-    # Build filter label (industry/region) for header context
-    filter_parts: list[str] = []
-    if industry:
-        filter_parts.append(industry)
-    if region:
-        filter_parts.append(region)
-    filter_label = (
-        "  ·  " + "  ·  ".join(filter_parts) if filter_parts else "  ·  Global"
-    )
-
-    # --- Build blocks ---
-    blocks = []
-
-    # Header
-    blocks.append({
-        "type": "header",
-        "text": {
-            "type": "plain_text",
-            "text": title or f":chart_with_upwards_trend: {cloud} · Adoption Heatmap · {fy}",
-            "emoji": True
-        }
-    })
-
-    # Summary context
-    blocks.append({
-        "type": "context",
-        "elements": [{
-            "type": "mrkdwn",
-            "text": (
-                f"{accounts:,} accounts  ·  "
-                f"{total} features  ·  "
-                f"{ts}"
-                f"{filter_label}"
-            )
-        }]
-    })
-
-    # Pulse bar + counts
-    blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"{pulse}\n"
-                f"*{green_n}* :large_green_circle: Healthy  ·  "
-                f"*{amber_n}* :large_yellow_circle: Watch  ·  "
-                f"*{red_n}* :red_circle: Critical"
+    group_data = {}
+    for group, feats in groups.items():
+        avg = sum(float(f.get("score") or 0) for f in feats) / len(feats)
+        trend = sum(float(f.get("trend") or 0) for f in feats) / len(feats)
+        accounts = max(int(f.get("account_count") or 0) for f in feats)
+        group_data[group] = {
+            "avg": avg,
+            "trend": trend,
+            "count": len(feats),
+            "accounts": accounts,
+            "health": (
+                "green" if avg > t["green"]
+                else "yellow" if avg > t["yellow"]
+                else "red"
             )
         }
-    })
-    blocks.append({
-        "type": "context",
-        "elements": [{
-            "type": "mrkdwn",
-            "text": (
-                f":large_green_circle: >={thresholds['green']:.1f}% Healthy  ·  "
-                f":large_yellow_circle: >={thresholds['yellow']:.1f}% Watch  ·  "
-                f":red_circle: <{thresholds['yellow']:.1f}% Critical"
-            ),
-        }],
-    })
 
-    blocks.append({"type": "divider"})
+    all_sorted = sorted(group_data.items(), key=lambda x: x[1]["avg"])
+    all_sorted_desc = list(reversed(all_sorted))
 
-    # Group rows with drill-down buttons
-    for group_name, features in sorted_groups:
-        avg_score = _group_avg_score(features)
-        count = len(features)
-        total_group_accts = max(
-            (f.get("account_count", 0) for f in features),
-            default=0
+    healthy_count = sum(1 for d in group_data.values() if d["health"] == "green")
+    watch_count = sum(1 for d in group_data.values() if d["health"] == "yellow")
+    critical_count = sum(1 for d in group_data.values() if d["health"] == "red")
+
+    if not total_accounts:
+        total_accounts = max((f.get("account_count") or 0 for f in features), default=0)
+    if not snapshot_date:
+        snapshot_date = features[0].get("data_dt", "") if features else ""
+    overall_avg = sum(d["avg"] for d in group_data.values()) / len(group_data)
+
+    focus_groups = sorted(
+        group_data.items(),
+        key=lambda x: (x[1]["avg"] - (20 if x[1]["trend"] < -10 else 0))
+    )[:3]
+    strong_groups = all_sorted_desc[:3]
+
+    top_score = all_sorted_desc[0][1]["avg"] if all_sorted_desc else 0
+    bottom_score = all_sorted[0][1]["avg"] if all_sorted else 0
+    gap = top_score - bottom_score
+    if gap > 40:
+        insight = (
+            f"Adoption drops sharply from "
+            f"`{all_sorted_desc[0][0]}` ({top_score:.0f}%) → "
+            f"`{all_sorted[0][0]}` ({bottom_score:.0f}%) — "
+            f"investigate friction in lower-performing groups"
         )
-        group_emoji = GROUP_EMOJI.get(group_name, ":bookmark_tabs:")
-        filled = round(avg_score / 10)
-        score_bar = "█" * filled + "░" * (10 - filled)
-        trend_badge = ""
+    elif critical_count > 0:
+        insight = (
+            f"{critical_count} critical group{'s' if critical_count > 1 else ''} "
+            f"below {t['yellow']:.0f}% — immediate PM action required"
+        )
+    else:
+        insight = (
+            f"Overall adoption at {overall_avg:.0f}% — "
+            f"focus on Watch groups to move the needle"
+        )
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f":bar_chart: {cloud} · Adoption Overview"}
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                "text": (
+                    f"{total_accounts:,} accounts  ·  "
+                    f"{len(features)} features  ·  {snapshot_date}\n"
+                    f":large_green_circle: {healthy_count} Healthy  ·  "
+                    f":large_yellow_circle: {watch_count} Watch  ·  "
+                    f":red_circle: {critical_count} Critical"
+                )}]
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*:rotating_light: Focus Now*\n" +
+                    "\n".join(
+                        f"- `{g}` — {d['avg']:.0f}%"
+                        + (f"  ↓ {d['trend']:.0f}%" if d["trend"] < -2 else "")
+                        for g, d in focus_groups
+                    )
+                )
+            },
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View All →"},
+                "action_id": "heatmap_drilldown_red_0",
+                "value": f"{focus_groups[0][0]}|{cloud}|{fy}"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*:trophy: Strong Areas*\n" +
+                    "\n".join(
+                        f"- `{g}` — {d['avg']:.0f}%"
+                        for g, d in strong_groups
+                    )
+                )
+            }
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*All Feature Groups*"}
+        },
+    ]
+
+    for i, (group, data) in enumerate(all_sorted_desc):
+        health_emoji = (
+            ":large_green_circle:" if data["health"] == "green"
+            else ":large_yellow_circle:" if data["health"] == "yellow"
+            else ":red_circle:"
+        )
+        trend_text = _format_trend(data["trend"])
 
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"{group_emoji} *{group_name}*  {trend_badge}\n"
-                    f"{total_group_accts:,} accounts  ·  "
-                    f"{count} feature{'s' if count != 1 else ''}  ·  "
-                    f"{score_bar}  {avg_score:.0f}% avg"
+                    f"{health_emoji} *{group}*   "
+                    f"{data['accounts']:,} accts  ·  "
+                    f"{data['count']} features  ·  "
+                    f"`Adoption: {data['avg']:.0f}%`  "
+                    f"{trend_text}"
                 )
             },
             "accessory": {
                 "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "Drill down ↗",
-                    "emoji": True
-                },
-                "action_id": "heatmap_drilldown",
-                "value": f"{group_name}|{cloud}|{fy}"
+                "text": {"type": "plain_text", "text": "Drill →"},
+                "action_id": f"heatmap_drilldown_grp_{i}",
+                "value": f"{group}|{cloud}|{fy}"
             }
         })
 
-    blocks.append({"type": "divider"})
-
-    # Strongest / needs attention
-    summary_text = ""
-    if strongest:
-        summary_text += (
-            f":trophy: *Strongest:* {_feature_link(strongest)} "
-            f"({strongest['score']}%)"
-        )
-    if weakest:
-        summary_text += (
-            f"\n:warning: *Needs attention:* {_feature_link(weakest)} "
-            f"({weakest['score']}%)"
-        )
-    if summary_text:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": summary_text}
-        })
-
-    # Footer
-    blocks.append({
-        "type": "context",
-        "elements": [{
-            "type": "mrkdwn",
-            "text": (
-                "_Reply with any feature or group name for drill-down · "
-                "Click *Drill down ↗* for group detail_"
-            )
-        }]
-    })
+    blocks += [
+        {"type": "divider"},
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f":bulb: {insight}"}]
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                "text": (
+                    f":large_green_circle: >{t['green']:.0f}% Healthy  ·  "
+                    f":large_yellow_circle: >{t['yellow']:.0f}% Watch  ·  "
+                    f":red_circle: <{t['yellow']:.0f}% Critical"
+                )}]
+        },
+        {
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": ":arrows_counterclockwise: Refresh"},
+                "action_id": "heatmap_refresh",
+                "value": f"{cloud}|{fy}"
+            }]
+        }
+    ]
 
     return blocks
 

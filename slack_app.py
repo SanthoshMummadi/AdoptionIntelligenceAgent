@@ -4,14 +4,17 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import logging
 import os
+import random
 import re
 import sys
 import time
 import threading
 import json
+import uuid
 import pickle
 import sqlite3
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 
 from slack_sdk.errors import SlackApiError
@@ -26,6 +29,7 @@ from domain.analytics.snowflake_client import (
     clear_usage_snapshot_cache,
     prewarm_cidm_usage_snapshot_dt,
     prewarm_renewal_as_of_date,
+    resolve_account_from_snowflake_cached,
 )
 from domain.tracking.account_tracker import setup_tracking_tables
 from services.adoption_heatmap_workflow import (
@@ -42,6 +46,7 @@ from domain.content.heatmap_builder import (
 from domain.analytics.heatmap_queries import (
     get_adoption_heatmap_data,
     get_feature_account_movers,
+    movers_cache_contains,
     _CLOUD_MAPPING,
     resolve_cloud,
     resolve_cloud_key,
@@ -118,12 +123,16 @@ def build_home_initial_blocks() -> list:
                 "action_id": "home_module_select",
                 "options": [
                     {
-                        "text": {"type": "plain_text", "text": "📊 Adoption"},
-                        "value": "adoption",
+                        "text": {"type": "plain_text", "text": "📊 Adoption Heatmap"},
+                        "value": "adoption_heatmap",
                     },
                     {
                         "text": {"type": "plain_text", "text": "📉 Attrition"},
                         "value": "attrition",
+                    },
+                    {
+                        "text": {"type": "plain_text", "text": "🔔 Watchlist"},
+                        "value": "watchlist",
                     },
                 ],
             },
@@ -172,6 +181,111 @@ prewarm_renewal_as_of_date()
 print("✓ CIDM + Renewal snapshots prewarmed")
 
 
+def prewarm_heatmap_cache(client=None):
+    del client  # kept for scheduler signature flexibility
+    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
+    top_clouds = ["Commerce B2B", "Agentforce IT Service"]
+    for cloud in top_clouds:
+        try:
+            result = get_adoption_heatmap_data(cloud, "FY2027")
+            logger.info("Pre-warmed cache: %s", cloud)
+
+            quarters = result.get("quarters", {})
+            features = next(
+                (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"] if quarters.get(q)),
+                [],
+            )
+            if not features:
+                continue
+
+            portfolio, family = resolve_cloud(cloud)
+            top_features = sorted(
+                features,
+                key=lambda f: float(f.get("score") or 0),
+                reverse=True,
+            )[:10]
+
+            for feature in top_features:
+                try:
+                    get_feature_account_movers(
+                        feature_id=feature.get("feature_id", ""),
+                        snapshot_date=feature.get("data_dt") or "",
+                        portfolio=portfolio,
+                        family=family,
+                        timeout=movers_timeout_s,
+                    )
+                    logger.info("Pre-warmed movers: %s", feature.get("feature", "Unknown"))
+                except Exception as movers_err:
+                    logger.warning(
+                        "Movers pre-warm failed for %s: %s",
+                        feature.get("feature", "Unknown"),
+                        movers_err,
+                    )
+        except Exception as e:
+            logger.warning("Pre-warm failed for %s: %s", cloud, e)
+
+
+def log_action_timing(action, request_id, timings: dict, status="ok", error_code=None):
+    logger.info(
+        json.dumps(
+            {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "action": action,
+                "request_id": request_id,
+                "status": status,
+                "error_code": error_code,
+                **timings,
+            }
+        )
+    )
+
+
+def _llm_with_timeout(timeout_s: int):
+    timeout_s = max(1, int(timeout_s))
+
+    def _call(**kwargs):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(server.call_llm_gateway_with_retry, **kwargs)
+            try:
+                return fut.result(timeout=timeout_s)
+            except FuturesTimeoutError:
+                return ""
+
+    return _call
+
+
+def _build_movers_blocks(movers: dict, title: str = "Account movers") -> list[dict]:
+    top_movers = movers.get("top_movers", [])[:5]
+    top_losers = movers.get("top_losers", [])[:5]
+    blocks: list[dict] = [
+        {"type": "header", "text": {"type": "plain_text", "text": title}},
+    ]
+    if top_movers:
+        movers_lines = "\n".join(
+            f"• *{m.get('acct_nm', 'Unknown')}*  ({m.get('mau_change_pct', 0):.0f}%)"
+            for m in top_movers
+        )
+        blocks.append(
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top movers*\n{movers_lines}"}}
+        )
+    if top_losers:
+        losers_lines = "\n".join(
+            f"• *{m.get('acct_nm', 'Unknown')}*  ({m.get('mau_change_pct', 0):.0f}%)"
+            for m in top_losers
+        )
+        blocks.append(
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top losers*\n{losers_lines}"}}
+        )
+    if not top_movers and not top_losers:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": "_No movers available for this snapshot._"}],
+            }
+        )
+    return blocks
+
+
 def setup_pulse_scheduler():
     """Setup pulse schedule from env (daily/weekly/hourly)."""
     global _pulse_scheduler
@@ -188,6 +302,18 @@ def setup_pulse_scheduler():
         print("⚠️ Invalid PULSE_SCHEDULE_TIME; defaulting to 09:00")
 
     ist = "Asia/Kolkata"
+    prewarm_enabled = os.getenv("HEATMAP_PREWARM_ENABLED", "true").lower() == "true"
+    prewarm_time = os.getenv("HEATMAP_PREWARM_SCHEDULE_TIME", "20:00")
+    prewarm_tz = os.getenv("HEATMAP_PREWARM_TIMEZONE", ist).strip() or ist
+
+    try:
+        prewarm_hour_s, prewarm_minute_s = prewarm_time.split(":")
+        prewarm_hour = int(prewarm_hour_s)
+        prewarm_minute = int(prewarm_minute_s)
+    except Exception:
+        prewarm_hour, prewarm_minute = 20, 0
+        print("⚠️ Invalid HEATMAP_PREWARM_SCHEDULE_TIME; defaulting to 20:00")
+
     scheduler = BackgroundScheduler(timezone=ist)
     if frequency == "daily":
         trigger = CronTrigger(hour=hour, minute=minute)
@@ -225,11 +351,31 @@ def setup_pulse_scheduler():
         id="clear_stale_caches",
         replace_existing=True,
     )
+    if prewarm_enabled:
+        jitter_m = random.randint(0, 3)
+        jitter_hour = prewarm_hour
+        jitter_minute = prewarm_minute + jitter_m
+        if jitter_minute >= 60:
+            jitter_hour = (jitter_hour + 1) % 24
+            jitter_minute -= 60
+        scheduler.add_job(
+            prewarm_heatmap_cache,
+            CronTrigger(hour=jitter_hour, minute=jitter_minute, timezone=prewarm_tz),
+            id="cache_prewarm",
+            name="Cache Pre-warm",
+            replace_existing=True,
+        )
+        print(
+            "✓ Scheduling heatmap cache prewarm at "
+            f"{jitter_hour:02d}:{jitter_minute:02d} ({prewarm_tz})"
+        )
     if WATCHLIST_DEMO_MODE:
         watch_trigger = CronTrigger(minute="*")
         print("✓ Watchlist demo mode enabled (runs every minute)")
     else:
-        watch_trigger = CronTrigger(hour=hour, minute=minute)
+        watch_hour = int(os.getenv("WATCHLIST_ALERT_HOUR", "9"))
+        watch_minute = random.randint(1, 4)
+        watch_trigger = CronTrigger(hour=watch_hour, minute=watch_minute, timezone=ist)
     scheduler.add_job(
         lambda: check_watchlist_alerts(app.client),
         trigger=watch_trigger,
@@ -845,6 +991,20 @@ def _is_adoption_query(text: str) -> bool:
     return any(kw in text_lower for kw in ADOPTION_KEYWORDS)
 
 
+def extract_account_from_query(text: str) -> str | None:
+    patterns = [
+        r"for (?:customer\s+)?([A-Za-z0-9\s&]+?)(?:\s*$|\s+in\s+|\s+on\s+)",
+        r"customer[:\s]+([A-Za-z0-9\s&]+?)(?:\s*$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
 # -------------------------
 # Slack events / actions
 # -------------------------
@@ -965,11 +1125,27 @@ def handle_message(event, say, client):
 
                 cloud = intent.get("cloud") or "Commerce B2B"
                 fy = intent.get("fy") or "FY2027"
+                account_name = extract_account_from_query(text)
+                account_id = None
+                if account_name:
+                    try:
+                        resolved = resolve_account_from_snowflake_cached(
+                            account_name, cloud=cloud
+                        )
+                        account_id = (resolved or {}).get("account_id")
+                    except Exception as resolve_err:
+                        logger.warning(
+                            "Account resolution failed for '%s': %s",
+                            account_name,
+                            resolve_err,
+                        )
 
                 # Route based on intent type
                 if intent["type"] == "heatmap_summary":
                     # Generate full heatmap
-                    result = get_adoption_heatmap_data(cloud, fy)
+                    result = get_adoption_heatmap_data(
+                        cloud, fy, account_id=account_id
+                    )
                     quarters = result.get("quarters", {})
                     features = []
                     for q in ["Q4", "Q3", "Q2", "Q1"]:
@@ -978,7 +1154,13 @@ def handle_message(event, say, client):
                             break
 
                     if features:
-                        blocks = build_adoption_heatmap_blocks(features, cloud, fy)
+                        blocks = build_adoption_heatmap_blocks(
+                            scored_data=features,
+                            cloud=cloud,
+                            fy=fy,
+                            total_accounts=result.get("summary", {}).get("total_accounts", 0),
+                            snapshot_date=result.get("summary", {}).get("latest_dt", ""),
+                        )
                         client.chat_postMessage(
                             channel=channel,
                             thread_ts=ts,
@@ -1022,7 +1204,9 @@ def handle_message(event, say, client):
                         return
 
                     # Get data and filter for the feature group
-                    result = get_adoption_heatmap_data(cloud, fy)
+                    result = get_adoption_heatmap_data(
+                        cloud, fy, account_id=account_id
+                    )
                     quarters = result.get("quarters", {})
                     all_features = []
                     for q in ["Q4", "Q3", "Q2", "Q1"]:
@@ -1081,7 +1265,9 @@ def handle_message(event, say, client):
                         return
 
                     # Search for the feature
-                    result = get_adoption_heatmap_data(cloud, fy)
+                    result = get_adoption_heatmap_data(
+                        cloud, fy, account_id=account_id
+                    )
                     quarters = result.get("quarters", {})
                     all_features = []
                     for q in ["Q4", "Q3", "Q2", "Q1"]:
@@ -1360,25 +1546,115 @@ def handle_module_select(ack, body, client):
     _home_state_set(user_id, status="initial")  # reset when user navigates
     selected = body["actions"][0]["selected_option"]["value"]
 
-    if selected == "adoption":
+    if selected == "adoption_heatmap":
         blocks = build_home_initial_blocks() + [
             {"type": "divider"},
             {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "📊 Adoption Heatmap"},
+            },
+            {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "*Select a cloud:*"},
-                "accessory": {
-                    "type": "static_select",
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "Choose cloud...",
-                    },
-                    "action_id": "home_cloud_select",
-                    "options": HOME_ADOPTION_CLOUD_OPTIONS,
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*What it does:*\n"
+                        "Get instant adoption insights for any Salesforce cloud — "
+                        "feature groups, drill-downs, AI recommendations, and account movers. "
+                        "All powered by PDP 2.0 live data."
+                    ),
+                },
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*Supported Clouds:*\n"
+                        ":shopping_trolley: Commerce B2B\n"
+                        ":ticket: Agentforce IT Service\n"
+                        "_More clouds coming soon: Sales Cloud, Service Cloud, FSC_"
+                    ),
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "*Supported filters:* `FY` (e.g. `FY2027`), `Industry`, `Region`, "
+                            "and conversational account filter in DM queries."
+                        ),
+                    }
+                ],
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*Commands:*\n"
+                        "`/adoption-heatmap [cloudname]` — Cloud heatmap\n"
+                        "`/adoption-heatmap [cloudname] [fy]` — Add fiscal year\n"
+                        "`/adoption-heatmap [cloudname] [fy] [industry]` — Add industry filter\n"
+                        "`/adoption-heatmap [cloudname] [fy] [industry] [region]` — Add region filter\n"
+                        "`/feature-watchlist` — View & manage your watched features\n"
+                        "`/compare Feature A vs Feature B` — Side-by-side comparison\n"
+                        "`/pulse-now` — Trigger pulse manually (testing)"
+                    ),
+                },
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*How to use:*\n"
+                        "1️⃣ Type `/adoption-heatmap`\n"
+                        "3️⃣ Drill into feature groups → features → account movers\n"
+                        "4️⃣ Click *👁 Watch* on any feature to get adoption alerts"
+                    ),
                 },
             },
         ]
     elif selected == "attrition":
         blocks = build_home_initial_blocks() + build_attrition_home_blocks()
+    elif selected == "gm_review":
+        blocks = build_home_initial_blocks() + [
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*📋 GM Review*\n"
+                        "Run executive renewal analysis with:\n"
+                        "• `/gm-review-canvas <accounts/opps>`\n"
+                        "• `/gm-review-lists <cloud or filters>`\n"
+                        "• `/gm-review-sheet <cloud or filters>`"
+                    ),
+                },
+            },
+        ]
+    elif selected == "watchlist":
+        blocks = build_home_initial_blocks() + [
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*🔔 Watchlist*\n"
+                        "Track adoption changes for features you care about.\n"
+                        "Use `/feature-watchlist` to view and manage your watchlist."
+                    ),
+                },
+            },
+        ]
     else:
         blocks = build_home_initial_blocks()
 
@@ -1388,9 +1664,7 @@ def handle_module_select(ack, body, client):
     })
 
 
-@app.action("home_cloud_select")
-def handle_cloud_select(ack, body, client):
-    ack()
+def _handle_cloud_select(body, client):
     user_id = body["user"]["id"]
 
     # Debounce — prevent double trigger
@@ -1400,193 +1674,66 @@ def handle_cloud_select(ack, body, client):
         return
     _LAST_CLOUD_SELECT[user_id] = now_ts
 
-    # Prevent concurrent loads
-    if _home_state_get(user_id).get("status") == "loading":
-        return
-    _home_state_set(user_id, status="loading")
-
     action = body["actions"][0]
     cloud_input = action.get("value")
     if not cloud_input:
         cloud_input = action.get("selected_option", {}).get("value", "Commerce B2B")
     cloud = resolve_cloud_key(cloud_input)
-    fy = "FY2027"
-
-    client.api_call("views.publish", json={
-        "user_id": user_id,
-        "view": {"type": "home", "blocks": build_home_loading_blocks(cloud)}
-    })
-
-    def _load():
-        try:
-            result = get_adoption_heatmap_data(cloud, fy)
-            quarters = result.get("quarters", {})
-            features = next(
-                (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"] if quarters.get(q)),
-                [],
-            )
-
-            if not features:
-                heatmap_body = [
-                    {"type": "divider"},
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"*📊 {cloud} · {result.get('fy') or fy}*\n"
-                                "_No adoption data in the selected window._"
-                            ),
-                        },
-                    },
-                ]
-                blocks = build_home_initial_blocks() + heatmap_body
-            else:
-                groups = defaultdict(list)
-                for f in features:
-                    groups[f.get("feature_group", "Unknown")].append(f)
-
-                # Red ≤5% · watch 6–19% (strictly, (5, 20) non-green) · green ≥20%
-                t = {"green": 20, "red": 5, "watch_lo": 6, "watch_hi": 19}
-
-                def _group_avg(feats: list) -> float:
-                    return sum(float(f.get("score", 0) or 0) for f in feats) / len(
-                        feats
-                    )
-
-                def _band(avg: float) -> str:
-                    if avg >= t["green"]:
-                        return "healthy"
-                    if avg <= t["red"]:
-                        return "critical"
-                    return "watch"  # 5 < avg < 20 (covers 6–19%)
-
-                healthy_count = sum(
-                    1 for g in groups.values() if _band(_group_avg(g)) == "healthy"
-                )
-                watch_count = sum(
-                    1 for g in groups.values() if _band(_group_avg(g)) == "watch"
-                )
-                critical_count = sum(
-                    1 for g in groups.values() if _band(_group_avg(g)) == "critical"
-                )
-
-                snapshot_date = (
-                    result.get("summary", {}).get("latest_dt", "") or "latest"
-                )
-                total_accounts = result.get("summary", {}).get("total_accounts", 0)
-                if total_accounts in (None, 0):
-                    total_accounts = max(
-                        (f.get("account_count", 0) for f in features), default=0
-                    )
-                total_accounts = int(total_accounts or 0)
-
-                blocks = [
-                    {
-                        "type": "header",
-                        "text": {
-                            "type": "plain_text",
-                            "text": f"📊 {cloud} · Adoption Heatmap",
-                        },
-                    },
-                    {
-                        "type": "context",
-                        "elements": [
-                            {
-                                "type": "mrkdwn",
-                                "text": (
-                                    f"{total_accounts:,} accounts · {len(features)} features · "
-                                    f"{snapshot_date}"
-                                ),
-                            }
-                        ],
-                    },
-                    {"type": "divider"},
-                    {
-                        "type": "section",
-                        "fields": [
-                            {
-                                "type": "mrkdwn",
-                                "text": f":large_green_circle: *{healthy_count}* Healthy",
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": f":large_yellow_circle: *{watch_count}* Watch",
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": f":red_circle: *{critical_count}* Critical",
-                            },
-                        ],
-                    },
-                    {
-                        "type": "context",
-                        "elements": [
-                            {
-                                "type": "mrkdwn",
-                                "text": (
-                                    f":large_green_circle: ≥{t['green']}% Healthy  ·  "
-                                    f":large_yellow_circle: {t['watch_lo']}-{t['watch_hi']}% Watch  ·  "
-                                    f":red_circle: ≤{t['red']}% Critical"
-                                ),
-                            }
-                        ],
-                    },
-                    {"type": "divider"},
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": "🔍 Drill into groups",
-                                },
-                                "action_id": "home_drill_groups",
-                                "value": cloud,
-                            },
-                            {
-                                "type": "button",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": "🔄 Refresh",
-                                },
-                                "action_id": "home_cloud_select",
-                                "value": cloud,
-                                "style": "primary",
-                            },
-                        ],
-                    },
-                ]
-            logger.warning("HOME heatmap published blocks=%s", len(blocks))
-            client.api_call(
-                "views.publish",
-                json={
-                    "user_id": user_id,
-                    "view": {
-                        "type": "home",
-                        "blocks": blocks,
-                    },
-                },
-            )
-            _home_state_set(user_id, status="heatmap_loaded")
-            st = HOME_STATE.get(user_id)
-            if isinstance(st, dict):
-                st.pop("canvas_id", None)
-        except Exception as e:
-            logger.warning(f"FULL ERROR: {e}")
-            logger.warning(f"Heatmap load failed: {e}")
-            _home_state_set(user_id, status="initial")
-            client.api_call("views.publish", json={
-                "user_id": user_id,
-                "view": {
-                    "type": "home",
-                    "blocks": build_home_initial_blocks(),
+    _home_state_set(user_id, status="initial")
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"📊 {cloud} · Adoption Heatmap"},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Home preview is disabled for performance.*\n"
+                    "Run heatmap on demand using slash commands:"
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"`/adoption-heatmap {cloud}`\n"
+                    f"`/adoption-heatmap {cloud} FY2027`\n"
+                    "`/feature-watchlist`"
+                ),
+            },
+        },
+        {"type": "divider"},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "↩ Back to Modules"},
+                    "action_id": "refresh_app_home",
                 }
-            })
-            return
+            ],
+        },
+    ]
+    client.api_call(
+        "views.publish",
+        json={"user_id": user_id, "view": {"type": "home", "blocks": blocks}},
+    )
 
-    threading.Thread(target=_load, daemon=True).start()
+
+@app.action("home_cloud_select")
+def handle_cloud_select(ack, body, client):
+    ack()
+    _handle_cloud_select(body, client)
+
+
+@app.action("home_cloud_select_agentforce")
+def handle_cloud_select_agentforce(ack, body, client):
+    ack()
+    _handle_cloud_select(body, client)
 
 
 @app.action("home_drill_groups")
@@ -2381,7 +2528,7 @@ def handle_adoption_heatmap(ack, body, client, logger):
         user=user,
         text=(
             f":hourglass_flowing_sand: Building heatmap for "
-            f"*{cloud}* {fy}{filter_str}..."
+            f"*{cloud}*{filter_str}..."
         )
     )
 
@@ -2398,7 +2545,13 @@ def handle_adoption_heatmap(ack, body, client, logger):
                 []
             )
             blocks = build_adoption_heatmap_blocks(
-                features, cloud, fy, industry=industry, region=region
+                scored_data=features,
+                cloud=cloud,
+                fy=fy,
+                industry=industry,
+                region=region,
+                total_accounts=result.get("summary", {}).get("total_accounts", 0),
+                snapshot_date=result.get("summary", {}).get("latest_dt", ""),
             )
 
             # Post heatmap to channel
@@ -2434,9 +2587,12 @@ def handle_adoption_heatmap(ack, body, client, logger):
     threading.Thread(target=_run_heatmap_async, daemon=True).start()
 
 
-@app.action("heatmap_drilldown")
+@app.action(re.compile(r"^heatmap_drilldown"))
 def handle_heatmap_drilldown(ack, body, client, logger):
     ack()
+    request_id = str(uuid.uuid4())
+    t0 = time.perf_counter()
+    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
 
     value = body["actions"][0]["value"]
     parts = value.split("|")
@@ -2462,45 +2618,88 @@ def handle_heatmap_drilldown(ack, body, client, logger):
         )
         return
 
-    # Fetch movers for worst feature in group
-    worst = min(group_features, key=lambda f: f.get("score", 100))
-    portfolio, family = _CLOUD_MAPPING.get(
-        cloud, ("Commerce", "B2B Commerce")
-    )
-    movers_data = get_feature_account_movers(
-        feature_id=worst.get("feature_id"),
-        snapshot_date=worst.get("data_dt") or "",
-        portfolio=portfolio,
-        family=family,
-    )
-
-    # Build and post Layer 2 blocks
+    # Fast-first: post drilldown immediately without waiting on movers.
     drilldown_blocks = build_group_drilldown_blocks(
         group_features,
         group_name,
         cloud,
         fy,
-        movers_data,
+        {},
         user_id=body["user"]["id"],
         is_on_watchlist_fn=is_on_watchlist,
     )
-    client.chat_postMessage(
+    response = client.chat_postMessage(
         channel=channel,
         thread_ts=message_ts,
         text=f":mag: {group_name} drill-down",
         blocks=drilldown_blocks
     )
+    t_first_post_ms = round((time.perf_counter() - t0) * 1000)
     logger.info(
-        f"Group drilldown posted: {group_name} "
-        f"— {len(group_features)} features, "
-        f"{len(movers_data.get('top_movers', []))} movers, "
-        f"{len(movers_data.get('top_losers', []))} losers"
+        "Group drilldown posted fast-first: %s — %s features",
+        group_name,
+        len(group_features),
     )
+
+    # Fetch movers in background and post follow-up in thread.
+    thread_ts = response.get("ts") or message_ts
+    worst = min(group_features, key=lambda f: f.get("score", 100))
+    portfolio, family = _CLOUD_MAPPING.get(
+        cloud, ("Commerce", "B2B Commerce")
+    )
+
+    def _fetch_movers_async():
+        try:
+            movers_data = get_feature_account_movers(
+                feature_id=worst.get("feature_id"),
+                snapshot_date=worst.get("data_dt") or "",
+                portfolio=portfolio,
+                family=family,
+                timeout=movers_timeout_s,
+            )
+            if movers_data.get("top_movers") or movers_data.get("top_losers"):
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text="Account movers",
+                    blocks=_build_movers_blocks(
+                        movers_data,
+                        title=f"Account movers · {group_name}",
+                    ),
+                )
+        except Exception as e:
+            logger.warning("Movers fetch failed for %s: %s", group_name, e)
+
+    threading.Thread(target=_fetch_movers_async, daemon=True).start()
+    log_action_timing(
+        "drilldown",
+        request_id,
+        {
+            "t_first_post_ms": t_first_post_ms,
+            "cache_hit_heatmap": True,
+            "cache_hit_movers": movers_cache_contains(
+                worst.get("feature_id"),
+                worst.get("data_dt") or "",
+                portfolio,
+                family,
+                top_n=5,
+                timeout=movers_timeout_s,
+            ),
+        },
+    )
+
+
+@app.action(re.compile(r"^heatmap_drilldown_grp_"))
+def handle_group_drill(ack, body, client, logger):
+    handle_heatmap_drilldown(ack, body, client, logger)
 
 
 @app.action("heatmap_feature_detail")
 def handle_heatmap_feature_detail(ack, body, client, logger):
     ack()
+    request_id = str(uuid.uuid4())
+    t0 = time.perf_counter()
+    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
 
     value = body["actions"][0]["value"]
     parts = value.split("|")
@@ -2528,38 +2727,78 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
         )
         return
 
-    # Fetch movers
-    portfolio, family = _CLOUD_MAPPING.get(
-        cloud, ("Commerce", "B2B Commerce")
-    )
-    movers_data = get_feature_account_movers(
-        feature_id=feature_id,
-        snapshot_date=matched.get("data_dt") or "",
-        portfolio=portfolio,
-        family=family,
-    )
-
-    # Build Layer 3 blocks
+    # Fast-first: render detail immediately with core data (no movers yet).
     blocks, color = build_feature_detail_blocks(
         feature=matched,
-        movers=movers_data,
+        movers={},
         cloud=cloud,
         fy=fy,
-        call_llm_fn=server.call_llm_gateway_with_retry,
+        call_llm_fn=None,
         user_id=body["user"]["id"],
         is_on_watchlist_fn=is_on_watchlist,
     )
 
-    client.chat_postMessage(
+    response = client.chat_postMessage(
         channel=channel,
         thread_ts=message_ts,
         text=f":mag: {feature_nm} · Feature detail",
         attachments=[{"color": color, "blocks": blocks}]
     )
-    logger.info(
-        f"Feature detail posted: {feature_nm} — "
-        f"{len(movers_data.get('top_movers', []))} movers, "
-        f"{len(movers_data.get('top_losers', []))} losers"
+    t_first_post_ms = round((time.perf_counter() - t0) * 1000)
+    logger.info("Feature detail posted fast-first: %s", feature_nm)
+
+    # Fetch movers in background and post enriched follow-up.
+    thread_ts = response.get("ts") or message_ts
+
+    def _fetch_detail_movers_async():
+        try:
+            portfolio, family = _CLOUD_MAPPING.get(
+                cloud, ("Commerce", "B2B Commerce")
+            )
+            movers_data = get_feature_account_movers(
+                feature_id=feature_id,
+                snapshot_date=matched.get("data_dt") or "",
+                portfolio=portfolio,
+                family=family,
+                timeout=movers_timeout_s,
+            )
+            llm_timeout_s = int(os.getenv("LLM_QUERY_TIMEOUT_SECONDS", "7"))
+            if movers_data.get("top_movers") or movers_data.get("top_losers"):
+                enriched_blocks, enriched_color = build_feature_detail_blocks(
+                    feature=matched,
+                    movers=movers_data,
+                    cloud=cloud,
+                    fy=fy,
+                    call_llm_fn=_llm_with_timeout(llm_timeout_s),
+                    user_id=body["user"]["id"],
+                    is_on_watchlist_fn=is_on_watchlist,
+                )
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f":zap: {feature_nm} · Movers update",
+                    attachments=[{"color": enriched_color, "blocks": enriched_blocks}],
+                )
+        except Exception as e:
+            logger.warning("Movers/detail enrichment failed for %s: %s", feature_nm, e)
+
+    threading.Thread(target=_fetch_detail_movers_async, daemon=True).start()
+    portfolio, family = _CLOUD_MAPPING.get(cloud, ("Commerce", "B2B Commerce"))
+    log_action_timing(
+        "feature_detail",
+        request_id,
+        {
+            "t_first_post_ms": t_first_post_ms,
+            "cache_hit_heatmap": True,
+            "cache_hit_movers": movers_cache_contains(
+                feature_id,
+                matched.get("data_dt") or "",
+                portfolio,
+                family,
+                top_n=5,
+                timeout=movers_timeout_s,
+            ),
+        },
     )
 
 
@@ -2804,7 +3043,12 @@ def handle_account_feature_heatmap(ack, body, client):
                 return
 
             blocks = build_adoption_heatmap_blocks(
-                features, cloud, fy, title=f"📊 {acct_name} · Feature Heatmap"
+                scored_data=features,
+                cloud=cloud,
+                fy=fy,
+                title=f"📊 {acct_name} · Feature Heatmap",
+                total_accounts=result.get("summary", {}).get("total_accounts", 0),
+                snapshot_date=result.get("summary", {}).get("latest_dt", ""),
             )
             client.chat_postMessage(
                 channel=channel,

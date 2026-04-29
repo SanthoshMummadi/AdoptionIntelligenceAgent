@@ -380,6 +380,8 @@ _pool: Queue = Queue(maxsize=POOL_SIZE)
 _pool_initialized = False
 _pool_created_count = 0
 _pool_lock = threading.Lock()
+_PDP_MAX_CONNECTIONS = max(1, _env_int("SNOWFLAKE_MAX_CONNECTIONS", 3))
+_PDP_SNOWFLAKE_SEMAPHORE = threading.Semaphore(_PDP_MAX_CONNECTIONS)
 
 
 def _snowflake_conn_params() -> dict[str, Any]:
@@ -528,6 +530,8 @@ def get_pdp_snowflake_connection() -> Any:
     """
     import subprocess
 
+    _PDP_SNOWFLAKE_SEMAPHORE.acquire()
+
     # Check if we're on adoption branch
     try:
         result = subprocess.run(
@@ -575,6 +579,7 @@ def get_pdp_snowflake_connection() -> Any:
         log_debug("[PDP] Snowflake connection established")
         return conn
     except Exception as e:
+        _PDP_SNOWFLAKE_SEMAPHORE.release()
         log_error(f"[PDP] Connection failed: {e}")
         raise
 
@@ -582,6 +587,7 @@ def get_pdp_snowflake_connection() -> Any:
 def return_pdp_connection(conn: Any) -> None:
     """Close PDP connection (not pooled)."""
     if conn is None:
+        _PDP_SNOWFLAKE_SEMAPHORE.release()
         return
     try:
         if not conn.is_closed():
@@ -589,6 +595,8 @@ def return_pdp_connection(conn: Any) -> None:
             log_debug("[PDP] Connection closed")
     except Exception as e:
         log_debug(f"[PDP] Error closing connection: {str(e)[:60]}")
+    finally:
+        _PDP_SNOWFLAKE_SEMAPHORE.release()
 
 
 def _product_atr_amount(p: dict) -> float:

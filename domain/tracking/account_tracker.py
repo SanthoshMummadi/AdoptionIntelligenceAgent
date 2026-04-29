@@ -96,6 +96,24 @@ def setup_tracking_tables():
     logger.info("✓ Tracking tables ready")
 
 
+def get_user_watchlist(user_id: str) -> list[dict]:
+    """Returns watchlist items for a user, newest first."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT feature_id, feature_name, cloud, added_at, last_score
+            FROM watchlist
+            WHERE user_id = ?
+            ORDER BY added_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def is_strategic(opp: dict) -> bool:
     """
     Returns True if opp qualifies for strategic tracking.
