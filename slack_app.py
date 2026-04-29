@@ -62,6 +62,10 @@ if not slack_bot_token:
 
 app = App(token=slack_bot_token)
 _pulse_scheduler = None
+WATCHLIST_FREQUENCY = os.getenv("WATCHLIST_ALERT_FREQUENCY", "daily").lower()
+WATCHLIST_THRESHOLD = float(os.getenv("WATCHLIST_DROP_THRESHOLD", "15"))
+WATCHLIST_MIN_SCORE = float(os.getenv("WATCHLIST_MIN_SCORE", "5"))
+WATCHLIST_DEMO_MODE = os.getenv("WATCHLIST_DEMO_MODE", "false").lower() == "true"
 # In-memory context store for heatmap thread replies
 # Shape: { channel_id: { cloud, fy, features, ts, created } }
 HEATMAP_CONTEXT: dict = {}
@@ -183,7 +187,8 @@ def setup_pulse_scheduler():
         hour, minute = 9, 0
         print("⚠️ Invalid PULSE_SCHEDULE_TIME; defaulting to 09:00")
 
-    scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+    ist = "Asia/Kolkata"
+    scheduler = BackgroundScheduler(timezone=ist)
     if frequency == "daily":
         trigger = CronTrigger(hour=hour, minute=minute)
         print(f"✓ Scheduling daily pulse at {hour:02d}:{minute:02d} IST")
@@ -208,9 +213,28 @@ def setup_pulse_scheduler():
         replace_existing=True,
     )
     scheduler.add_job(
+        lambda: send_daily_pulse(app.client),
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=ist),
+        id="daily_watchlist_pulse",
+        name="Daily Watchlist Pulse",
+        replace_existing=True,
+    )
+    scheduler.add_job(
         clear_stale_caches,
         CronTrigger(minute=0),
         id="clear_stale_caches",
+        replace_existing=True,
+    )
+    if WATCHLIST_DEMO_MODE:
+        watch_trigger = CronTrigger(minute="*")
+        print("✓ Watchlist demo mode enabled (runs every minute)")
+    else:
+        watch_trigger = CronTrigger(hour=hour, minute=minute)
+    scheduler.add_job(
+        lambda: check_watchlist_alerts(app.client),
+        trigger=watch_trigger,
+        id="watchlist_alerts",
+        name="Watchlist Alerts",
         replace_existing=True,
     )
     scheduler.start()
@@ -301,6 +325,20 @@ def init_database() -> None:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                feature_id TEXT,
+                feature_name TEXT,
+                cloud TEXT,
+                added_at TIMESTAMP,
+                last_score REAL,
+                last_checked TIMESTAMP
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -340,6 +378,369 @@ def save_to_history(
             conn.close()
         except Exception:
             pass
+
+
+def add_to_watchlist(user_id: str, feature_id: str, feature_name: str, cloud: str) -> None:
+    """Add/update one watchlist subscription for a user and feature."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id FROM watchlist
+            WHERE user_id = ? AND feature_id = ? AND cloud = ?
+            """,
+            (user_id, feature_id, cloud),
+        )
+        row = cur.fetchone()
+        now = datetime.now(timezone.utc).isoformat()
+        if row:
+            cur.execute(
+                """
+                UPDATE watchlist
+                SET feature_name = ?, added_at = ?
+                WHERE id = ?
+                """,
+                (feature_name, now, row[0]),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO watchlist
+                (user_id, feature_id, feature_name, cloud, added_at, last_score, last_checked)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, feature_id, feature_name, cloud, now, None, None),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remove_from_watchlist(user_id: str, feature_id: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM watchlist WHERE user_id = ? AND feature_id = ?",
+            (user_id, feature_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_on_watchlist(user_id: str, feature_id: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM watchlist WHERE user_id = ? AND feature_id = ? LIMIT 1",
+            (user_id, feature_id),
+        )
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def get_all_watchlist_items() -> list[dict]:
+    """Fetch all watchlist rows for background checks."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, user_id, feature_id, feature_name, cloud, last_score
+            FROM watchlist
+            """
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": r[0],
+                "user_id": r[1],
+                "feature_id": r[2],
+                "feature_name": r[3],
+                "cloud": r[4],
+                "last_score": r[5],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def get_user_watchlist(user_id: str) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, feature_id, feature_name, cloud, added_at, last_score
+            FROM watchlist
+            WHERE user_id = ?
+            ORDER BY added_at DESC
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": r[0],
+                "feature_id": r[1],
+                "feature_name": r[2],
+                "cloud": r[3],
+                "added_at": r[4],
+                "last_score": r[5],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def update_watchlist_score(item_id: int, current_score: float) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE watchlist
+            SET last_score = ?, last_checked = ?
+            WHERE id = ?
+            """,
+            (float(current_score), datetime.now(timezone.utc).isoformat(), item_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_current_feature_score(feature_id: str, cloud: str) -> float | None:
+    """Resolve current score by feature_id from latest available FY2027 quarter."""
+    try:
+        result = get_adoption_heatmap_data(cloud, "FY2027")
+        quarters = result.get("quarters", {})
+        for q in ["Q4", "Q3", "Q2", "Q1"]:
+            feats = quarters.get(q) or []
+            match = next((f for f in feats if f.get("feature_id") == feature_id), None)
+            if match:
+                return float(match.get("score") or 0.0)
+    except Exception as e:
+        logger.warning("get_current_feature_score failed for %s/%s: %s", cloud, feature_id, e)
+    return None
+
+
+def check_watchlist_alerts(client) -> None:
+    """Weekly watchlist monitor: DM when feature score drops by 15%+ versus last check."""
+    items = get_all_watchlist_items()
+    if not items:
+        return
+
+    for item in items:
+        current_score = get_current_feature_score(item["feature_id"], item["cloud"])
+        if current_score is None:
+            continue
+
+        # Demo mode: send heartbeat alert every run for easy live demo.
+        if WATCHLIST_DEMO_MODE:
+            last_score_demo = item.get("last_score")
+            if last_score_demo is not None and last_score_demo > 0:
+                delta_pct = ((current_score - last_score_demo) / last_score_demo) * 100.0
+                trend_txt = (
+                    f"↑ +{delta_pct:.0f}%" if delta_pct > 0
+                    else f"↓ {delta_pct:.0f}%" if delta_pct < 0
+                    else "→ 0%"
+                )
+            else:
+                trend_txt = "→ baseline set"
+            try:
+                client.chat_postMessage(
+                    channel=item["user_id"],
+                    text=(
+                        f":bell: *Watchlist Demo Alert: {item['feature_name']}*\n"
+                        f"Current adoption: `{current_score:.0f}%`\n"
+                        f"Cloud: {item['cloud']} · Trend: {trend_txt}"
+                    ),
+                )
+            except Exception as e:
+                logger.warning("watchlist demo alert DM failed: %s", e)
+            update_watchlist_score(item["id"], current_score)
+            continue
+        if current_score <= WATCHLIST_MIN_SCORE:
+            update_watchlist_score(item["id"], current_score)
+            continue
+
+        last_score = item.get("last_score")
+        if last_score is not None and last_score > 0:
+            drop_ratio = (current_score - last_score) / last_score
+            if current_score < last_score * (1 - WATCHLIST_THRESHOLD / 100.0):
+                try:
+                    client.chat_postMessage(
+                        channel=item["user_id"],
+                        text=(
+                            f":warning: *Watchlist Alert: {item['feature_name']}*\n"
+                            f"Adoption dropped from `{last_score:.0f}%` -> `{current_score:.0f}%`\n"
+                            f"Cloud: {item['cloud']} · Trend: ↓ {abs(drop_ratio) * 100:.0f}%"
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning("watchlist alert DM failed: %s", e)
+
+        update_watchlist_score(item["id"], current_score)
+
+
+def send_daily_pulse(client):
+    """Send personalized daily pulse to all users with watchlist items."""
+    all_watchlist_users = sorted({item["user_id"] for item in get_all_watchlist_items()})
+
+    for user_id in all_watchlist_users:
+        try:
+            items = get_user_watchlist(user_id)
+            if not items:
+                continue
+
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "📊 Your Daily Adoption Pulse"},
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"_{len(items)} watched feature"
+                                f"{'s' if len(items) != 1 else ''} · "
+                                f"{datetime.now().strftime('%B %d, %Y')}_"
+                            ),
+                        }
+                    ],
+                },
+                {"type": "divider"},
+            ]
+
+            for item in items:
+                try:
+                    result = get_adoption_heatmap_data(item["cloud"], "FY2027")
+                    quarters = result.get("quarters", {})
+                    features = next(
+                        (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"] if quarters.get(q)),
+                        [],
+                    )
+                    matched = next(
+                        (f for f in features if f.get("feature_id") == item["feature_id"]),
+                        None,
+                    )
+                    if not matched:
+                        continue
+
+                    score = float(matched.get("score") or 0)
+                    last_score = float(item.get("last_score") or 0)
+                    mau = int(matched.get("mau") or 0)
+
+                    health = (
+                        ":large_green_circle:" if score > 20
+                        else ":large_yellow_circle:" if score >= 5
+                        else ":red_circle:"
+                    )
+
+                    if last_score > 0:
+                        delta = score - last_score
+                        change = (
+                            f"↑ +{delta:.0f}pts" if delta > 2
+                            else f"↓ {delta:.0f}pts" if delta < -2
+                            else "→ No change"
+                        )
+                    else:
+                        change = "First check"
+
+                    mau_display = f"{mau/1000:.1f}K" if mau >= 1000 else str(mau)
+
+                    blocks.append(
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"{health} *{item['feature_name']}*\n"
+                                    f"`{score:.0f}%` adoption  ·  {mau_display} MAU  ·  {change}"
+                                ),
+                            },
+                        }
+                    )
+                    blocks.append(
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "View Detail"},
+                                    "action_id": "heatmap_feature_detail",
+                                    "value": (
+                                        f"{item['feature_id']}|{item['feature_name']}|"
+                                        f"{item['cloud']}|FY2027"
+                                    ),
+                                    "style": "primary",
+                                },
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "❌ Remove"},
+                                    "action_id": "remove_from_watchlist",
+                                    "value": (
+                                        f"{item['feature_id']}|{item['feature_name']}|"
+                                        f"{item['cloud']}"
+                                    ),
+                                    "style": "danger",
+                                },
+                            ],
+                        }
+                    )
+
+                    if last_score > 0 and score < last_score * 0.85:
+                        blocks.append(
+                            {
+                                "type": "context",
+                                "elements": [
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": (
+                                            f":warning: Dropped "
+                                            f"{((score-last_score)/last_score*100):.0f}% "
+                                            f"since last check — action needed!"
+                                        ),
+                                    }
+                                ],
+                            }
+                        )
+
+                    update_watchlist_score(item["id"], score)
+
+                    blocks.append({"type": "divider"})
+                except Exception as e:
+                    logger.warning("Pulse failed for %s: %s", item.get("feature_name"), e)
+                    continue
+
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "_Use `/feature-watchlist` to manage your watchlist_",
+                        }
+                    ],
+                }
+            )
+
+            client.chat_postMessage(
+                channel=user_id,
+                blocks=blocks,
+                text=f"📊 Your Daily Adoption Pulse — {len(items)} features tracked",
+            )
+        except Exception as e:
+            logger.warning("Daily pulse failed for %s: %s", user_id, e)
 
 
 def get_session(user_id: str) -> dict:
@@ -494,7 +895,13 @@ def handle_message(event, say, client):
                     family=family,
                 )
                 blocks, color = build_feature_detail_blocks(
-                    feature=best, movers=movers_data, cloud=cloud, fy=fy
+                    feature=best,
+                    movers=movers_data,
+                    cloud=cloud,
+                    fy=fy,
+                    call_llm_fn=server.call_llm_gateway_with_retry,
+                    user_id=event.get("user"),
+                    is_on_watchlist_fn=is_on_watchlist,
                 )
 
                 client.chat_postMessage(
@@ -700,7 +1107,13 @@ def handle_message(event, say, client):
                                 family=family,
                             )
                             blocks, color = build_feature_detail_blocks(
-                                feature=best, movers=movers_data, cloud=cloud, fy=fy
+                                feature=best,
+                                movers=movers_data,
+                                cloud=cloud,
+                                fy=fy,
+                                call_llm_fn=server.call_llm_gateway_with_retry,
+                                user_id=user,
+                                is_on_watchlist_fn=is_on_watchlist,
                             )
                             client.chat_postMessage(
                                 channel=channel,
@@ -2063,7 +2476,13 @@ def handle_heatmap_drilldown(ack, body, client, logger):
 
     # Build and post Layer 2 blocks
     drilldown_blocks = build_group_drilldown_blocks(
-        group_features, group_name, cloud, fy, movers_data
+        group_features,
+        group_name,
+        cloud,
+        fy,
+        movers_data,
+        user_id=body["user"]["id"],
+        is_on_watchlist_fn=is_on_watchlist,
     )
     client.chat_postMessage(
         channel=channel,
@@ -2126,6 +2545,9 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
         movers=movers_data,
         cloud=cloud,
         fy=fy,
+        call_llm_fn=server.call_llm_gateway_with_retry,
+        user_id=body["user"]["id"],
+        is_on_watchlist_fn=is_on_watchlist,
     )
 
     client.chat_postMessage(
@@ -2139,6 +2561,265 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
         f"{len(movers_data.get('top_movers', []))} movers, "
         f"{len(movers_data.get('top_losers', []))} losers"
     )
+
+
+@app.action("add_to_watchlist")
+def handle_add_to_watchlist(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    value = body["actions"][0]["value"]
+
+    try:
+        feature_id, feature_name, cloud = value.split("|", 2)
+    except ValueError:
+        client.chat_postMessage(
+            channel=user_id,
+            text=":x: Could not parse watchlist payload.",
+        )
+        return
+
+    # Save to watchlist
+    add_to_watchlist(user_id, feature_id, feature_name, cloud)
+
+    # Update originating message so button flips immediately to "Remove".
+    updated_blocks_with_remove_button = body.get("message", {}).get("blocks", [])
+    if updated_blocks_with_remove_button:
+        for block in updated_blocks_with_remove_button:
+            accessory = block.get("accessory")
+            if isinstance(accessory, dict) and accessory.get("action_id") == "add_to_watchlist":
+                accessory["action_id"] = "remove_from_watchlist"
+                accessory["text"] = {"type": "plain_text", "text": "❌ Remove from Watchlist"}
+                accessory["value"] = f"{feature_id}|{feature_name}|{cloud}"
+                accessory["style"] = "danger"
+
+            elements = block.get("elements")
+            if isinstance(elements, list):
+                for elem in elements:
+                    if isinstance(elem, dict) and elem.get("action_id") == "add_to_watchlist":
+                        elem["action_id"] = "remove_from_watchlist"
+                        elem["text"] = {
+                            "type": "plain_text",
+                            "text": "❌ Remove from Watchlist",
+                        }
+                        elem["value"] = f"{feature_id}|{feature_name}|{cloud}"
+                        elem["style"] = "danger"
+
+        try:
+            client.chat_update(
+                channel=body["channel"]["id"],
+                ts=body["message"]["ts"],
+                blocks=updated_blocks_with_remove_button,
+                text=f":eyes: {feature_name} added to watchlist",
+            )
+        except Exception as e:
+            logger.warning("Failed to refresh watchlist button state: %s", e)
+
+    # Confirm added
+    client.chat_postMessage(
+        channel=user_id,
+        text=f":eyes: *{feature_name}* added to your watchlist!",
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":eyes: *{feature_name}* added to your watchlist!\n"
+                        "You'll get alerted when adoption drops significantly."
+                    ),
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ Remove from Watchlist"},
+                        "action_id": "remove_from_watchlist",
+                        "value": f"{feature_id}|{feature_name}|{cloud}",
+                        "style": "danger",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "📋 View My Watchlist"},
+                        "action_id": "view_watchlist",
+                        "value": user_id,
+                    },
+                ],
+            },
+        ],
+    )
+
+@app.action("remove_from_watchlist")
+def handle_remove_from_watchlist(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    value = body["actions"][0]["value"]
+    parts = value.split("|")
+    feature_id = parts[0] if len(parts) > 0 else ""
+    feature_name = parts[1] if len(parts) > 1 else "Unknown"
+
+    remove_from_watchlist(user_id, feature_id)
+    client.chat_postMessage(
+        channel=user_id,
+        text=f":x: *{feature_name}* removed from your watchlist.",
+    )
+
+
+@app.action("view_watchlist")
+def handle_view_watchlist(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    items = get_user_watchlist(user_id)
+
+    if not items:
+        client.chat_postMessage(
+            channel=user_id,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            ":eyes: Your watchlist is empty.\n"
+                            "Click *👁 Watch* on any feature to start tracking it."
+                        ),
+                    },
+                }
+            ],
+            text="Your watchlist is empty.",
+        )
+        return
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "👁 Your Watchlist"},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"{len(items)} feature{'s' if len(items) != 1 else ''} being tracked"
+                    ),
+                }
+            ],
+        },
+        {"type": "divider"},
+    ]
+    for item in items:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":eyes: *{item['feature_name']}*\n"
+                        f"{item['cloud']}  ·  Added {item['added_at']}"
+                    ),
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "View Detail"},
+                        "action_id": "heatmap_feature_detail",
+                        "value": (
+                            f"{item['feature_id']}|{item['feature_name']}|"
+                            f"{item['cloud']}|FY2027"
+                        ),
+                        "style": "primary",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ Remove"},
+                        "action_id": "remove_from_watchlist",
+                        "value": (
+                            f"{item['feature_id']}|{item['feature_name']}|{item['cloud']}"
+                        ),
+                        "style": "danger",
+                    },
+                ],
+            }
+        )
+        blocks.append({"type": "divider"})
+
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "_You'll get alerted when adoption drops significantly · "
+                        "Alerts configurable via `.env`_"
+                    ),
+                }
+            ],
+        }
+    )
+
+    client.chat_postMessage(
+        channel=user_id,
+        blocks=blocks,
+        text="Your watchlist",
+    )
+
+
+@app.action("account_feature_heatmap")
+def handle_account_feature_heatmap(ack, body, client):
+    ack()
+    value = body["actions"][0]["value"]
+    parts = value.split("|")
+    acct_id = parts[0] if len(parts) > 0 else ""
+    acct_name = parts[1] if len(parts) > 1 else "Unknown"
+    cloud = parts[2] if len(parts) > 2 else "Commerce B2B"
+    fy = parts[3] if len(parts) > 3 else "FY2027"
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+
+    def _load_account_heatmap():
+        try:
+            result = get_adoption_heatmap_data(
+                cloud, fy, account_id=acct_id or None
+            )
+            quarters = result.get("quarters", {})
+            features = next(
+                (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"] if quarters.get(q)),
+                [],
+            )
+
+            if not features:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=message_ts,
+                    text=f":x: No feature data found for *{acct_name}*",
+                )
+                return
+
+            blocks = build_adoption_heatmap_blocks(
+                features, cloud, fy, title=f"📊 {acct_name} · Feature Heatmap"
+            )
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=message_ts,
+                text=f"📊 {acct_name} · {cloud} Feature Heatmap",
+                blocks=blocks,
+            )
+        except Exception as e:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=message_ts,
+                text=f":x: Failed to load heatmap for *{acct_name}*: {str(e)}",
+            )
+
+    threading.Thread(target=_load_account_heatmap, daemon=True).start()
 
 
 @app.action("heatmap_message_owner")
@@ -2245,7 +2926,13 @@ def handle_heatmap_back_to_group(ack, body, client, logger):
         family=family,
     )
     drilldown_blocks = build_group_drilldown_blocks(
-        group_feats, group_nm, cloud, fy, movers_data
+        group_feats,
+        group_nm,
+        cloud,
+        fy,
+        movers_data,
+        user_id=body["user"]["id"],
+        is_on_watchlist_fn=is_on_watchlist,
     )
     client.chat_postMessage(
         channel=channel,
@@ -2894,6 +3581,114 @@ def handle_pulse_now(ack, say, command, client):
     except Exception as e:
         log_error(f"pulse-now failed: {e}")
         say(f":x: Pulse failed: {str(e)}")
+
+
+@app.command("/feature-watchlist")
+def handle_watchlist_command(ack, body, client):
+    ack()
+    user_id = body.get("user_id") or body.get("user", {}).get("id")
+    if not user_id:
+        return
+    items = get_user_watchlist(user_id)
+
+    if not items:
+        client.chat_postMessage(
+            channel=user_id,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            ":eyes: Your watchlist is empty.\n"
+                            "Click *👁 Watch* on any feature to start tracking it."
+                        ),
+                    },
+                }
+            ],
+            text="Your watchlist is empty.",
+        )
+        return
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "👁 Your Watchlist"},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"{len(items)} feature{'s' if len(items) != 1 else ''} being tracked"
+                    ),
+                }
+            ],
+        },
+        {"type": "divider"},
+    ]
+    for item in items:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":eyes: *{item['feature_name']}*\n"
+                        f"{item['cloud']}  ·  Added {item['added_at']}"
+                    ),
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "View Detail"},
+                        "action_id": "heatmap_feature_detail",
+                        "value": (
+                            f"{item['feature_id']}|{item['feature_name']}|"
+                            f"{item['cloud']}|FY2027"
+                        ),
+                        "style": "primary",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ Remove"},
+                        "action_id": "remove_from_watchlist",
+                        "value": (
+                            f"{item['feature_id']}|{item['feature_name']}|{item['cloud']}"
+                        ),
+                        "style": "danger",
+                    },
+                ],
+            }
+        )
+        blocks.append({"type": "divider"})
+
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "_You'll get alerted when adoption drops significantly · "
+                        "Alerts configurable via `.env`_"
+                    ),
+                }
+            ],
+        }
+    )
+
+    client.chat_postMessage(
+        channel=user_id,
+        blocks=blocks,
+        text="Your watchlist",
+    )
 
 
 if __name__ == "__main__":

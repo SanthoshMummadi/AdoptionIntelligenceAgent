@@ -497,6 +497,7 @@ def build_adoption_heatmap_blocks(
     fy: str,
     industry: str | None = None,
     region: str | None = None,
+    title: str | None = None,
 ) -> list:
     """
     Builds Slack Block Kit blocks for adoption heatmap.
@@ -603,7 +604,7 @@ def build_adoption_heatmap_blocks(
         "type": "header",
         "text": {
             "type": "plain_text",
-            "text": f":chart_with_upwards_trend: {cloud} · Adoption Heatmap · {fy}",
+            "text": title or f":chart_with_upwards_trend: {cloud} · Adoption Heatmap · {fy}",
             "emoji": True
         }
     })
@@ -660,7 +661,7 @@ def build_adoption_heatmap_blocks(
         group_emoji = GROUP_EMOJI.get(group_name, ":bookmark_tabs:")
         filled = round(avg_score / 10)
         score_bar = "█" * filled + "░" * (10 - filled)
-        trend_badge = "`NEW`"
+        trend_badge = ""
 
         blocks.append({
             "type": "section",
@@ -752,6 +753,19 @@ def _trend_arrow(trend) -> str:
     return f":arrow_lower_right: {trend:.1f}%"
 
 
+def _format_trend(trend) -> str:
+    """Formats trend safely to avoid tiny-denominator explosions."""
+    if trend is None:
+        return "→ No prior data"
+    if abs(trend) > 1000:
+        return "🆕 New activity"
+    if trend > 2:
+        return f"↑ +{trend:.0f}%"
+    if trend < -2:
+        return f"↓ {trend:.0f}%"
+    return "→ Stable"
+
+
 def _status_from_score(score: int) -> str:
     if score >= 70:
         return "green"
@@ -766,6 +780,8 @@ def build_group_drilldown_blocks(
     cloud: str,
     fy: str,
     movers_data: dict = None,
+    user_id: str | None = None,
+    is_on_watchlist_fn=None,
 ) -> list:
     """
     Layer 2 — Group drill-down blocks.
@@ -801,33 +817,17 @@ def build_group_drilldown_blocks(
     blocks.append({"type": "divider"})
 
     for f in sorted_features:
-        score = f.get("score", 0)
-        status = f.get("status") or _status_from_score(score)
-        emoji = STATUS_EMOJI.get(status, ":white_circle:")
-        feature_nm = f.get("feature", "")
-        mau = f.get("mau", 0)
-        trend = f.get("trend")
-        bar = _score_bar(score)
-        trend_str = _trend_arrow(trend)
         feature_id = f.get("feature_id", "")
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"{emoji} *{_feature_link(f)}*\n"
-                    f"{bar}  *{score}%*\n"
-                    f":bar_chart: {mau:,} MAU  ·  "
-                    f"{trend_str}"
-                ),
-            },
-            "accessory": {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Feature detail ↗", "emoji": True},
-                "action_id": "heatmap_feature_detail",
-                "value": f"{feature_id}|{feature_nm}|{cloud}|{fy}",
-            },
-        })
+        blocks.extend(
+            build_feature_card(
+                f,
+                feature_id,
+                cloud,
+                fy,
+                user_id=user_id,
+                is_on_watchlist_fn=is_on_watchlist_fn,
+            )
+        )
 
     blocks.append({
         "type": "context",
@@ -839,277 +839,368 @@ def build_group_drilldown_blocks(
     return blocks
 
 
+def _watchlist_button(
+    user_id: str | None,
+    feature_id: str,
+    feature_name: str,
+    cloud: str,
+    is_on_watchlist_fn=None,
+) -> dict:
+    """Returns Watch or Remove button based on watchlist state."""
+    on_watchlist = False
+    if user_id and is_on_watchlist_fn:
+        try:
+            on_watchlist = bool(is_on_watchlist_fn(user_id, feature_id))
+        except Exception:
+            on_watchlist = False
+
+    if on_watchlist:
+        return {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "❌ Remove from Watchlist"},
+            "action_id": "remove_from_watchlist",
+            "value": f"{feature_id}|{feature_name}|{cloud}",
+            "style": "danger",
+        }
+    return {
+        "type": "button",
+        "text": {"type": "plain_text", "text": "👁 Watch"},
+        "action_id": "add_to_watchlist",
+        "value": f"{feature_id}|{feature_name}|{cloud}",
+    }
+
+
+def build_feature_card(
+    feature,
+    feature_id,
+    cloud,
+    fy,
+    user_id: str | None = None,
+    is_on_watchlist_fn=None,
+):
+    score = float(feature.get("score") or 0)
+    mau = feature.get("mau") or 0
+    trend_raw = feature.get("trend")
+    trend = float(trend_raw) if trend_raw is not None else None
+    name = feature.get("feature", "Unknown")
+
+    # Health emoji
+    health = (
+        ":large_green_circle:" if score > 20
+        else ":large_yellow_circle:" if score >= 5
+        else ":red_circle:"
+    )
+
+    # MAU display
+    mau_display = f"{mau/1000:.1f}K MAU" if mau >= 1000 else f"{mau} MAU"
+
+    # Growth text
+    growth = _format_trend(trend)
+
+    # Insight line
+    if score < 5:
+        insight = ":warning: Critical — needs immediate attention"
+    elif score < 10:
+        insight = ":warning: Low adoption — review blockers"
+    elif trend is not None and trend < -10:
+        insight = ":warning: Significant drop — investigate"
+    elif trend is not None and trend > 10:
+        insight = ":rocket: Strong growth momentum"
+    else:
+        insight = ":bulb: Stable — monitor for opportunities"
+
+    return [
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{health} {_feature_link(feature)}*\n"
+                    f"{score:.0f}% adoption  -  {mau_display}  -  {growth}"
+                )
+            }
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": insight}]
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Feature Detail"},
+                    "style": "primary",
+                    "action_id": "heatmap_feature_detail",
+                    "value": f"{feature_id}|{name}|{cloud}|{fy}"
+                },
+                _watchlist_button(user_id, feature_id, name, cloud, is_on_watchlist_fn),
+            ]
+        }
+    ]
+
+
 def build_feature_detail_blocks(
     feature: dict,
     movers: dict,
     cloud: str,
     fy: str,
+    call_llm_fn=None,
+    user_id: str | None = None,
+    is_on_watchlist_fn=None,
 ) -> tuple[list, str]:
-    """
-    Layer 3 — Feature intelligence brief blocks.
-    Returns (blocks, color) tuple for use with attachments.
-    """
-
-    score = feature.get("score", 0)
-    status = feature.get("status") or _status_from_score(score)
-    feature_nm = feature.get("feature", "")
-    group_nm = feature.get("feature_group", "")
-    owner = feature.get("owner", "—")
-    acct_count = feature.get("account_count", 0)
-    mau = feature.get("mau", 0)
-    transactions = feature.get("transactions", 0)
-    utilization = feature.get("utilization", 0.0)
-    penetration = feature.get("penetration", 0.0)
-    trend = feature.get("trend")
+    score = float(feature.get("score") or 0)
+    mau = feature.get("mau") or 0
+    trend_raw = feature.get("trend")
+    trend = float(trend_raw) if trend_raw is not None else None
+    name = feature.get("feature", "Unknown")
+    group = feature.get("feature_group", "")
+    owner = feature.get("owner", "")
     description = feature.get("description", "")
-    availability = feature.get("availability", "")
-    data_dt = feature.get("data_dt", "")
+    penetration = float(feature.get("penetration") or 0)
     feature_id = feature.get("feature_id", "")
+    gus_url = feature.get("gus_url", "")
+    availability = feature.get("availability", "GA")
+    snapshot_date = feature.get("data_dt", "")
+    accounts = int(feature.get("account_count") or 0)
+    transactions = int(feature.get("transactions") or 0)
 
+    # Health emoji + status
+    if score > 20:
+        health = ":large_green_circle:"
+        status = "Performing well"
+    elif score >= 5:
+        health = ":large_yellow_circle:"
+        status = "Needs attention"
+    else:
+        health = ":red_circle:"
+        status = ":rotating_light: Critically underperforming"
+
+    # MAU display
+    mau_display = f"{mau/1000:.1f}K MAU" if mau >= 1000 else f"{mau} MAU"
+
+    # Growth text
+    growth = _format_trend(trend)
+
+    # Why analysis — data-driven
+    penetration_pct = penetration * 100
+    why_lines = []
+    if penetration_pct < 10:
+        why_lines.append(
+            f"- Low account penetration ({penetration_pct:.1f}%) — feature likely undiscovered"
+        )
+    if mau < 100:
+        why_lines.append("- Very low active usage — may not be enabled by default")
+    if trend is not None and trend < -10:
+        why_lines.append("- Sharp decline — investigate recent product or UX changes")
+    if score < 5:
+        why_lines.append("- Below critical threshold — immediate action required")
+    if not why_lines:
+        why_lines.append("- Usage is stable but growth opportunity exists")
+    why_text = "\n".join(why_lines)
+
+    # What to do — actionable (LLM first, deterministic fallback)
+    default_actions_text = (
+        "- Review feature discoverability in UI\n"
+        "- Identify top-adopting accounts and replicate patterns\n"
+        "- Schedule PM review with CSM team"
+    )
+    if call_llm_fn:
+        try:
+            actions_text = call_llm_fn(
+                prompt=(
+                    f"You are a Salesforce Product Manager advisor.\n"
+                    f"Feature: {name}\n"
+                    f"Cloud: {cloud}\n"
+                    f"Group: {group}\n"
+                    f"Adoption: {score:.0f}%\n"
+                    f"MAU: {mau}\n"
+                    f"Penetration: {penetration:.1f}%\n"
+                    f"Trend: {(_format_trend(trend))}\n"
+                    f"Description: {description}\n\n"
+                    f"Give exactly 3 specific, actionable recommendations for a PM "
+                    f"to improve adoption of this feature. "
+                    f"Each on a new line starting with '- '. "
+                    f"Be specific to this feature, not generic. "
+                    f"Max 15 words per recommendation."
+                ),
+                system_prompt=(
+                    "You are a concise Salesforce PM advisor. "
+                    "Give specific, actionable recommendations only. "
+                    "No preamble, no explanation, just the 3 bullet points."
+                ),
+                max_tokens=150,
+            )
+            if not str(actions_text).strip():
+                actions_text = default_actions_text
+        except Exception:
+            actions_text = default_actions_text
+    else:
+        actions_text = default_actions_text
+
+    # Feature name with GUS link
+    name_display = f"<{gus_url}|{name}>" if gus_url else name
+
+    blocks = [
+        # Header
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{health} {name}"}
+        },
+        # Context breadcrumb
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                "text": f"{group}  ·  {cloud}  ·  {availability}  ·  {fy}  ·  as of {snapshot_date}"}]
+        },
+        # KPI + status
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{score:.0f}% adoption  ·  {mau_display}  ·  {growth}*"
+                )
+            }
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Accounts*\n:busts_in_silhouette: {accounts:,}"},
+                {"type": "mrkdwn", "text": f"*Penetration*\n:dart: {penetration*100:.1f}%"},
+                {"type": "mrkdwn", "text": f"*Transactions*\n:arrows_counterclockwise: {transactions:,}"},
+                {"type": "mrkdwn", "text": f"*MAU (28d)*\n:bar_chart: {mau:,}"},
+            ]
+        },
+        {"type": "divider"},
+        # Why
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Why this is happening:*\n{why_text}"}
+        },
+        # What to do
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*What to do:*  _✨ AI recommendations_\n{actions_text}"}
+        },
+        {"type": "divider"},
+    ]
+
+    # About — only if description exists
+    if description:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*About:*\n{description}"}
+        })
+
+    # Feature Owner
+    if owner:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Feature Owner*\n:bust_in_silhouette: {owner}"
+            },
+        })
+
+    blocks.append({"type": "divider"})
+
+    # Top movers — only if data exists
     top_movers = movers.get("top_movers", [])
     top_losers = movers.get("top_losers", [])
 
-    status_emoji = STATUS_EMOJI.get(status, ":white_circle:")
-    status_badge = STATUS_BADGES.get(status, ":white_circle: UNKNOWN")
-    color = STATUS_COLORS.get(status, "#AAAAAA")
-    bar = _score_bar(score)
-    trend_str = _trend_arrow(trend)
-
-    blocks_out = []
-
-    blocks_out.append({
-        "type": "header",
-        "text": {
-            "type": "plain_text",
-            "text": f"{feature_nm}",
-            "emoji": True
-        }
-    })
-
-    blocks_out.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"*{_feature_link(feature)}*\n"
-                f"_{group_nm}_  ·  {status_emoji}  {status_badge}  ·  "
-                f"{cloud}  ·  {availability}  ·  "
-                f"{fy}  ·  _as of {data_dt}_"
-            )
-        }
-    })
-    blocks_out.append({
-        "type": "section",
-        "fields": [
-            {
-                "type": "mrkdwn",
-                "text": f"*Adoption*\n{bar} {score}%"
-            },
-            {
-                "type": "mrkdwn",
-                "text": f"*Accounts*\n:busts_in_silhouette: {acct_count:,}"
-            },
-            {
-                "type": "mrkdwn",
-                "text": f"*MAU (28d)*\n:bar_chart: {mau:,}"
-            },
-            {
-                "type": "mrkdwn",
-                "text": f"*Penetration*\n:dart: {penetration * 100:.1f}%"
-            },
-            {
-                "type": "mrkdwn",
-                "text": f"*Transactions*\n:arrows_counterclockwise: {transactions:,}"
-            },
-            {
-                "type": "mrkdwn",
-                "text": f"*Trend*\n{trend_str}"
-            },
-        ]
-    })
-
-    blocks_out.append({"type": "divider"})
-
-    # -- ROOT CAUSE --
-    root_causes = _infer_root_causes(score, trend, acct_count, penetration)
-
-    blocks_out.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                "*Why Analysis*\n"
-                + "\n".join(
-                    f"{i+1}. {rc}"
-                    for i, rc in enumerate(root_causes)
-                )
-            )
-        }
-    })
-
-    blocks_out.append({"type": "divider"})
-
-    # -- TOP MOVERS --
     if top_movers:
-        mover_lines = ["*:chart_with_upwards_trend: Top Movers*"]
-        for i, a in enumerate(top_movers, 1):
-            badge = " `NEW`" if a.get("mau_prior", 99) < 5 else ""
-            csm = (
-                f"  ·  {a['csm_name']}"
-                if a.get("csm_name") not in ("—", None)
-                else ""
-            )
-            region = (
-                f"  ·  {a['csg_region']}"
-                if a.get("csg_region") else ""
-            )
-            mover_lines.append(
-                f"{i}. :large_green_circle: *{a['acct_nm']}*{badge}  "
-                f"+{a['mau_change_pct']:.1f}%  ·  "
-                f"{a['mau_current']:,} MAU"
-                f"{region}{csm}"
-            )
-        blocks_out.append({
+        blocks.append({
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "\n".join(mover_lines)
-            }
+            "text": {"type": "mrkdwn", "text": "*Top adopters:*"}
         })
-    else:
-        blocks_out.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*:chart_with_upwards_trend: Top Movers*\n"
-                    "_No mover data available — "
-                    "prior month snapshot may not exist yet._"
-                )
-            }
-        })
+        for m in top_movers[:3]:
+            acct_name = m.get("account_name") or m.get("acct_nm") or "Unknown"
+            acct_id = m.get("account_id") or m.get("acct_id") or ""
+            delta = (
+                m.get("delta_pct")
+                if m.get("delta_pct") is not None
+                else m.get("mau_change_pct", 0)
+            )
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"↑ *{acct_name}*  `+{float(delta):.0f}%`"
+                },
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View Heatmap →"},
+                    "action_id": "account_feature_heatmap",
+                    "value": f"{acct_id}|{acct_name}|{cloud}|{fy}|{feature_id}"
+                }
+            })
 
-    # -- TOP LOSERS --
     if top_losers:
-        loser_lines = ["*:chart_with_downwards_trend: Losing Ground*"]
-        for i, a in enumerate(top_losers, 1):
-            csm = (
-                f"  ·  {a['csm_name']}"
-                if a.get("csm_name") not in ("—", None)
-                else ""
-            )
-            region = (
-                f"  ·  {a['csg_region']}"
-                if a.get("csg_region") else ""
-            )
-            loser_lines.append(
-                f"{i}. :red_circle: *{a['acct_nm']}*  "
-                f"{a['mau_change_pct']:.1f}%  ·  "
-                f"{a['mau_current']:,} MAU"
-                f"{region}{csm}"
-            )
-        blocks_out.append({
+        blocks.append({
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "\n".join(loser_lines)
-            }
+            "text": {"type": "mrkdwn", "text": "*Losing ground:*"}
         })
-    else:
-        blocks_out.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*:chart_with_downwards_trend: Losing Ground*\n"
-                    "_No loser data available — "
-                    "prior month snapshot may not exist yet._"
-                )
-            }
-        })
+        for l in top_losers[:3]:
+            acct_name = l.get("account_name") or l.get("acct_nm") or "Unknown"
+            acct_id = l.get("account_id") or l.get("acct_id") or ""
+            delta = (
+                l.get("delta_pct")
+                if l.get("delta_pct") is not None
+                else l.get("mau_change_pct", 0)
+            )
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"↓ *{acct_name}*  `{float(delta):.0f}%`"
+                },
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View Heatmap →"},
+                    "action_id": "account_feature_heatmap",
+                    "value": f"{acct_id}|{acct_name}|{cloud}|{fy}|{feature_id}"
+                }
+            })
 
-    blocks_out.append({"type": "divider"})
-
-    # -- FEATURE DESCRIPTION / VoC --
-    if description:
-        desc_preview = (
-            description[:297] + "…"
-            if len(description) > 300
-            else description
-        )
-        blocks_out.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*About this feature*\n_{desc_preview}_"
-            }
-        })
-    blocks_out.append({"type": "divider"})
-    action_text = _recommended_action(score, trend, acct_count, top_losers)
-    blocks_out.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"*Feature Owner*\n:bust_in_silhouette: {owner}\n"
-                f"{group_nm}  ·  {cloud}"
-            )
+    # Actions
+    action_elements = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "✉️ Message Owner"},
+            "style": "primary",
+            "action_id": "heatmap_message_owner",
+            "value": f"{feature_id}|{name}|{owner}|{cloud}"
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "⚖️ Compare"},
+            "action_id": "heatmap_compare",
+            "value": f"{feature_id}|{name}|{cloud}|{fy}"
+        },
+        _watchlist_button(user_id, feature_id, name, cloud, is_on_watchlist_fn),
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "↩ Back to Group"},
+            "action_id": "heatmap_back_to_group",
+            "value": f"{group}|{cloud}|{fy}"
         }
-    },)
-    blocks_out[-1]["fields"] = [
-        blocks_out[-1].pop("text"),
-        {"type": "mrkdwn", "text": f"*Recommended Action*\n{action_text}"},
     ]
-    blocks_out.append({
+
+    blocks.append({
         "type": "actions",
-        "elements": [
-            {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": ":envelope: Message Owner",
-                    "emoji": True
-                },
-                "style": "primary",
-                "action_id": "heatmap_message_owner",
-                "value": f"{feature_id}|{feature_nm}|{owner}|{cloud}|{fy}"
-            },
-            {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": ":bar_chart: Compare Features",
-                    "emoji": True
-                },
-                "action_id": "heatmap_compare",
-                "value": f"{feature_id}|{feature_nm}|{cloud}|{fy}"
-            },
-            {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": ":arrow_left: Back to Group",
-                    "emoji": True
-                },
-                "action_id": "heatmap_back_to_group",
-                "value": f"{group_nm}|{cloud}|{fy}"
-            },
-        ]
+        "elements": action_elements
     })
 
-    blocks_out.append({
-        "type": "context",
-        "elements": [{
-            "type": "mrkdwn",
-            "text": (
-                f":bulb: _PDP 2.0  ·  {data_dt}  ·  "
-                "Reply with account name for deep dive_"
-            )
-        }]
-    })
+    color = (
+        "#1A7A45" if score > 20
+        else "#8A6000" if score >= 5
+        else "#C0392B"
+    )
 
-    del status_emoji, utilization
-    return blocks_out, color
+    del name_display
+    return blocks, color
 
 
 def _infer_root_causes(

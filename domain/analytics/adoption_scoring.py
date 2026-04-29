@@ -134,9 +134,9 @@ def calculate_adoption_score(
 
     if prev_quarter_used is not None:
         prev = max(0, prev_quarter_used)
-        if prev == 0:
-            # New feature or zero baseline — treat as neutral (no penalty/bonus)
-            trend = 0.0
+        if prev < 10:
+            # Tiny baseline makes % trend mathematically huge but not meaningful.
+            trend = None
             trend_score = 50.0  # neutral midpoint
         else:
             pct_change = ((used - prev) / prev) * 100
