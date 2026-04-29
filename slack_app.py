@@ -27,8 +27,10 @@ import server  # side effect: startup env validation (see server._should_run_sta
 from domain.analytics.snowflake_client import (
     clear_stale_caches,
     clear_usage_snapshot_cache,
+    get_pdp_snowflake_connection,
     prewarm_cidm_usage_snapshot_dt,
     prewarm_renewal_as_of_date,
+    return_pdp_connection,
     resolve_account_from_snowflake_cached,
 )
 from domain.tracking.account_tracker import setup_tracking_tables
@@ -39,9 +41,11 @@ from services.adoption_heatmap_workflow import (
 from services.daily_pulse_workflow import run_daily_pulse
 from domain.content.heatmap_builder import (
     build_adoption_heatmap_blocks,
+    build_account_heatmap_blocks,
     build_group_drilldown_blocks,
     build_feature_detail_blocks,
     build_home_loading_blocks,
+    _format_mover_pct,
 )
 from domain.analytics.heatmap_queries import (
     get_adoption_heatmap_data,
@@ -76,6 +80,21 @@ WATCHLIST_DEMO_MODE = os.getenv("WATCHLIST_DEMO_MODE", "false").lower() == "true
 HEATMAP_CONTEXT: dict = {}
 HOME_STATE: dict = {}  # { user_id: { "status": str, ... } }
 _LAST_CLOUD_SELECT: dict = {}  # { user_id: timestamp }
+
+# Drilldown bounce — duplicate Slack deliveries / overlapping regex handlers
+_LAST_DRILLDOWN: dict[str, float] = {}
+DRILLDOWN_DEBOUNCE_S = float(os.getenv("HEATMAP_DRILLDOWN_DEBOUNCE_S", "3"))
+HEATMAP_USE_CIDM = os.getenv("HEATMAP_USE_CIDM", "false").lower() == "true"
+
+
+def _drilldown_debounced(user_id: str) -> bool:
+    """True if we should ignore this drill event (within debounce window)."""
+    now = time.time()
+    last = _LAST_DRILLDOWN.get(user_id, 0.0)
+    if now - last < DRILLDOWN_DEBOUNCE_S:
+        return True
+    _LAST_DRILLDOWN[user_id] = now
+    return False
 
 
 def _home_state_get(user_id: str) -> dict:
@@ -183,7 +202,7 @@ print("✓ CIDM + Renewal snapshots prewarmed")
 
 def prewarm_heatmap_cache(client=None):
     del client  # kept for scheduler signature flexibility
-    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
+    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "120"))
     top_clouds = ["Commerce B2B", "Agentforce IT Service"]
     for cloud in top_clouds:
         try:
@@ -257,22 +276,24 @@ def _llm_with_timeout(timeout_s: int):
 def _build_movers_blocks(movers: dict, title: str = "Account movers") -> list[dict]:
     top_movers = movers.get("top_movers", [])[:5]
     top_losers = movers.get("top_losers", [])[:5]
+
+    def _line(m: dict) -> str:
+        pct = _format_mover_pct(m.get("mau_change_pct"))
+        return (
+            f"• *{m.get('acct_nm', 'Unknown')}*  ({pct})"
+            if pct else f"• *{m.get('acct_nm', 'Unknown')}*"
+        )
+
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": title}},
     ]
     if top_movers:
-        movers_lines = "\n".join(
-            f"• *{m.get('acct_nm', 'Unknown')}*  ({m.get('mau_change_pct', 0):.0f}%)"
-            for m in top_movers
-        )
+        movers_lines = "\n".join(_line(m) for m in top_movers)
         blocks.append(
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top movers*\n{movers_lines}"}}
         )
     if top_losers:
-        losers_lines = "\n".join(
-            f"• *{m.get('acct_nm', 'Unknown')}*  ({m.get('mau_change_pct', 0):.0f}%)"
-            for m in top_losers
-        )
+        losers_lines = "\n".join(_line(m) for m in top_losers)
         blocks.append(
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top losers*\n{losers_lines}"}}
         )
@@ -991,18 +1012,258 @@ def _is_adoption_query(text: str) -> bool:
     return any(kw in text_lower for kw in ADOPTION_KEYWORDS)
 
 
-def extract_account_from_query(text: str) -> str | None:
-    patterns = [
-        r"for (?:customer\s+)?([A-Za-z0-9\s&]+?)(?:\s*$|\s+in\s+|\s+on\s+)",
-        r"customer[:\s]+([A-Za-z0-9\s&]+?)(?:\s*$)",
+def classify_intent_keywords(text: str) -> dict:
+    text_lower = (text or "").lower()
+
+    # CHECK ACCOUNT LOOKUP FIRST — before anything else
+    account_signals = [" for ", "account ", "customer ", "company "]
+    has_account_signal = any(s in text_lower for s in account_signals)
+
+    if has_account_signal:
+        acct_name, detected_cloud = extract_account_from_query(text)
+        if acct_name:
+            return {
+                "type": "account_lookup",
+                "cloud": detected_cloud or "Commerce B2B",
+                "fy": "FY2027",
+                "account_name": acct_name,
+            }
+
+    # THEN check general heatmap
+    if any(w in text_lower for w in ["heatmap", "adoption", "features", "cloud"]):
+        return {"type": "heatmap_summary", "cloud": None, "fy": "FY2027"}
+
+    if any(w in text_lower for w in ["watchlist", "watch"]):
+        return {"type": "watchlist", "cloud": None, "fy": "FY2027"}
+
+    return {"type": "unknown", "cloud": None, "fy": "FY2027"}
+
+
+def extract_account_from_query(text: str) -> tuple[str | None, str | None]:
+    """
+    Returns (account_name, cloud) extracted from natural language.
+    """
+    cloud_patterns = {
+        "Commerce B2B": [
+            r"commerce\s+b2b", r"b2b\s+commerce", r"\bb2b\b",
+        ],
+        "Agentforce IT Service": [
+            r"agentforce\s+it\s+service", r"agentforce\s+itsm", r"\bitsm\b",
+        ],
+        "Sales Cloud": [r"sales\s+cloud"],
+        "Service Cloud": [r"service\s+cloud"],
+        "FSC": [r"\bfsc\b", r"financial\s+services"],
+    }
+
+    detected_cloud = None
+    clean = text or ""
+    for cloud_name, patterns in cloud_patterns.items():
+        for p in patterns:
+            if re.search(p, clean, re.IGNORECASE):
+                detected_cloud = cloud_name
+                clean = re.sub(p, " ", clean, flags=re.IGNORECASE).strip()
+                break
+        if detected_cloud:
+            break
+
+    noise = [
+        r"\b(what\s+is|show\s+(me)?|give\s+me|get|fetch|load|"
+        r"heatmap|adoption|the|a|an|for|in|of|on|at|"
+        r"feature|features|details?|overview|summary|"
+        r"b2b|commerce|agentforce|salesforce)\b",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = match.group(1).strip()
-            if value:
-                return value
-    return None
+    acct_text = clean
+    for n in noise:
+        acct_text = re.sub(n, " ", acct_text, flags=re.IGNORECASE)
+    acct_text = re.sub(r"\s+", " ", acct_text).strip().strip("?.,")
+
+    if len(acct_text) >= 2 and not acct_text.isdigit():
+        return acct_text, detected_cloud
+    return None, detected_cloud
+
+
+def _cloud_to_family(cloud: str) -> str:
+    """Map cloud display name to PDP PRODUCT_FEATURE_FAMILY."""
+    mapping = {
+        "Commerce B2B": "B2B Commerce",
+        "Agentforce IT Service": "Agentforce IT Service",
+        "Sales Cloud": "Sales Cloud",
+        "Service Cloud": "Service Cloud",
+        "FSC": "Financial Services Cloud",
+    }
+    return mapping.get(cloud, cloud)
+
+
+def _fetch_and_post_account_heatmap(
+    client,
+    user_id: str,
+    acct_id: str,
+    acct_name: str,
+    cloud: str,
+    fy: str,
+    channel: str | None = None,
+    thread_ts: str | None = None,
+) -> None:
+    """Fetch account-scoped heatmap and post to channel/DM."""
+    target_channel = channel or user_id
+    try:
+        result = get_adoption_heatmap_data(cloud, fy, account_id=acct_id or None)
+        quarters = result.get("quarters", {})
+        features = next(
+            (quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"] if quarters.get(q)),
+            [],
+        )
+        if not features:
+            client.chat_postMessage(
+                channel=target_channel,
+                thread_ts=thread_ts,
+                text=f":x: No adoption data found for *{acct_name}* in {cloud} {fy}.",
+            )
+            return
+
+        blocks = build_account_heatmap_blocks(
+            features=features,
+            cloud=cloud,
+            fy=fy,
+            account_name=acct_name,
+            snapshot_date=result.get("summary", {}).get("latest_dt", ""),
+        )
+        client.chat_postMessage(
+            channel=target_channel,
+            thread_ts=thread_ts,
+            blocks=blocks,
+            text=f"📊 {acct_name} · {cloud} · {fy} Adoption Heatmap",
+        )
+    except Exception as e:
+        logger.error("Account heatmap failed for %s: %s", acct_name, e)
+        client.chat_postMessage(
+            channel=target_channel,
+            thread_ts=thread_ts,
+            text=f":x: Failed to load heatmap for *{acct_name}*: {str(e)}",
+        )
+
+
+def _lookup_and_disambiguate_account(
+    client,
+    user_id: str,
+    acct_name: str,
+    cloud: str,
+    fy: str,
+    channel: str | None = None,
+    thread_ts: str | None = None,
+) -> None:
+    """Lookup account, handle disambiguation, then post account heatmap."""
+    target_channel = channel or user_id
+    conn = None
+    cursor = None
+    try:
+        conn = get_pdp_snowflake_connection()
+        cursor = conn.cursor()
+        search = (acct_name or "").replace("'", "''")
+        cursor.execute(
+            f"""
+            SELECT DISTINCT ACCT_ID, ACCT_NM
+            FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+            WHERE ACCT_NM ILIKE '%{search}%'
+              AND DATA_DT = (
+                  SELECT MAX(DATA_DT)
+                  FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
+              )
+            LIMIT 10
+            """
+        )
+        rows = cursor.fetchall()
+    except Exception as e:
+        logger.error("Account lookup failed: %s", e)
+        client.chat_postMessage(
+            channel=target_channel,
+            thread_ts=thread_ts,
+            text=f":x: Lookup failed for *{acct_name}*. Try again in a moment.",
+        )
+        return
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+        except Exception:
+            pass
+        if conn:
+            return_pdp_connection(conn)
+
+    if not rows:
+        client.chat_postMessage(
+            channel=target_channel,
+            thread_ts=thread_ts,
+            text=(
+                f":x: No account matching *{acct_name}* found in *{cloud}* data.\n"
+                f"_Try a shorter name — e.g. 'L'Oreal' instead of full legal name._"
+            ),
+        )
+        return
+
+    exact = [r for r in rows if str(r[1] or "").lower() == acct_name.lower()]
+    if exact:
+        rows = exact[:1]
+
+    if len(rows) == 1:
+        _fetch_and_post_account_heatmap(
+            client,
+            user_id,
+            acct_id=str(rows[0][0] or ""),
+            acct_name=str(rows[0][1] or acct_name),
+            cloud=cloud,
+            fy=fy,
+            channel=target_channel,
+            thread_ts=thread_ts,
+        )
+        return
+
+    total_found = len(rows)
+    display_rows = rows[:10]
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":mag: Found *{total_found}* accounts matching "
+                    f"*{acct_name}* in {cloud}:"
+                ),
+            },
+        },
+        {"type": "divider"},
+    ]
+    safe_fy = fy or "FY2027"
+    safe_cloud = cloud or "Commerce B2B"
+    for i, (acct_id, acct_nm) in enumerate(display_rows):
+        safe_name = str(acct_nm or "Unknown").replace("|", " ")
+        safe_id = str(acct_id or "").strip()
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f":office: *{safe_name}*"},
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View Heatmap →"},
+                    "action_id": f"account_heatmap_disambig_{i}",
+                    "value": f"{safe_id}|{safe_cloud}|{safe_fy}|{safe_name}",
+                },
+            }
+        )
+
+    if len(rows) > 10:
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                "text": f"_Showing 10 of {len(rows)} matches — try a more specific name_"}]
+        })
+
+    client.chat_postMessage(
+        channel=target_channel,
+        thread_ts=thread_ts,
+        blocks=blocks,
+        text=f"Found {total_found} matches for {acct_name}",
+    )
 
 
 # -------------------------
@@ -1111,7 +1372,25 @@ def handle_message(event, say, client):
             try:
                 # Classify intent using LLM gateway
                 from server import call_llm_gateway_with_retry
-                intent = classify_adoption_intent(text, call_llm_fn=call_llm_gateway_with_retry)
+                try:
+                    intent = classify_adoption_intent(
+                        text,
+                        call_llm_fn=call_llm_gateway_with_retry,
+                    )
+                except Exception as cls_err:
+                    err_msg = str(cls_err).lower()
+                    if ("429" not in err_msg) and ("rate limit" not in err_msg):
+                        raise
+                    logger.warning(
+                        "Intent classifier rate-limited; using keyword fallback: %s",
+                        cls_err,
+                    )
+                    intent = classify_intent_keywords(text)
+                    logger.info(
+                        "Fallback intent selected: %s for text: '%s'",
+                        intent.get("type"),
+                        text[:60],
+                    )
 
                 if intent["type"] == "not_adoption":
                     # Not an adoption query - let it fall through to normal handling
@@ -1123,11 +1402,29 @@ def handle_message(event, say, client):
                         pass
                     return
 
-                cloud = intent.get("cloud") or "Commerce B2B"
+                # Override: LLM sometimes returns heatmap_summary for account queries.
+                if intent.get("type") == "heatmap_summary":
+                    account_signals = [" for ", "account ", "customer ", "company "]
+                    if any(s in text.lower() for s in account_signals):
+                        acct_name, detected_cloud = extract_account_from_query(text)
+                        if acct_name:
+                            logger.info(
+                                "Intent override: heatmap_summary -> account_lookup for account='%s'",
+                                acct_name,
+                            )
+                            intent = {
+                                "type": "account_lookup",
+                                "cloud": detected_cloud or intent.get("cloud") or "Commerce B2B",
+                                "fy": intent.get("fy") or "FY2027",
+                                "account_name": acct_name,
+                            }
+
+                parsed_account_name, parsed_cloud = extract_account_from_query(text)
+                cloud = intent.get("cloud") or parsed_cloud or "Commerce B2B"
                 fy = intent.get("fy") or "FY2027"
-                account_name = extract_account_from_query(text)
+                account_name = parsed_account_name
                 account_id = None
-                if account_name:
+                if HEATMAP_USE_CIDM and account_name and intent.get("type") != "account_lookup":
                     try:
                         resolved = resolve_account_from_snowflake_cached(
                             account_name, cloud=cloud
@@ -1139,6 +1436,8 @@ def handle_message(event, say, client):
                             account_name,
                             resolve_err,
                         )
+                else:
+                    resolved = None
 
                 # Route based on intent type
                 if intent["type"] == "heatmap_summary":
@@ -1358,6 +1657,37 @@ def handle_message(event, say, client):
                             "(Region/industry filters coming soon — currently showing all data)"
                         )
                     )
+                elif intent["type"] == "account_lookup":
+                    acct_name, detected_cloud = extract_account_from_query(text)
+                    cloud = (
+                        detected_cloud
+                        or intent.get("cloud")
+                        or HOME_STATE.get(user, {}).get("cloud", "Commerce B2B")
+                    )
+                    fy = intent.get("fy") or "FY2027"
+
+                    if not acct_name:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=ts,
+                            text=(
+                                ":x: Couldn't identify the account name.\n"
+                                "Try: _'Show heatmap for L'Oreal in Commerce B2B'_"
+                            ),
+                        )
+                        return
+
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text=f":hourglass_flowing_sand: Looking up *{acct_name}* in *{cloud}*...",
+                    )
+                    threading.Thread(
+                        target=_lookup_and_disambiguate_account,
+                        args=(client, user, acct_name, cloud, fy),
+                        kwargs={"channel": channel, "thread_ts": ts},
+                        daemon=True,
+                    ).start()
                 else:
                     # Unknown intent type
                     client.chat_postMessage(
@@ -2587,12 +2917,10 @@ def handle_adoption_heatmap(ack, body, client, logger):
     threading.Thread(target=_run_heatmap_async, daemon=True).start()
 
 
-@app.action(re.compile(r"^heatmap_drilldown"))
-def handle_heatmap_drilldown(ack, body, client, logger):
-    ack()
+def _execute_heatmap_group_drill(body, client, logger):
+    """Focused Now + group Drill → — shared logic (already ack'd)."""
     request_id = str(uuid.uuid4())
     t0 = time.perf_counter()
-    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
 
     value = body["actions"][0]["value"]
     parts = value.split("|")
@@ -2628,7 +2956,7 @@ def handle_heatmap_drilldown(ack, body, client, logger):
         user_id=body["user"]["id"],
         is_on_watchlist_fn=is_on_watchlist,
     )
-    response = client.chat_postMessage(
+    client.chat_postMessage(
         channel=channel,
         thread_ts=message_ts,
         text=f":mag: {group_name} drill-down",
@@ -2641,57 +2969,30 @@ def handle_heatmap_drilldown(ack, body, client, logger):
         len(group_features),
     )
 
-    # Fetch movers in background and post follow-up in thread.
-    thread_ts = response.get("ts") or message_ts
-    worst = min(group_features, key=lambda f: f.get("score", 100))
-    portfolio, family = _CLOUD_MAPPING.get(
-        cloud, ("Commerce", "B2B Commerce")
-    )
-
-    def _fetch_movers_async():
-        try:
-            movers_data = get_feature_account_movers(
-                feature_id=worst.get("feature_id"),
-                snapshot_date=worst.get("data_dt") or "",
-                portfolio=portfolio,
-                family=family,
-                timeout=movers_timeout_s,
-            )
-            if movers_data.get("top_movers") or movers_data.get("top_losers"):
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text="Account movers",
-                    blocks=_build_movers_blocks(
-                        movers_data,
-                        title=f"Account movers · {group_name}",
-                    ),
-                )
-        except Exception as e:
-            logger.warning("Movers fetch failed for %s: %s", group_name, e)
-
-    threading.Thread(target=_fetch_movers_async, daemon=True).start()
     log_action_timing(
         "drilldown",
         request_id,
         {
             "t_first_post_ms": t_first_post_ms,
             "cache_hit_heatmap": True,
-            "cache_hit_movers": movers_cache_contains(
-                worst.get("feature_id"),
-                worst.get("data_dt") or "",
-                portfolio,
-                family,
-                top_n=5,
-                timeout=movers_timeout_s,
-            ),
         },
     )
 
 
+@app.action(re.compile(r"^heatmap_drilldown_red_"))
+def handle_heatmap_drilldown(ack, body, client, logger):
+    ack()
+    if _drilldown_debounced(body["user"]["id"]):
+        return
+    _execute_heatmap_group_drill(body, client, logger)
+
+
 @app.action(re.compile(r"^heatmap_drilldown_grp_"))
 def handle_group_drill(ack, body, client, logger):
-    handle_heatmap_drilldown(ack, body, client, logger)
+    ack()
+    if _drilldown_debounced(body["user"]["id"]):
+        return
+    _execute_heatmap_group_drill(body, client, logger)
 
 
 @app.action("heatmap_feature_detail")
@@ -2699,7 +3000,7 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
     ack()
     request_id = str(uuid.uuid4())
     t0 = time.perf_counter()
-    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
+    movers_timeout_s = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "120"))
 
     value = body["actions"][0]["value"]
     parts = value.split("|")
@@ -2762,23 +3063,19 @@ def handle_heatmap_feature_detail(ack, body, client, logger):
                 family=family,
                 timeout=movers_timeout_s,
             )
-            llm_timeout_s = int(os.getenv("LLM_QUERY_TIMEOUT_SECONDS", "7"))
             if movers_data.get("top_movers") or movers_data.get("top_losers"):
-                enriched_blocks, enriched_color = build_feature_detail_blocks(
-                    feature=matched,
-                    movers=movers_data,
-                    cloud=cloud,
-                    fy=fy,
-                    call_llm_fn=_llm_with_timeout(llm_timeout_s),
-                    user_id=body["user"]["id"],
-                    is_on_watchlist_fn=is_on_watchlist,
-                )
                 client.chat_postMessage(
                     channel=channel,
                     thread_ts=thread_ts,
-                    text=f":zap: {feature_nm} · Movers update",
-                    attachments=[{"color": enriched_color, "blocks": enriched_blocks}],
+                    text=f":zap: {feature_nm} · Account movers",
+                    blocks=_build_movers_blocks(
+                        movers_data,
+                        title=f"Account movers · {feature_nm}",
+                    ),
                 )
+                logger.info("Account movers posted for %s", feature_nm)
+            else:
+                logger.info("No movers rows for %s", feature_nm)
         except Exception as e:
             logger.warning("Movers/detail enrichment failed for %s: %s", feature_nm, e)
 
@@ -3015,11 +3312,30 @@ def handle_view_watchlist(ack, body, client):
 def handle_account_feature_heatmap(ack, body, client):
     ack()
     value = body["actions"][0]["value"]
-    parts = value.split("|")
-    acct_id = parts[0] if len(parts) > 0 else ""
-    acct_name = parts[1] if len(parts) > 1 else "Unknown"
-    cloud = parts[2] if len(parts) > 2 else "Commerce B2B"
-    fy = parts[3] if len(parts) > 3 else "FY2027"
+    segments = value.split("|", 4)
+
+    acct_id = segments[0] if segments else ""
+    acct_name = "Unknown"
+    cloud = "Commerce B2B"
+    fy = "FY2027"
+
+    if len(segments) >= 5:
+        fy_at_3 = str(segments[3]).startswith("FY")
+        fy_at_2 = str(segments[2]).startswith("FY")
+        if fy_at_3:
+            acct_name = (segments[1] or "").strip() or "Unknown"
+            cloud = segments[2] or cloud
+            fy = segments[3] or fy
+        elif fy_at_2:
+            cloud = segments[1] or cloud
+            fy = segments[2] or fy
+            acct_name = (segments[4] or "").strip() or "Unknown"
+        else:
+            cloud = segments[1] or cloud
+            fy = segments[2] or fy
+            acct_name = (segments[4] or "").strip() or acct_name
+    elif len(segments) >= 2:
+        acct_name = (segments[1] or "").strip() or "Unknown"
     channel = body["channel"]["id"]
     message_ts = body["message"]["ts"]
 
@@ -3064,6 +3380,44 @@ def handle_account_feature_heatmap(ack, body, client):
             )
 
     threading.Thread(target=_load_account_heatmap, daemon=True).start()
+
+
+@app.action(re.compile(r"^account_heatmap_disambig_\d+$"))
+def handle_account_disambig(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    value = body["actions"][0]["value"]
+    try:
+        # Format: acct_id|cloud|fy|acct_name
+        parts = value.split("|", 3)
+        acct_id = parts[0]
+        cloud_raw = parts[1] if len(parts) > 1 else ""
+        cloud = cloud_raw.strip() if cloud_raw and cloud_raw.strip() not in ("", "None") else "Commerce B2B"
+        fy_raw = parts[2] if len(parts) > 2 else ""
+        fy = (fy_raw or "").strip()
+        fy = fy if fy and fy != "None" else "FY2027"
+        acct_name = parts[3] if len(parts) > 3 else "Account"
+    except Exception:
+        client.chat_postMessage(
+            channel=user_id,
+            text=":x: Could not parse account selection. Please try again.",
+        )
+        return
+
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=message_ts,
+        text=f":hourglass_flowing_sand: Loading heatmap for *{acct_name}*...",
+    )
+
+    threading.Thread(
+        target=_fetch_and_post_account_heatmap,
+        args=(client, user_id, acct_id, acct_name, cloud, fy),
+        kwargs={"channel": channel, "thread_ts": message_ts},
+        daemon=True,
+    ).start()
 
 
 @app.action("heatmap_message_owner")

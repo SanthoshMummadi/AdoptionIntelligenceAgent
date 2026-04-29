@@ -69,6 +69,19 @@ _CACHE_LOCK = threading.Lock()
 _MOVERS_CACHE_LOCK = threading.Lock()
 
 
+def _resolve_movers_statement_timeout(explicit: int | None) -> int:
+    """Seconds for STATEMENT_TIMEOUT on PDP movers queries; env default allows heavy scans."""
+    if explicit is not None:
+        try:
+            return max(3, int(explicit))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(3, int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "120")))
+    except ValueError:
+        return 120
+
+
 def _movers_cache_key(
     feature_id: str,
     snapshot_date: str,
@@ -89,8 +102,9 @@ def movers_cache_contains(
     portfolio: str,
     family: str,
     top_n: int = 5,
-    timeout: int = 8,
+    timeout: int | None = None,
 ) -> bool:
+    timeout = _resolve_movers_statement_timeout(timeout)
     key = _movers_cache_key(feature_id, snapshot_date, portfolio, family, top_n, timeout)
     with _MOVERS_CACHE_LOCK:
         return key in _MOVERS_CACHE
@@ -170,8 +184,8 @@ def get_fy_quarter_dates(fy: str) -> list[dict]:
         ]
     """
     # Parse FY number (e.g., "FY27" -> 27, "FY2027" -> 2027)
-    fy_str = fy.replace("FY", "").strip()
-    fy_num = int(fy_str)
+    fy_str = (fy or "FY2027").replace("FY", "").strip()
+    fy_num = int(fy_str) if fy_str.isdigit() else 2027
 
     # Assume 2-digit year for 20XX
     if fy_num < 100:
@@ -574,7 +588,7 @@ def get_feature_account_movers(
     portfolio: str,
     family: str,
     top_n: int = 5,
-    timeout: int = 8,
+    timeout: int | None = None,
 ) -> dict:
     """
     Returns top mover and top loser accounts for a given feature
@@ -588,6 +602,8 @@ def get_feature_account_movers(
         portfolio:     e.g. 'Commerce'
         family:        e.g. 'B2B Commerce'
         top_n:         Number of movers/losers to return (default 5)
+        timeout:       PDP statement timeout seconds; omit to use MOVERS_QUERY_TIMEOUT_SECONDS
+                       (default 120). Minimum 3.
 
     Returns:
         {
@@ -611,8 +627,7 @@ def get_feature_account_movers(
         return_pdp_connection,
     )
 
-    if timeout is None:
-        timeout = int(os.getenv("MOVERS_QUERY_TIMEOUT_SECONDS", "8"))
+    timeout = _resolve_movers_statement_timeout(timeout)
     cache_key = _movers_cache_key(
         feature_id, snapshot_date, portfolio, family, top_n, int(timeout)
     )
@@ -625,9 +640,8 @@ def get_feature_account_movers(
     try:
         conn = get_pdp_snowflake_connection()
         cur = conn.cursor()
-        safe_timeout = max(3, int(timeout))
         cur.execute(
-            f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {safe_timeout}"
+            f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {timeout}"
         )
 
         # Current snapshot: latest load date for this feature (not portfolio-wide).
@@ -680,48 +694,58 @@ def get_feature_account_movers(
                 _MOVERS_CACHE[cache_key] = result
             return result
 
-        # Query current + prior MAU per account for this feature
-        cur.execute("""
-            WITH current_snap AS (
+        # Single scan over current + prior DATA_DT (avoids two full table passes on PDP).
+        cur.execute(
+            """
+            WITH per_day AS (
                 SELECT
                     ACCT_ID,
+                    DATA_DT,
                     MAX(ACCT_NM)                        AS acct_nm,
                     MAX(CSM_NAME)                       AS csm_name,
                     MAX(CSG_REGION_NM)                  AS csg_region,
-                    SUM(ORG_PF_ROLLING_28D_MAU)         AS mau_current
+                    SUM(ORG_PF_ROLLING_28D_MAU)         AS mau
                 FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
                 WHERE PRODUCT_FEATURE_ID    = %s
-                  AND DATA_DT               = %s
+                  AND DATA_DT               IN (%s, %s)
                   AND ORG_PF_ROLLING_28D_MAU > 10
-                GROUP BY ACCT_ID
+                GROUP BY ACCT_ID, DATA_DT
             ),
-            prior_snap AS (
+            acct_metrics AS (
                 SELECT
                     ACCT_ID,
-                    SUM(ORG_PF_ROLLING_28D_MAU)         AS mau_prior
-                FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
-                WHERE PRODUCT_FEATURE_ID    = %s
-                  AND DATA_DT               = %s
-                  AND ORG_PF_ROLLING_28D_MAU > 10
+                    MAX(acct_nm)                        AS acct_nm,
+                    MAX(csm_name)                       AS csm_name,
+                    MAX(csg_region)                     AS csg_region,
+                    SUM(IFF(DATA_DT = %s, mau, 0))       AS mau_current,
+                    SUM(IFF(DATA_DT = %s, mau, 0))       AS mau_prior
+                FROM per_day
                 GROUP BY ACCT_ID
             )
             SELECT
-                c.ACCT_ID,
-                c.acct_nm,
-                c.csm_name,
-                c.csg_region,
-                c.mau_current,
-                p.mau_prior,
+                ACCT_ID,
+                acct_nm,
+                csm_name,
+                csg_region,
+                mau_current,
+                mau_prior,
                 ROUND(
-                    (c.mau_current - p.mau_prior)
-                    / NULLIF(p.mau_prior, 0) * 100
+                    (mau_current - mau_prior)
+                    / NULLIF(mau_prior, 0) * 100
                 , 1)                                    AS mau_change_pct
-            FROM current_snap c
-            JOIN prior_snap p ON c.ACCT_ID = p.ACCT_ID
-            WHERE p.mau_prior > 0
-              AND c.mau_current > 0
+            FROM acct_metrics
+            WHERE mau_prior > 0
+              AND mau_current > 0
             ORDER BY mau_change_pct DESC
-        """, (feature_id, actual_snapshot, feature_id, prior_date))
+            """,
+            (
+                feature_id,
+                actual_snapshot,
+                prior_date,
+                actual_snapshot,
+                prior_date,
+            ),
+        )
 
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]

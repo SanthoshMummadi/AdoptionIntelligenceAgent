@@ -17,6 +17,26 @@ _MAX_DRILLDOWN_CHARS = 1500
 _PRODUCT_HEADER_LEN = 20
 _IST = ZoneInfo("Asia/Kolkata")
 
+CLOUD_FEATURE_GROUPS = {
+    "Commerce B2B": [
+        "Cart", "Checkout", "Pricing", "Search", "Shipping",
+        "Product & Catalog", "Buyer Groups", "B2B Payments",
+        "Payments", "Promotions", "Markets/I18n", "Setup & User Tools",
+        "Shopper Experience & Profiles", "Import/Export Tools",
+        "Subscriptions", "Tax", "Analytics", "Buyer Messaging",
+        "Data Cloud for Commerce", "Agentforce for Shopping",
+    ],
+    "Agentforce IT Service": [
+        "CMDB & Service Graph", "AI Agents", "Service Management",
+        "Knowledge Management", "Asset Management",
+    ],
+}
+
+CLOUD_TOTAL_FEATURES = {
+    "Commerce B2B": 83,
+    "Agentforce IT Service": 16,
+}
+
 
 def _now_ist() -> str:
     now = datetime.now(tz=_IST)
@@ -524,12 +544,10 @@ def build_adoption_heatmap_blocks(
     for group, feats in groups.items():
         avg = sum(float(f.get("score") or 0) for f in feats) / len(feats)
         trend = sum(float(f.get("trend") or 0) for f in feats) / len(feats)
-        accounts = max(int(f.get("account_count") or 0) for f in feats)
         group_data[group] = {
             "avg": avg,
             "trend": trend,
             "count": len(feats),
-            "accounts": accounts,
             "health": (
                 "green" if avg > t["green"]
                 else "yellow" if avg > t["yellow"]
@@ -556,26 +574,7 @@ def build_adoption_heatmap_blocks(
     )[:3]
     strong_groups = all_sorted_desc[:3]
 
-    top_score = all_sorted_desc[0][1]["avg"] if all_sorted_desc else 0
-    bottom_score = all_sorted[0][1]["avg"] if all_sorted else 0
-    gap = top_score - bottom_score
-    if gap > 40:
-        insight = (
-            f"Adoption drops sharply from "
-            f"`{all_sorted_desc[0][0]}` ({top_score:.0f}%) → "
-            f"`{all_sorted[0][0]}` ({bottom_score:.0f}%) — "
-            f"investigate friction in lower-performing groups"
-        )
-    elif critical_count > 0:
-        insight = (
-            f"{critical_count} critical group{'s' if critical_count > 1 else ''} "
-            f"below {t['yellow']:.0f}% — immediate PM action required"
-        )
-    else:
-        insight = (
-            f"Overall adoption at {overall_avg:.0f}% — "
-            f"focus on Watch groups to move the needle"
-        )
+    del overall_avg
 
     blocks = [
         {
@@ -591,6 +590,15 @@ def build_adoption_heatmap_blocks(
                     f":large_green_circle: {healthy_count} Healthy  ·  "
                     f":large_yellow_circle: {watch_count} Watch  ·  "
                     f":red_circle: {critical_count} Critical"
+                )}]
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                "text": (
+                    f":large_green_circle: >{t['green']:.0f}% Healthy  ·  "
+                    f":large_yellow_circle: >{t['yellow']:.0f}% Watch  ·  "
+                    f":red_circle: <{t['yellow']:.0f}% Critical"
                 )}]
         },
         {"type": "divider"},
@@ -640,19 +648,17 @@ def build_adoption_heatmap_blocks(
             else ":large_yellow_circle:" if data["health"] == "yellow"
             else ":red_circle:"
         )
-        trend_text = _format_trend(data["trend"])
+        row = (
+            f"{health_emoji} *{group}*   "
+            f"{data['count']} features  ·  "
+            f"`Adoption: {data['avg']:.0f}%`"
+        )
 
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"{health_emoji} *{group}*   "
-                    f"{data['accounts']:,} accts  ·  "
-                    f"{data['count']} features  ·  "
-                    f"`Adoption: {data['avg']:.0f}%`  "
-                    f"{trend_text}"
-                )
+                "text": row
             },
             "accessory": {
                 "type": "button",
@@ -665,19 +671,6 @@ def build_adoption_heatmap_blocks(
     blocks += [
         {"type": "divider"},
         {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f":bulb: {insight}"}]
-        },
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn",
-                "text": (
-                    f":large_green_circle: >{t['green']:.0f}% Healthy  ·  "
-                    f":large_yellow_circle: >{t['yellow']:.0f}% Watch  ·  "
-                    f":red_circle: <{t['yellow']:.0f}% Critical"
-                )}]
-        },
-        {
             "type": "actions",
             "elements": [{
                 "type": "button",
@@ -687,6 +680,288 @@ def build_adoption_heatmap_blocks(
             }]
         }
     ]
+
+    return blocks
+
+
+def build_account_heatmap_blocks(
+    features: list,
+    cloud: str,
+    fy: str,
+    account_name: str,
+    snapshot_date: str | None = None,
+) -> list:
+    """
+    Account-scoped heatmap — variance-aware layout.
+    Low variance (all healthy) → premium summary card
+    High variance (mixed) → split by health with drill buttons
+    """
+    from collections import defaultdict
+
+    if not features:
+        return [{"type": "section", "text": {"type": "mrkdwn",
+            "text": f":x: No adoption data found for *{account_name}* · {cloud} · {fy}"}}]
+
+    t = {"green": 20.0, "yellow": 5.0}
+    if not snapshot_date:
+        snapshot_date = features[0].get("data_dt", "") if features else ""
+
+    # Aggregate by group
+    groups = defaultdict(list)
+    for f in features:
+        groups[f.get("feature_group", "Unknown")].append(f)
+
+    group_data = {}
+    for group, feats in groups.items():
+        avg = sum(float(f.get("score") or 0) for f in feats) / max(len(feats), 1)
+        group_data[group] = {
+            "avg": avg,
+            "count": len(feats),
+            "health": (
+                "green" if avg > t["green"]
+                else "yellow" if avg > t["yellow"]
+                else "red"
+            )
+        }
+
+    scores = [d["avg"] for d in group_data.values()]
+    variance = max(scores) - min(scores) if scores else 0
+    overall_avg = sum(scores) / len(scores) if scores else 0
+    all_healthy = all(d["health"] == "green" for d in group_data.values())
+
+    healthy_count = sum(1 for d in group_data.values() if d["health"] == "green")
+    watch_count = sum(1 for d in group_data.values() if d["health"] == "yellow")
+    critical_count = sum(1 for d in group_data.values() if d["health"] == "red")
+
+    # Header — always shown
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text",
+                "text": f":office: {account_name}"}
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                "text": (
+                    f"{len(features)} features  ·  {cloud}  ·  {fy}  ·  {snapshot_date}\n"
+                    f":large_green_circle: {healthy_count} Healthy  ·  "
+                    f":large_yellow_circle: {watch_count} Watch  ·  "
+                    f":red_circle: {critical_count} Critical"
+                )}]
+        },
+        {"type": "divider"}
+    ]
+
+    # -- LOW VARIANCE — all healthy --
+    if all_healthy and variance < 20:
+
+        # Coverage gap analysis
+        total_possible = CLOUD_TOTAL_FEATURES.get(cloud, len(features))
+        activated = len(features)
+        gap = total_possible - activated
+        coverage_pct = (activated / total_possible * 100) if total_possible > 0 else 100
+
+        # Missing groups
+        activated_groups = set(group_data.keys())
+        all_possible_groups = CLOUD_FEATURE_GROUPS.get(cloud, [])
+        missing_groups = [g for g in all_possible_groups if g not in activated_groups]
+
+        # Active groups — sorted by score desc
+        top_groups = sorted(
+            group_data.keys(),
+            key=lambda g: group_data[g]["avg"],
+            reverse=True
+        )[:5]
+
+        blocks += [
+            # Adoption status
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*:large_green_circle: {overall_avg:.0f}% adoption "
+                        f"on activated features*\n"
+                        f"No risks detected on {activated} active features"
+                    )
+                }
+            },
+            # Coverage gap — the KEY insight
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*:bar_chart: Feature Coverage: "
+                        f"{activated}/{total_possible} ({coverage_pct:.0f}%)*\n"
+                        + (
+                            f":warning: *{gap} features untapped* — "
+                            f"biggest growth opportunity is feature expansion"
+                            if gap > 0 else
+                            ":tada: Full feature coverage!"
+                        )
+                    )
+                }
+            },
+        ]
+
+        # Active groups
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*:white_check_mark: Active Groups ({len(group_data)})*\n"
+                    + "  ·  ".join(
+                        f"`{g}`"
+                        for g in top_groups
+                    )
+                    + (f"  ·  _+{len(group_data)-5} more_"
+                       if len(group_data) > 5 else "")
+                )
+            }
+        })
+
+        # Missing groups — only if there are any
+        if missing_groups:
+            blocks.append({"type": "divider"})
+            missing_display = missing_groups[:8]  # cap at 8
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*:x: Missing Groups ({len(missing_groups)})*\n"
+                        + "  ·  ".join(f"`{g}`" for g in missing_display)
+                        + (f"\n_...and {len(missing_groups)-8} more_"
+                           if len(missing_groups) > 8 else "")
+                    )
+                }
+            })
+
+        blocks.append({"type": "divider"})
+
+        # Insight line
+        if gap > 20:
+            insight = (
+                f"Account uses only {coverage_pct:.0f}% of {cloud} features — "
+                f"activate missing groups to unlock full platform value"
+            )
+        elif gap > 0:
+            insight = (
+                f"Strong adoption across {activated} features — "
+                f"{gap} additional features available to expand"
+            )
+        else:
+            insight = (
+                f"Full feature activation achieved — "
+                f"focus on usage depth and MAU growth"
+            )
+
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                "text": f":bulb: _Insight: {insight}_"}]
+        })
+
+    # -- HIGH VARIANCE — mixed health --
+    else:
+        red_groups = {g: d for g, d in group_data.items() if d["health"] == "red"}
+        yellow_groups = {g: d for g, d in group_data.items() if d["health"] == "yellow"}
+        green_groups = {g: d for g, d in group_data.items() if d["health"] == "green"}
+
+        # Critical
+        if red_groups:
+            red_text = "\n".join(
+                f":red_circle: `{g}` - {d['avg']:.0f}%  ·  {d['count']} features"
+                for g, d in sorted(red_groups.items(), key=lambda x: x[1]["avg"])
+            )
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                    "text": f"*:rotating_light: Needs Immediate Attention*\n{red_text}"}
+            })
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": f"Drill {g[:20]} ->"},
+                        "action_id": f"heatmap_drilldown_red_{i}",
+                        "value": f"{g}|{cloud}|{fy}",
+                        "style": "danger"
+                    }
+                    for i, g in enumerate(list(red_groups.keys())[:3])
+                ]
+            })
+            blocks.append({"type": "divider"})
+
+        # Watch
+        if yellow_groups:
+            yellow_text = "\n".join(
+                f":large_yellow_circle: `{g}` - {d['avg']:.0f}%  ·  {d['count']} features"
+                for g, d in sorted(yellow_groups.items(), key=lambda x: x[1]["avg"])
+            )
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                    "text": f"*:dart: Watch*\n{yellow_text}"}
+            })
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": f"Drill {g[:20]} ->"},
+                        "action_id": f"heatmap_drilldown_yellow_{i}",
+                        "value": f"{g}|{cloud}|{fy}"
+                    }
+                    for i, g in enumerate(list(yellow_groups.keys())[:3])
+                ]
+            })
+            blocks.append({"type": "divider"})
+
+        # Healthy — collapsed
+        if green_groups:
+            green_text = "  ·  ".join(
+                f"`{g}` {d['avg']:.0f}%"
+                for g, d in sorted(
+                    green_groups.items(),
+                    key=lambda x: x[1]["avg"],
+                    reverse=True
+                )
+            )
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                    "text": f"*:large_green_circle: Fully Adopted*\n{green_text}"}
+            })
+            blocks.append({"type": "divider"})
+
+        # Insight
+        if red_groups or yellow_groups:
+            problem_areas = list(red_groups.keys()) + list(yellow_groups.keys())
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn",
+                    "text": (
+                        f":bulb: _Insight: "
+                        f"{len(red_groups)} critical, {len(yellow_groups)} watch - "
+                        f"focus on `{problem_areas[0]}` first for highest impact_"
+                    )}]
+            })
+
+    # Footer
+    blocks.append({
+        "type": "actions",
+        "elements": [{
+            "type": "button",
+            "text": {"type": "plain_text", "text": ":arrows_counterclockwise: Refresh"},
+            "action_id": "heatmap_refresh",
+            "value": f"{cloud}|{fy}"
+        }]
+    })
 
     return blocks
 
@@ -734,6 +1009,21 @@ def _format_trend(trend) -> str:
     if trend < -2:
         return f"↓ {trend:.0f}%"
     return "→ Stable"
+
+
+def _format_mover_pct(pct) -> str:
+    """Display MAU change % without tiny-denominator blow-ups (mirrors _format_trend cap)."""
+    if pct is None:
+        return ""
+    try:
+        p = float(pct)
+    except (TypeError, ValueError):
+        return ""
+    if abs(p) > 1000:
+        return "🆕 New"
+    if p > 0:
+        return f"+{p:.0f}%"
+    return f"{p:.0f}%"
 
 
 def _status_from_score(score: int) -> str:
@@ -867,11 +1157,13 @@ def build_feature_card(
     # Growth text
     growth = _format_trend(trend)
 
-    # Insight line
+    # Insight line (align with _format_trend: huge % = new baseline, not "growth")
     if score < 5:
         insight = ":warning: Critical — needs immediate attention"
     elif score < 10:
         insight = ":warning: Low adoption — review blockers"
+    elif trend is not None and abs(trend) > 1000:
+        insight = "🆕 New feature activity — baseline forming"
     elif trend is not None and trend < -10:
         insight = ":warning: Significant drop — investigate"
     elif trend is not None and trend > 10:
@@ -1093,17 +1385,19 @@ def build_feature_detail_blocks(
                 if m.get("delta_pct") is not None
                 else m.get("mau_change_pct", 0)
             )
+            dp = _format_mover_pct(delta) or "—"
+            mn = str(acct_name or "Unknown").replace("|", " ")
             blocks.append({
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"↑ *{acct_name}*  `+{float(delta):.0f}%`"
+                    "text": f"↑ *{acct_name}*  `{dp}`"
                 },
                 "accessory": {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "View Heatmap →"},
                     "action_id": "account_feature_heatmap",
-                    "value": f"{acct_id}|{acct_name}|{cloud}|{fy}|{feature_id}"
+                    "value": f"{acct_id}|{cloud}|{fy}|{feature_id}|{mn}",
                 }
             })
 
@@ -1120,17 +1414,19 @@ def build_feature_detail_blocks(
                 if l.get("delta_pct") is not None
                 else l.get("mau_change_pct", 0)
             )
+            dp = _format_mover_pct(delta) or "—"
+            ln = str(acct_name or "Unknown").replace("|", " ")
             blocks.append({
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"↓ *{acct_name}*  `{float(delta):.0f}%`"
+                    "text": f"↓ *{acct_name}*  `{dp}`"
                 },
                 "accessory": {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "View Heatmap →"},
                     "action_id": "account_feature_heatmap",
-                    "value": f"{acct_id}|{acct_name}|{cloud}|{fy}|{feature_id}"
+                    "value": f"{acct_id}|{cloud}|{fy}|{feature_id}|{ln}",
                 }
             })
 
