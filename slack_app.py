@@ -1052,31 +1052,60 @@ def extract_account_from_query(text: str) -> tuple[str | None, str | None]:
         ],
         "Sales Cloud": [r"sales\s+cloud"],
         "Service Cloud": [r"service\s+cloud"],
-        "FSC": [r"\bfsc\b", r"financial\s+services"],
+        "FSC": [r"\bfsc\b", r"financial\s+services\s+cloud"],
     }
 
+    raw = text or ""
+    clean = raw
     detected_cloud = None
-    clean = text or ""
+
+    # Phase 1: detect cloud and strip cloud context from query.
     for cloud_name, patterns in cloud_patterns.items():
         for p in patterns:
-            if re.search(p, clean, re.IGNORECASE):
+            if re.search(p, raw, re.IGNORECASE):
                 detected_cloud = cloud_name
-                clean = re.sub(p, " ", clean, flags=re.IGNORECASE).strip()
+                # Keep stripping all cloud tokens so anchor parsing stays clean.
+                for sp in patterns:
+                    clean = re.sub(sp, " ", clean, flags=re.IGNORECASE)
                 break
         if detected_cloud:
             break
 
-    noise = [
-        r"\b(what\s+is|show\s+(me)?|give\s+me|get|fetch|load|"
-        r"heatmap|adoption|the|a|an|for|in|of|on|at|"
-        r"feature|features|details?|overview|summary|"
-        r"b2b|commerce|agentforce|salesforce)\b",
-    ]
-    acct_text = clean
-    for n in noise:
-        acct_text = re.sub(n, " ", acct_text, flags=re.IGNORECASE)
-    acct_text = re.sub(r"\s+", " ", acct_text).strip().strip("?.,")
+    clean = re.sub(r"\s+", " ", clean).strip()
 
+    def _normalize_account_candidate(value: str) -> str:
+        # Preserve apostrophes, hyphens, legal suffix punctuation, and symbol-heavy names.
+        return re.sub(r"\s+", " ", value or "").strip().strip("\"'`")
+
+    # Phase 2: anchor-based extraction (most explicit to least explicit).
+    anchored_patterns = [
+        r"for\s+(.+?)\s+\bin\b\s+",
+        r"for\s+(.+?)$",
+        r"(?:heatmap|adoption)\s+of\s+(.+?)(?:\s+in\s+|$)",
+    ]
+    for pat in anchored_patterns:
+        m = re.search(pat, clean, re.IGNORECASE)
+        if m:
+            acct_text = _normalize_account_candidate(m.group(1))
+            if acct_text.lower().endswith(" in"):
+                acct_text = acct_text[:-3].strip()
+            trailing_noise = [" in", " for", " on", " at", " of"]
+            for noise in trailing_noise:
+                if acct_text.lower().endswith(noise):
+                    acct_text = acct_text[: -len(noise)].strip()
+            if len(acct_text) >= 2 and not acct_text.isdigit():
+                return acct_text, detected_cloud
+
+    # Fallback: strip noise and use remaining text.
+    noise_pattern = (
+        r"\b(show|me|give|get|fetch|load|what|is|the|a|an|"
+        r"for|in|of|on|at|"
+        r"heatmap|adoption|overview|summary|details?|"
+        r"account|accounts|customer|company|org|"
+        r"cloud|agentforce|salesforce|commerce)\b"
+    )
+    acct_text = re.sub(noise_pattern, " ", clean, flags=re.IGNORECASE)
+    acct_text = _normalize_account_candidate(acct_text)
     if len(acct_text) >= 2 and not acct_text.isdigit():
         return acct_text, detected_cloud
     return None, detected_cloud
@@ -1107,6 +1136,13 @@ def _fetch_and_post_account_heatmap(
     """Fetch account-scoped heatmap and post to channel/DM."""
     target_channel = channel or user_id
     try:
+        full_result = get_adoption_heatmap_data(cloud, fy)
+        full_quarters = full_result.get("quarters", {})
+        full_cloud_features = next(
+            (full_quarters[q] for q in ["Q4", "Q3", "Q2", "Q1"] if full_quarters.get(q)),
+            [],
+        )
+
         result = get_adoption_heatmap_data(cloud, fy, account_id=acct_id or None)
         quarters = result.get("quarters", {})
         features = next(
@@ -1127,6 +1163,7 @@ def _fetch_and_post_account_heatmap(
             fy=fy,
             account_name=acct_name,
             snapshot_date=result.get("summary", {}).get("latest_dt", ""),
+            full_cloud_features=full_cloud_features,
         )
         client.chat_postMessage(
             channel=target_channel,
@@ -1160,15 +1197,22 @@ def _lookup_and_disambiguate_account(
         conn = get_pdp_snowflake_connection()
         cursor = conn.cursor()
         search = (acct_name or "").replace("'", "''")
+        family = _cloud_to_family(cloud or "").replace("'", "''")
         cursor.execute(
             f"""
-            SELECT DISTINCT ACCT_ID, ACCT_NM
+            SELECT ACCT_ID, ACCT_NM,
+                   COUNT(DISTINCT ORG_ID) AS orgs,
+                   COUNT(DISTINCT PRODUCT_FEATURE) AS features
             FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
             WHERE ACCT_NM ILIKE '%{search}%'
+              AND PRODUCT_FEATURE_FAMILY = '{family}'
               AND DATA_DT = (
                   SELECT MAX(DATA_DT)
                   FROM DM_PRODUCT_PRD.GLD_ANALYTICS.RPT_PRODUCTUSAGE_PFT_ORG_METRICS
               )
+            GROUP BY ACCT_ID, ACCT_NM
+            HAVING COUNT(DISTINCT PRODUCT_FEATURE) > 0
+            ORDER BY features DESC
             LIMIT 10
             """
         )
@@ -1201,10 +1245,6 @@ def _lookup_and_disambiguate_account(
         )
         return
 
-    exact = [r for r in rows if str(r[1] or "").lower() == acct_name.lower()]
-    if exact:
-        rows = exact[:1]
-
     if len(rows) == 1:
         _fetch_and_post_account_heatmap(
             client,
@@ -1235,13 +1275,24 @@ def _lookup_and_disambiguate_account(
     ]
     safe_fy = fy or "FY2027"
     safe_cloud = cloud or "Commerce B2B"
-    for i, (acct_id, acct_nm) in enumerate(display_rows):
+    for i, (acct_id, acct_nm, orgs, features) in enumerate(display_rows):
         safe_name = str(acct_nm or "Unknown").replace("|", " ")
         safe_id = str(acct_id or "").strip()
+        sf_url = f"https://org62.my.salesforce.com/{safe_id}"
+        org_n = orgs if orgs is not None else 0
+        feat_n = features if features is not None else 0
+        org_label = "org" if org_n == 1 else "orgs"
         blocks.append(
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f":office: *{safe_name}*"},
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":office: *<{sf_url}|{safe_name}>*\n"
+                        f"`{feat_n}` features  ·  `{org_n}` {org_label}  ·  "
+                        f"ID: `{safe_id}`"
+                    ),
+                },
                 "accessory": {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "View Heatmap →"},

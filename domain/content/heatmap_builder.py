@@ -690,6 +690,7 @@ def build_account_heatmap_blocks(
     fy: str,
     account_name: str,
     snapshot_date: str | None = None,
+    full_cloud_features: list | None = None,
 ) -> list:
     """
     Account-scoped heatmap — variance-aware layout.
@@ -701,6 +702,8 @@ def build_account_heatmap_blocks(
     if not features:
         return [{"type": "section", "text": {"type": "mrkdwn",
             "text": f":x: No adoption data found for *{account_name}* · {cloud} · {fy}"}}]
+    if not full_cloud_features:
+        full_cloud_features = features
 
     t = {"green": 20.0, "yellow": 5.0}
     if not snapshot_date:
@@ -755,115 +758,138 @@ def build_account_heatmap_blocks(
 
     # -- LOW VARIANCE — all healthy --
     if all_healthy and variance < 20:
+        total_per_group = defaultdict(int)
+        for f in full_cloud_features:
+            total_per_group[f.get("feature_group", "Unknown")] += 1
 
-        # Coverage gap analysis
-        total_possible = CLOUD_TOTAL_FEATURES.get(cloud, len(features))
-        activated = len(features)
-        gap = total_possible - activated
-        coverage_pct = (activated / total_possible * 100) if total_possible > 0 else 100
+        fully_activated = {}
+        underutilized = {}
+        not_activated = []
 
-        # Missing groups
-        activated_groups = set(group_data.keys())
+        account_groups = defaultdict(list)
+        for f in features:
+            account_groups[f.get("feature_group", "Unknown")].append(f)
+
         all_possible_groups = CLOUD_FEATURE_GROUPS.get(cloud, [])
-        missing_groups = [g for g in all_possible_groups if g not in activated_groups]
+        if not all_possible_groups:
+            all_possible_groups = sorted(
+                set(total_per_group.keys()) | set(account_groups.keys())
+            )
 
-        # Active groups — sorted by score desc
-        top_groups = sorted(
-            group_data.keys(),
-            key=lambda g: group_data[g]["avg"],
-            reverse=True
-        )[:5]
+        for group in all_possible_groups:
+            total = total_per_group.get(group, 0)
+            account_feats = account_groups.get(group, [])
+            activated = len(account_feats)
+            avg_score = (
+                sum(float(f.get("score") or 0) for f in account_feats) / activated
+                if activated > 0 else 0
+            )
 
-        blocks += [
-            # Adoption status
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"*:large_green_circle: {overall_avg:.0f}% adoption "
-                        f"on activated features*\n"
-                        f"No risks detected on {activated} active features"
-                    )
+            if activated == 0:
+                not_activated.append(group)
+            elif total > 0 and activated == total:
+                fully_activated[group] = {
+                    "activated": activated,
+                    "total": total,
+                    "avg_score": avg_score,
                 }
-            },
-            # Coverage gap — the KEY insight
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"*:bar_chart: Feature Coverage: "
-                        f"{activated}/{total_possible} ({coverage_pct:.0f}%)*\n"
-                        + (
-                            f":warning: *{gap} features untapped* — "
-                            f"biggest growth opportunity is feature expansion"
-                            if gap > 0 else
-                            ":tada: Full feature coverage!"
-                        )
-                    )
+            else:
+                underutilized[group] = {
+                    "activated": activated,
+                    "total": total,
+                    "unused": max(total - activated, 0),
+                    "avg_score": avg_score,
                 }
-            },
-        ]
 
-        # Active groups
+        total_possible = CLOUD_TOTAL_FEATURES.get(cloud, len(full_cloud_features))
+        activated_count = len(features)
+        coverage_pct = (activated_count / total_possible * 100) if total_possible > 0 else 0
+        sum_unused = sum(d["unused"] for d in underutilized.values())
+
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*:white_check_mark: Active Groups ({len(group_data)})*\n"
-                    + "  ·  ".join(
-                        f"`{g}`"
-                        for g in top_groups
-                    )
-                    + (f"  ·  _+{len(group_data)-5} more_"
-                       if len(group_data) > 5 else "")
+                    f"*:bar_chart: Feature Activation Overview*\n"
+                    f"`{activated_count}/{total_possible}` features active "
+                    f"({coverage_pct:.0f}% coverage)"
                 )
             }
         })
 
-        # Missing groups — only if there are any
-        if missing_groups:
-            blocks.append({"type": "divider"})
-            missing_display = missing_groups[:8]  # cap at 8
+        if not_activated or underutilized:
+            warning_parts = []
+            if not_activated:
+                warning_parts.append(f"{len(not_activated)} untouched groups")
+            if sum_unused > 0:
+                warning_parts.append(f"{sum_unused} unused features in active flows")
+            if warning_parts:
+                blocks.append({
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn",
+                        "text": f":warning: {' + '.join(warning_parts)}"}]
+                })
+
+        blocks.append({"type": "divider"})
+
+        if not_activated:
+            display = not_activated[:5]
+            overflow = len(not_activated) - 5
+            group_list = "  ·  ".join(f"`{g}`" for g in display)
+            if overflow > 0:
+                group_list += f"  ·  _+{overflow} more_"
             blocks.append({
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"*:x: Missing Groups ({len(missing_groups)})*\n"
-                        + "  ·  ".join(f"`{g}`" for g in missing_display)
-                        + (f"\n_...and {len(missing_groups)-8} more_"
-                           if len(missing_groups) > 8 else "")
+                        f"*:red_circle: Not Activated ({len(not_activated)} groups)*\n"
+                        f"{group_list}"
+                    )
+                }
+            })
+
+        if underutilized:
+            sorted_under = sorted(
+                underutilized.items(),
+                key=lambda x: x[1]["unused"],
+                reverse=True
+            )
+            rows = "\n".join(
+                f":large_yellow_circle: *{g}*   "
+                f"`{d['activated']}/{d['total']}` active  ·  "
+                f"`{d['unused']}` unused  ·  "
+                f"Adoption: `{d['avg_score']:.0f}%`"
+                for g, d in sorted_under
+            )
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*:large_yellow_circle: Underutilized ({len(underutilized)} groups)*\n"
+                        f"→ {sum_unused} unused features concentrated "
+                        f"in {len(underutilized)} groups\n"
+                        f"{rows}"
+                    )
+                }
+            })
+
+        if fully_activated:
+            fa_list = "  ·  ".join(f"`{g}`" for g in fully_activated.keys())
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*:large_green_circle: Fully Activated ({len(fully_activated)})*\n"
+                        f"{fa_list}"
                     )
                 }
             })
 
         blocks.append({"type": "divider"})
-
-        # Insight line
-        if gap > 20:
-            insight = (
-                f"Account uses only {coverage_pct:.0f}% of {cloud} features — "
-                f"activate missing groups to unlock full platform value"
-            )
-        elif gap > 0:
-            insight = (
-                f"Strong adoption across {activated} features — "
-                f"{gap} additional features available to expand"
-            )
-        else:
-            insight = (
-                f"Full feature activation achieved — "
-                f"focus on usage depth and MAU growth"
-            )
-
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn",
-                "text": f":bulb: _Insight: {insight}_"}]
-        })
 
     # -- HIGH VARIANCE — mixed health --
     else:
