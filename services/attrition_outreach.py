@@ -1,5 +1,5 @@
 """
-Stage 3 — Outreach & intervention for GM Review sheet rows.
+Commerce **attrition outreach** for GM Review sheet rows (module: ``attrition_outreach``).
 
 Triggered when Col AB (Outreach Status) is exactly *Outreach Initiated* (not the checkmark).
 After success the cell becomes *Outreach Initiated ✓*; restoring *Outreach Initiated* re-runs

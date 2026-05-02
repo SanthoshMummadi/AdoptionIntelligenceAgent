@@ -107,6 +107,22 @@ def setup_tracking_tables():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS digest_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cloud TEXT,
+            urgent_count INTEGER,
+            outreach_count INTEGER,
+            reviewed_count INTEGER,
+            pending_count INTEGER,
+            watch_channel_id TEXT,
+            posted_ts TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
     logger.info("✓ Tracking tables ready")
@@ -139,6 +155,111 @@ def has_prior_outreach_log(opp_id: str, account_nm: str) -> bool:
         return False
     finally:
         conn.close()
+
+
+def get_latest_outreach_accounts_for_digest() -> list[dict]:
+    """
+    One row per outreach account: latest ``outreach_log`` entry per ``opp_id``,
+    plus latest per ``account_nm`` when ``opp_id`` was empty.
+    """
+    rows_out: list[dict] = []
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT o.id, o.opp_id, o.account_nm, o.protect_channel_id
+            FROM outreach_log o
+            INNER JOIN (
+                SELECT opp_id AS k, MAX(id) AS mid
+                FROM outreach_log
+                WHERE TRIM(COALESCE(opp_id, '')) != ''
+                GROUP BY opp_id
+            ) m ON o.opp_id = m.k AND o.id = m.mid
+            """
+        )
+        for r in cur.fetchall() or []:
+            rows_out.append(
+                {
+                    "id": r[0],
+                    "opp_id": r[1] or "",
+                    "account_nm": r[2] or "",
+                    "protect_channel_id": r[3] or "",
+                }
+            )
+        cur.execute(
+            """
+            SELECT o.id, o.opp_id, o.account_nm, o.protect_channel_id
+            FROM outreach_log o
+            INNER JOIN (
+                SELECT account_nm AS k, MAX(id) AS mid
+                FROM outreach_log
+                WHERE TRIM(COALESCE(opp_id, '')) = ''
+                  AND TRIM(COALESCE(account_nm, '')) != ''
+                GROUP BY account_nm
+            ) m ON o.account_nm = m.k AND o.id = m.mid
+            """
+        )
+        for r in cur.fetchall() or []:
+            rows_out.append(
+                {
+                    "id": r[0],
+                    "opp_id": r[1] or "",
+                    "account_nm": r[2] or "",
+                    "protect_channel_id": r[3] or "",
+                }
+            )
+    finally:
+        conn.close()
+    return rows_out
+
+
+def log_digest_entry(
+    *,
+    cloud: str,
+    urgent_count: int,
+    outreach_count: int,
+    reviewed_count: int,
+    pending_count: int,
+    watch_channel_id: str,
+    posted_ts: str,
+) -> None:
+    """Append a Commerce attrition digest run (SQLite)."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO digest_log (
+            cloud,
+            urgent_count,
+            outreach_count,
+            reviewed_count,
+            pending_count,
+            watch_channel_id,
+            posted_ts
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            cloud,
+            int(urgent_count),
+            int(outreach_count),
+            int(reviewed_count),
+            int(pending_count),
+            watch_channel_id,
+            posted_ts,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    logger.info(
+        "Digest logged: urgent=%s outreach=%s pending=%s reviewed=%s cloud=%s",
+        urgent_count,
+        outreach_count,
+        pending_count,
+        reviewed_count,
+        cloud,
+    )
 
 
 def log_outreach_event(

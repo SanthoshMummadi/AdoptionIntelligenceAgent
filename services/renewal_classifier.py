@@ -1,9 +1,8 @@
 """
-Stage 2 — Classification Engine
-At Risk Classification Framework V6
+Renewal / at-risk classification (module: ``renewal_classifier``, V6 framework).
 Commerce Cloud ONLY — FY2027 + FY2028
-Triggered automatically as the final Stage 2 step of Google Sheets export
-(``export_to_gsheet``), e.g. from ``/gm-review-sheet`` or canvas flows that export.
+Triggered automatically on Google Sheets export (``export_to_gsheet``),
+e.g. from ``/gm-review-sheet`` or canvas flows that export.
 """
 
 import logging

@@ -25,7 +25,7 @@ from domain.salesforce.bulk_org62 import (
     get_opp_dynamic_fields_bulk,
     get_red_accounts_bulk,
 )
-from services.classify_renewal_workflow import ClassifyRenewalWorkflow
+from services.renewal_classifier import ClassifyRenewalWorkflow
 from services.gm_review_workflow import GMReviewWorkflow
 
 logger = logging.getLogger(__name__)
@@ -427,7 +427,7 @@ def _run_classification_pass(
         )
 
     try:
-        from services.stage3_outreach import scan_sheet_for_outreach
+        from services.attrition_outreach import scan_sheet_for_outreach
 
         count = scan_sheet_for_outreach(slack_client, worksheet)
         if count > 0:

@@ -805,7 +805,7 @@ def export_to_gsheet(
                     )
                 if slack_client is not None:
                     try:
-                        from services.stage3_outreach import (
+                        from services.attrition_outreach import (
                             scan_sheet_for_outreach,
                         )
 
@@ -866,7 +866,7 @@ def apply_classification_dropdown(worksheet) -> None:
         )
         return
 
-    from services.classify_renewal_workflow import CLASSIFICATION_VALUES
+    from services.renewal_classifier import CLASSIFICATION_VALUES
 
     rule = DataValidationRule(
         BooleanCondition("ONE_OF_LIST", list(CLASSIFICATION_VALUES)),

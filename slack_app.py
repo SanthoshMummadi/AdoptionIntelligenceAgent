@@ -28,7 +28,8 @@ from domain.analytics.snowflake_client import (
 from domain.tracking.account_tracker import setup_tracking_tables
 from services.app_home import publish_app_home
 from services.daily_pulse_workflow import run_daily_pulse
-from services.classify_renewal_workflow import ClassifyRenewalWorkflow, ClassificationResult
+from services.attrition_digest import run_daily_digest
+from services.renewal_classifier import ClassifyRenewalWorkflow, ClassificationResult
 from services.gm_review_bulk_workflow import _lookup_record_channel
 from log_utils import log_error
 
@@ -91,6 +92,14 @@ def setup_pulse_scheduler():
             f"defaulting daily at {hour:02d}:{minute:02d} IST"
         )
 
+    print("✓ Scheduling Commerce Attrition daily digest at same cron as Pulse")
+    scheduler.add_job(
+        lambda: run_daily_digest(app.client),
+        trigger=trigger,
+        id="daily_digest",
+        name="Daily Commerce Attrition Digest",
+        replace_existing=True,
+    )
     scheduler.add_job(
         lambda: run_daily_pulse(app.client, pulse_channel),
         trigger=trigger,
@@ -1542,7 +1551,7 @@ def handle_initiate_outreach(ack, respond, command, client, logger):
         import gspread
 
         from domain.integrations.gsheet_exporter import get_google_creds, _gsheet_id
-        from services.stage3_outreach import scan_sheet_for_outreach
+        from services.attrition_outreach import scan_sheet_for_outreach
 
         try:
             sid = _gsheet_id()
@@ -1594,6 +1603,77 @@ def handle_initiate_outreach(ack, respond, command, client, logger):
     threading.Thread(
         target=process, args=(tab_name, cloud, uid), daemon=True
     ).start()
+
+
+@app.command("/attrition-digest")
+def handle_attrition_digest(ack, respond, command, client, logger):
+    """
+    Post the Commerce Attrition daily digest to #cc-attrition-watch manually.
+    Usage: `/attrition-digest Commerce Cloud`
+    """
+    ack()
+
+    text = (command.get("text") or "").strip() or "Commerce Cloud"
+    cloud = text.title()
+
+    supported = ", ".join(f"`{k}`" for k in CLOUD_TAB_MAP)
+    tab_name = CLOUD_TAB_MAP.get(cloud)
+    if not tab_name:
+        respond(
+            f"❌ Unknown cloud: `{cloud}`. Supported: {supported}\n\n"
+            f"*Usage:* `/attrition-digest Commerce Cloud`\n"
+        )
+        return
+
+    chan = command.get("channel_id")
+    uid = command.get("user_id")
+
+    respond("⏳ Generating digest...")
+
+    def _finish(ok_msg: str, err_msg: str | None) -> None:
+        body = ok_msg if err_msg is None else err_msg
+        try:
+            respond(text=body, replace_original=True)
+        except Exception as resp_err:
+            logger.warning(
+                "digest: respond(update) failed: %s; trying ephemeral",
+                resp_err,
+            )
+            try:
+                if chan and uid:
+                    client.chat_postEphemeral(channel=chan, user=uid, text=body)
+                else:
+                    logger.error("digest: no channel_id/user_id for fallback")
+            except SlackApiError as se:
+                logger.error("digest: chat_postEphemeral failed: %s", se)
+
+    def process():
+        try:
+            from services.attrition_digest import run_daily_digest
+
+            ok = run_daily_digest(
+                client,
+                cloud=cloud,
+                worksheet_title=tab_name,
+            )
+            if ok:
+                _finish(
+                    "✅ Digest posted to `#cc-attrition-watch`",
+                    None,
+                )
+            else:
+                _finish(
+                    "",
+                    ":x: Digest failed — check logs (set "
+                    "`CC_ATTRITION_WATCH_CHANNEL_ID` / sheet credentials).",
+                )
+        except Exception as e:
+            logger.exception("digest: %s", e)
+            _finish("", f":x: Digest failed: {str(e)[:500]}")
+
+    import threading
+
+    threading.Thread(target=process, daemon=True).start()
 
 
 def _format_classification(r: ClassificationResult) -> str:
