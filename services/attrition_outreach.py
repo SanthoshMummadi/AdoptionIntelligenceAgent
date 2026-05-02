@@ -697,6 +697,7 @@ def sheet_row_to_stage3_dict(
         return _money_cell_to_float(c(name, idx))
 
     atr_money = _money_cell_to_float(c("ATR", 3))
+    swing_val = _money_from_col("Swing", 5)
     outreach_idx = header_to_idx.get("Outreach Status") if header_to_idx else None
     if outreach_idx is None:
         outreach_idx = 27
@@ -723,6 +724,8 @@ def sheet_row_to_stage3_dict(
         "account_cell": account_cell,
         "atr_display": c("ATR", 3),
         "atr_value": atr_money,
+        "swing_display": c("Swing", 5),
+        "swing_value": swing_val,
         "forecast_display": c("Forecasted Attrition", 4),
         "forecasted_attrition": _money_from_col("Forecasted Attrition", 4),
         "renewal_month": c("Renewal Month", 9),

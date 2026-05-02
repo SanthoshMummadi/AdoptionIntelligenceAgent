@@ -123,6 +123,45 @@ def setup_tracking_tables():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_snapshot (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_key TEXT NOT NULL UNIQUE,
+            account_nm TEXT,
+            opp_id TEXT,
+            protect_channel_id TEXT,
+            forecasted_atr REAL,
+            swing REAL,
+            classification TEXT,
+            burn_rate REAL,
+            renewal_month TEXT,
+            red_ac_flag TEXT,
+            last_message_ts REAL,
+            snapshot_date TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    cursor.execute("PRAGMA table_info(account_snapshot)")
+    snap_cols = {row[1] for row in cursor.fetchall()}
+    if snap_cols:
+        migrations = []
+        if "protect_channel_id" not in snap_cols:
+            migrations.append(
+                "ALTER TABLE account_snapshot ADD COLUMN protect_channel_id TEXT"
+            )
+        if "last_message_ts" not in snap_cols:
+            migrations.append(
+                "ALTER TABLE account_snapshot ADD COLUMN last_message_ts REAL"
+            )
+        for stmt in migrations:
+            try:
+                cursor.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+
     conn.commit()
     conn.close()
     logger.info("✓ Tracking tables ready")
@@ -153,6 +192,24 @@ def has_prior_outreach_log(opp_id: str, account_nm: str) -> bool:
             if cur.fetchone():
                 return True
         return False
+    finally:
+        conn.close()
+
+
+def get_all_protect_channel_ids() -> set[str]:
+    """Distinct Slack conversation IDs from ``outreach_log`` (trimmed / uppercased for comparison)."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT TRIM(protect_channel_id)
+            FROM outreach_log
+            WHERE TRIM(COALESCE(protect_channel_id, '')) != ''
+            """,
+        )
+        rows = cur.fetchall() or []
+        return {(str(row[0] or "").strip().upper()) for row in rows if row}
     finally:
         conn.close()
 
@@ -212,6 +269,87 @@ def get_latest_outreach_accounts_for_digest() -> list[dict]:
     finally:
         conn.close()
     return rows_out
+
+
+def account_snapshot_key(opp_id: str, account_nm: str) -> str:
+    o = (opp_id or "").strip()
+    if o:
+        return f"opp:{o}"
+    return f"nm:{(account_nm or '').strip().lower()}"
+
+
+def get_account_snapshot(account_key: str) -> dict | None:
+    """Latest stored metrics for change detection (``account_snapshot``)."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM account_snapshot WHERE account_key = ? LIMIT 1",
+            (account_key,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def upsert_account_snapshot(
+    *,
+    account_key: str,
+    account_nm: str,
+    opp_id: str,
+    protect_channel_id: str,
+    forecasted_atr: float,
+    swing: float,
+    classification: str,
+    burn_rate: float | None,
+    renewal_month: str,
+    red_ac_flag: str,
+    last_message_ts: float | None,
+    snapshot_date: str,
+) -> None:
+    """Replace the single snapshot row for ``account_key``."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM account_snapshot WHERE account_key = ?", (account_key,))
+        cur.execute(
+            """
+            INSERT INTO account_snapshot (
+                account_key, account_nm, opp_id, protect_channel_id, forecasted_atr,
+                swing, classification, burn_rate, renewal_month, red_ac_flag,
+                last_message_ts, snapshot_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_key,
+                (account_nm or "").strip(),
+                (opp_id or "").strip(),
+                (protect_channel_id or "").strip(),
+                float(forecasted_atr or 0),
+                float(swing or 0),
+                (classification or "").strip(),
+                burn_rate,
+                (renewal_month or "").strip(),
+                (red_ac_flag or "").strip(),
+                last_message_ts,
+                snapshot_date,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_outreach_accounts_with_protect_channel() -> list[dict]:
+    """Latest outreach row per account with a non-empty protect channel Id."""
+    return [
+        r
+        for r in get_latest_outreach_accounts_for_digest()
+        if str((r or {}).get("protect_channel_id") or "").strip()
+    ]
 
 
 def log_digest_entry(

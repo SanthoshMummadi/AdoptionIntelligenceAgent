@@ -25,7 +25,10 @@ from domain.analytics.snowflake_client import (
     prewarm_cidm_usage_snapshot_dt,
     prewarm_renewal_as_of_date,
 )
-from domain.tracking.account_tracker import setup_tracking_tables
+from domain.tracking.account_tracker import (
+    get_all_protect_channel_ids,
+    setup_tracking_tables,
+)
 from services.app_home import publish_app_home
 from services.daily_pulse_workflow import run_daily_pulse
 from services.attrition_digest import run_daily_digest
@@ -42,6 +45,11 @@ if not slack_bot_token:
 
 app = App(token=slack_bot_token)
 _pulse_scheduler = None
+
+
+def _daily_attrition_digest() -> None:
+    """Scheduled: summary + active-outreach sections in ``#cc-attrition-watch``."""
+    run_daily_digest(app.client)
 
 
 def on_startup():
@@ -92,9 +100,11 @@ def setup_pulse_scheduler():
             f"defaulting daily at {hour:02d}:{minute:02d} IST"
         )
 
-    print("✓ Scheduling Commerce Attrition daily digest at same cron as Pulse")
+    print(
+        "✓ Scheduling Commerce Attrition digest (with per-account updates) at Pulse cron",
+    )
     scheduler.add_job(
-        lambda: run_daily_digest(app.client),
+        _daily_attrition_digest,
         trigger=trigger,
         id="daily_digest",
         name="Daily Commerce Attrition Digest",
@@ -324,12 +334,54 @@ def split_into_chunks(text: str, max_length: int = 3900) -> list[str]:
     return chunks
 
 
+_protect_channel_name_checked: dict[str, bool] = {}
+
+
+def _channel_name_matches_cc_protect(name: str) -> bool:
+    n = name.strip().lower().lstrip("#")
+    return n.startswith("cc-") and n.endswith("-protect")
+
+
+def _slack_channel_is_protect_by_conversation_lookup(client, channel_id: str) -> bool:
+    """Resolve channel name via Slack API once per channel id (payload rarely includes channel_name)."""
+    cid = (channel_id or "").strip()
+    if not cid or cid[0] not in ("C", "G"):
+        return False
+    ckey = cid.upper()
+    if ckey in _protect_channel_name_checked:
+        return _protect_channel_name_checked[ckey]
+    try:
+        res = client.conversations_info(channel=cid)
+        ch = (res or {}).get("channel") or {}
+        nm = str(ch.get("name") or "")
+        yn = _channel_name_matches_cc_protect(nm)
+        _protect_channel_name_checked[ckey] = yn
+        return yn
+    except Exception:
+        _protect_channel_name_checked[ckey] = False
+        return False
+
+
 # -------------------------
 # Slack events / actions
 # -------------------------
 @app.event("message")
 def handle_message(event, say, client):
     if event.get("bot_id") or event.get("subtype"):
+        return
+
+    # Never respond in protect channels (those are AE/RM/CSM — bot only reads for digests elsewhere).
+    channel_id = (event.get("channel") or "").strip()
+    channel_upper = channel_id.upper()
+    channel_name = (event.get("channel_name") or "").strip()
+    if channel_name and _channel_name_matches_cc_protect(channel_name):
+        return
+
+    protect_ids = get_all_protect_channel_ids()
+    if channel_upper and channel_upper in protect_ids:
+        return
+
+    if channel_id and _slack_channel_is_protect_by_conversation_lookup(client, channel_id):
         return
 
     text = event.get("text", "").strip()
@@ -1608,8 +1660,8 @@ def handle_initiate_outreach(ack, respond, command, client, logger):
 @app.command("/attrition-digest")
 def handle_attrition_digest(ack, respond, command, client, logger):
     """
-    Post the Commerce Attrition daily digest to #cc-attrition-watch manually.
-    Usage: `/attrition-digest Commerce Cloud`
+    Post Commerce Attrition digest to ``#cc-attrition-watch`` (rollup + active-outreach sections).
+    Usage: ``/attrition-digest Commerce Cloud``
     """
     ack()
 

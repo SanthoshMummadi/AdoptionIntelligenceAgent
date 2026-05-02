@@ -3,7 +3,9 @@ Commerce Attrition daily digest — rollup from ``outreach_log`` + GM Review She
 Posts to ``#cc-attrition-watch`` (scheduled and manual slash command).
 
 Named by behavior (`attrition_digest`), not pipeline stage numbering.
-Pairs with ``services.attrition_outreach``.
+
+Per-account protect-channel activity + sheet deltas are merged into this digest via
+``services.attrition_tracker.process_digest_account_row``.
 """
 from __future__ import annotations
 
@@ -27,10 +29,12 @@ from domain.tracking.account_tracker import (
     log_digest_entry,
 )
 from services.attrition_outreach import (
+    _is_slack_conversation_id,
     _parse_renewal_to_end_of_month_date,
     _fmt_money_short,
     sheet_row_to_stage3_dict,
 )
+from services.attrition_tracker import process_digest_account_row
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,7 @@ class DigestSnapshot:
     top_urgent: list[dict]
     matched_rows: int
     outreach_cohort: int
+    active_outreach_rows: list[dict]
 
 
 def _load_commerce_sheet_rows(worksheet_title: str) -> tuple[list[str], list[list[str]]]:
@@ -125,6 +130,7 @@ def _gather_snapshot(cloud: str, worksheet_title: str) -> DigestSnapshot:
             top_urgent=[],
             matched_rows=0,
             outreach_cohort=len(outreach_rows),
+            active_outreach_rows=[],
         )
 
     header_map = {h: i for i, h in enumerate(headers) if h}
@@ -177,6 +183,26 @@ def _gather_snapshot(cloud: str, worksheet_title: str) -> DigestSnapshot:
     )
     top_urgent = urgent_pool[:3]
 
+    active_outreach_rows: list[dict] = []
+    for rd in matched:
+        ost = (rd.get("outreach_status") or "").strip()
+        if ost not in ACTIVE_OUTREACH:
+            continue
+        ch = str(
+            rd.get("_digest_channel_id")
+            or rd.get("protect_slack_channel_id")
+            or ""
+        ).strip()
+        if not _is_slack_conversation_id(ch):
+            up = ch.upper()
+            if _is_slack_conversation_id(up):
+                ch = up
+        if not _is_slack_conversation_id(ch):
+            continue
+        row = dict(rd)
+        row["_norm_protect_channel_id"] = ch
+        active_outreach_rows.append(row)
+
     return DigestSnapshot(
         cloud=cloud,
         urgent_count=urgent_count,
@@ -186,11 +212,15 @@ def _gather_snapshot(cloud: str, worksheet_title: str) -> DigestSnapshot:
         top_urgent=top_urgent,
         matched_rows=len(matched),
         outreach_cohort=len(outreach_rows),
+        active_outreach_rows=active_outreach_rows,
     )
 
 
-def _format_digest_message(snap: DigestSnapshot) -> str:
-    today = datetime.now(IST).strftime("%Y-%m-%d")
+_DIGEST_TEXT_MAX = 38000
+
+
+def _format_digest_summary(snap: DigestSnapshot) -> str:
+    today = datetime.now(IST).strftime("%B %d, %Y")
     lines = [
         f"📊 *Commerce Attrition — Daily Digest | {today}*",
         "",
@@ -229,22 +259,71 @@ def _format_digest_message(snap: DigestSnapshot) -> str:
     return "\n".join(lines)
 
 
+def _compose_full_digest_message(
+    slack_client: Any, snap: DigestSnapshot, worksheet_title: str
+) -> str:
+    summary = _format_digest_summary(snap)
+    if os.getenv("GM_REVIEW_ACCOUNT_UPDATES", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return summary
+
+    if not slack_client:
+        return summary
+
+    snap_date = datetime.now(IST).strftime("%Y-%m-%d")
+    uid_cache: dict[str, str] = {}
+    participant_ring: dict[str, str] = {}
+    sections: list[str] = []
+
+    for rd in snap.active_outreach_rows:
+        pch = str(rd.get("_norm_protect_channel_id") or "").strip()
+        oid = str(rd.get("opp_id") or "").strip()
+        label = (
+            str(rd.get("account_nm") or rd.get("account_name") or "Unknown").strip()
+        )
+        blk = process_digest_account_row(
+            slack_client,
+            rd=rd,
+            account_nm=label,
+            opp_id_sheet=oid,
+            protect_channel_id=pch,
+            snap_date=snap_date,
+            uid_cache=uid_cache,
+            participant_ring=participant_ring,
+        )
+        if blk:
+            sections.append(blk)
+
+    if not sections:
+        return summary
+
+    body = summary.rstrip()
+    assembled = body + "\n\n---\n\n" + "\n\n---\n\n".join(sections)
+    if len(assembled) > _DIGEST_TEXT_MAX:
+        logger.warning(
+            "digest combined text truncated from %s chars",
+            len(assembled),
+        )
+        assembled = assembled[: _DIGEST_TEXT_MAX - 20] + "\n_(truncated)_"
+    return assembled
+
+
 def build_daily_digest(
     slack_client: Any = None,
     *,
     cloud: str = "Commerce Cloud",
     worksheet_title: str | None = None,
 ) -> str:
-    """
-    Build digest text from ``outreach_log`` + the Commerce GM Review tab.
-
-    ``slack_client`` is accepted for API symmetry; unused today.
-    """
+    """Build digest text from ``outreach_log`` + the Commerce GM Review tab."""
     title = worksheet_title or os.getenv(
         "GM_REVIEW_GOOGLE_TAB", "Commerce Cloud GM Review"
     )
     snap = _gather_snapshot(cloud, title)
-    return _format_digest_message(snap)
+    return _compose_full_digest_message(slack_client, snap, title)
 
 
 def run_daily_digest(
@@ -264,7 +343,7 @@ def run_daily_digest(
 
     try:
         snap = _gather_snapshot(cloud, title)
-        text = _format_digest_message(snap)
+        text = _compose_full_digest_message(slack_client, snap, title)
     except Exception as e:
         logger.exception("run_daily_digest: build failed: %s", e)
         return False
