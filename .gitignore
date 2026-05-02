@@ -12,6 +12,7 @@ keys/
 google_token.pkl
 google_token.pickle
 credentials.json
+google_creds.json
 oauth_credentials.json
 *_credentials.json
 *.pkl

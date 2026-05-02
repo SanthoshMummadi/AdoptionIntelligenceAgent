@@ -1,134 +1,159 @@
 # Adoption Intelligence Bot
 
-Slack-native PM intelligence hub for:
-- Product brief and V2MoM analysis
-- GM Review (at-risk renewal workflows)
-- Attrition risk analysis and exports
-- App Home operational dashboard
+Slack-native **PM intelligence hub**: product briefs and V2MoM analysis, **AI Council / GM Review** (at‑risk renewals via Salesforce + Snowflake + Claude), **attrition risk** tooling, optional Google Sheets export, and an App Home dashboard.
 
-## Core Features
+---
 
-- **Slack Bot + Socket Mode**
-  - DM interactions, slash commands, file ingestion, App Home publishing
-- **Bulk GM Review pipeline**
-  - Snowflake-first bulk renewals + CIDM enrichment + Salesforce dynamic fields
-  - `/gm-review-lists` for list updates
-  - `/gm-review-sheet` for Google Sheets export
-- **App Home dashboard**
-  - At-risk counts for Commerce + FSC
-  - Refresh action and quick GM Review buttons
-  - Top red accounts summary
-- **Attrition tooling**
-  - `/attrition-risk`, `/attrition-clouds`, `/risk-mapping`, `/at-risk-canvas`
-- **Config-driven prompts**
-  - Hub/module prompts from `config.properties`
+## Branch: `attrition`
 
-## Project Structure
+Check out **`attrition`** when you care about the **renewal / GM Review / Snowflake bulk** track and stable alignment with **`main`** (same tip as upstream `origin/main`-style lineage in this repo).
 
-- `slack_app.py` - main Slack Bolt entrypoint
-- `server.py` - FastMCP server entrypoint
-- `services/gm_review_bulk_workflow.py` - bulk GM Review orchestration
-- `services/gm_review_workflow.py` - legacy/per-account GM Review flow
-- `services/app_home.py` - App Home dashboard blocks + publishing
-- `domain/analytics/bulk_renewals.py` - bulk renewals query and filters
-- `domain/analytics/bulk_cidm.py` - bulk CIDM usage/enrichment
-- `domain/salesforce/bulk_org62.py` - bulk Salesforce opportunity fields
-- `domain/integrations/gsheet_exporter.py` - sheet export adapter/writer
-- `domain/content/list_builder.py` - Slack List field mapping/update
-- `domain/analytics/snowflake_client.py` - Snowflake connection/query utilities
-- `docs/ARCHITECTURE.md` - architecture details
-- `docs/AI_COUNCIL_GM_REVIEW.md` - GM Review flow deep-dive
+The **`adoption`** branch adds **adoption‑centric** UX and data work (for example Feature Activation Overview, adoption heatmaps, and related Slack home improvements). If you need those features, use **`adoption`** instead of **`attrition`**.
+
+---
+
+## What this branch delivers
+
+| Area | What you get |
+|------|----------------|
+| **Slack bot** | Socket Mode: DMs, file uploads, slash commands, App Home |
+| **GM Review** | Sequential (`gm_review_workflow`) and **bulk Snowflake‑first** (`gm_review_bulk_workflow`) paths; canvas markdown + optional Sheets |
+| **Attrition** | `/attrition-risk`, `/attrition-clouds`, `/risk-mapping`, `/at-risk-canvas` |
+| **MCP** | `server.py` — FastMCP tools for brief/query and GM Review–related operations |
+| **Integrations** | Salesforce Org62, Snowflake (CIDM / renewals / attrition‑style enrichment), Salesforce LLM Gateway, optional Tableau & Google Drive |
+
+---
 
 ## Prerequisites
 
-- Python 3.13+
-- Slack app credentials (bot + app tokens)
-- Salesforce access (session token or username/password flow)
-- Snowflake service account + key pair
-- Optional: Google OAuth token for Drive/Sheets integration
+- **Python 3.13+**
+- Slack app: **Bot token** + **App‑level token** (Socket Mode)
+- Salesforce session or username/password (see `.env.example`)
+- Snowflake: service account preferred — **key‑pair auth** in production paths (avoid `externalbrowser` in prod)
+- Optional: Google OAuth for Drive/Sheets (`python google_auth.py` → `google_token.pkl`)
 
-## Local Setup
+---
+
+## Setup
 
 ```bash
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Create `.env` (do not commit it) and set required keys such as:
-- `SLACK_BOT_TOKEN`
-- `SLACK_APP_TOKEN`
-- `LLM_GATEWAY_API_KEY`
-- `LLM_MODEL`
-- `SNOWFLAKE_USER`
-- `SNOWFLAKE_ACCOUNT`
-- `SNOWFLAKE_ROLE`
-- `SNOWFLAKE_WAREHOUSE`
-- `SNOWFLAKE_DATABASE`
-- `SNOWFLAKE_SCHEMA`
-- `SNOWFLAKE_PRIVATE_KEY_PATH`
-- `SF_ACCESS_TOKEN`
-- `SF_INSTANCE_URL`
+Copy **`.env.example`** → **`.env`** and fill in secrets (never commit `.env`). Notable variables:
 
-Common runtime flags used by this project:
+**Slack & LLM**
+
+- `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
+- `LLM_GATEWAY_API_KEY`, `LLM_MODEL`
+
+**Snowflake**
+
+- `SNOWFLAKE_USER`, `SNOWFLAKE_ACCOUNT`, role/warehouse/database/schema
+- `SNOWFLAKE_PRIVATE_KEY_PATH` (and passphrase if applicable)
+- Snapshot / tuning (examples): `SNOWFLAKE_CIDM_SNAPSHOT_DT`, timeouts in `.env.example`; Commerce bulk renewals window uses **`SYSDATE()`** (see **`GM_REVIEW_RENEWAL_CLSD_FORWARD_MONTHS`** in `.env.example`)
+
+**Salesforce**
+
+- Session: `SF_ACCESS_TOKEN`, `SF_INSTANCE_URL` — or username/password equivalents
+
+**Bulk GM Review tuning**
+
 - `GM_REVIEW_BULK_MODE=1`
-- `GM_REVIEW_LIST_ID=<slack_list_id>`
-- `GM_REVIEW_FCAST_ATTRITION_THRESHOLD=-500000`
-- `SNOWFLAKE_CIDM_SNAPSHOT_DT=YYYY-MM-DD`
-- `SNOWFLAKE_RENEWAL_AS_OF_DATE=YYYY-MM-DD`
-- `SNOWFLAKE_CSS_SKIP=1`
+- `GM_REVIEW_FCAST_ATTRITION_THRESHOLD=-500000` (and related bulk filters — see `.env.example`)
+- `GM_REVIEW_MAX_CONCURRENT`, list/sheet helpers: `GM_REVIEW_LIST_ID`, etc.
+
+Internal LLM Gateway hosts may require a CA bundle (`LLM_GATEWAY_CA_BUNDLE`); see `CLAUDE.md` or `.env.example` for TLS notes.
+
+Startup validates required env in `server.py` unless you set `PRODUCT_ADOPTION_SKIP_ENV_VALIDATION=1` or run tests from `tests/`.
+
+---
 
 ## Run
 
+**Slack app**
+
 ```bash
-./venv/bin/python slack_app.py
+python slack_app.py
 ```
 
-For MCP server testing:
+**MCP server (inspector)**
 
 ```bash
 npx @modelcontextprotocol/inspector python server.py
 ```
 
-## Slack Commands
+---
 
-- `/gm-review-lists <cloud or filters>`
-- `/gm-review-sheet <cloud or filters>`
-- `/gm-review-canvas <accounts/opps>` (stub/deprecated path depending on config)
-- `/at-risk-canvas <optional filters>`
-- `/attrition-risk <Account Name>`
-- `/attrition-clouds`
-- `/risk-mapping <optional theme>`
-- `/tableau-test`
+## Slack slash commands (high level)
 
-## App Home
+| Command | Purpose |
+|---------|---------|
+| `/gm-review-canvas` | AI Council / GM Review canvas from accounts or opportunity IDs |
+| `/gm-review-lists` | Update Slack Lists from GM Review bulk output |
+| `/gm-review-sheet` | Export GM Review bulk results to Google Sheets |
+| `/at-risk-canvas` | At‑risk renewal canvas (filters optional) |
+| `/attrition-risk` | Attrition summary (Excel‑backed model path) |
+| `/attrition-clouds` | List cloud filters for attrition |
+| `/risk-mapping` | Risk theme ↔ playbook mappings |
+| `/tableau-test` | Tableau connectivity smoke test |
 
-App Home is published on `app_home_opened` and supports:
-- `refresh_app_home`
-- `run_gm_review_commerce`
-- `run_gm_review_fsc`
+DM “hub” wording can switch modes (e.g. product brief, V2MoM, attrition predictor) — see `config.properties` and `CLAUDE.md`.
 
-Implementation: `services/app_home.py` and related handlers in `slack_app.py`.
+---
 
-## Data & Security Notes
+## Tests
 
-- Treat `storage/*.pkl`, `bot_history.db`, and OAuth tokens as sensitive.
-- Never commit `.env`, keys, or credentials.
-- Keep `keys/` ignored in git.
-- Snowflake production path uses key-pair auth (no `externalbrowser` in prod).
+Requires live Salesforce, Snowflake, and LLM where noted:
 
-## Troubleshooting
+```bash
+python3 tests/test_commerce_cloud_e2e.py
+python3 tests/test_dynamic_accounts.py
+python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
+```
 
-- **Slack auth/proxy errors**
-  - If startup fails at `auth.test` with proxy tunnel/403, check local network/proxy rules.
-- **Snowflake connectivity**
-  - Verify key path/passphrase and warehouse permissions.
-- **No GM Review rows**
-  - Validate cloud filters, fiscal filters, and attrition threshold in `.env`.
+---
+
+## Project layout
+
+| Path | Role |
+|------|------|
+| `slack_app.py` | Bolt app entrypoint |
+| `server.py` | FastMCP server |
+| `services/gm_review_bulk_workflow.py` | Bulk GM Review orchestration |
+| `services/gm_review_workflow.py` | Account‑by‑account GM Review |
+| `services/app_home.py` | App Home blocks & publishing |
+| `domain/analytics/bulk_renewals.py`, `bulk_cidm.py` | Bulk Snowflake renewals / CIDM |
+| `domain/salesforce/bulk_org62.py` | Bulk Salesforce reads |
+| `domain/intelligence/risk_engine.py` | Risk themes + LLM / fallbacks |
+| `domain/content/canvas_builder.py` | Slack canvas markdown |
+| `domain/integrations/gsheet_exporter.py` | Sheets export |
+| `config.properties` | Hub modules & prompts |
+
+---
 
 ## Documentation
 
-- `docs/ARCHITECTURE.md`
-- `docs/ARCHITECTURE_DIAGRAM.md`
-- `docs/AI_COUNCIL_GM_REVIEW.md`
-- `docs/REPO_LAYOUT.md`
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- [`docs/ARCHITECTURE_DIAGRAM.md`](docs/ARCHITECTURE_DIAGRAM.md)
+- [`docs/AI_COUNCIL_GM_REVIEW.md`](docs/AI_COUNCIL_GM_REVIEW.md)
+- [`docs/REPO_LAYOUT.md`](docs/REPO_LAYOUT.md)
+
+Agent / contributor notes live in **`CLAUDE.md`** (timeouts, circuit breaker, Daily Pulse scheduler, concurrency).
+
+---
+
+## Security & data
+
+- Treat **`storage/*.pkl`**, **`bot_history.db`**, **`google_token.pkl`**, and anything under **`keys/`** as sensitive.
+- Do not commit `.env`, API keys, or private keys.
+
+---
+
+## Troubleshooting
+
+- **Slack `auth.test` / proxy errors** — check corporate proxy or Socket Mode firewall rules.
+- **Snowflake auth** — confirm key path, passphrase, role, and warehouse grants.
+- **Empty GM Review rows** — validate cloud/FY filters, snapshot dates, and `GM_REVIEW_FCAST_ATTRITION_THRESHOLD`.

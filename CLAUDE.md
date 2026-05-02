@@ -11,7 +11,12 @@ A Slack-native **PM Intelligence Hub** that analyzes product briefs, runs V2MoM-
 - AI Council Review (GM Review) — at-risk renewal synthesis with Salesforce + Snowflake + LLM
 - Attrition risk prediction via Excel-driven models and real-time Salesforce queries
 - Slack Canvas generation for executive summaries
+- App Home dashboard with renewal insights
 - Google Drive integration (Docs/Sheets/Slides)
+
+**Branch context:**
+- **`attrition`** (current) — Stable renewal/GM Review/Snowflake bulk track, aligned with main
+- **`adoption`** — Adds adoption-centric features (Feature Activation Overview, adoption heatmaps, enhanced App Home)
 
 ## Development Setup
 
@@ -51,15 +56,24 @@ npx @modelcontextprotocol/inspector python server.py
 
 ## Testing
 
+Requires live Salesforce, Snowflake, and LLM credentials. Tests automatically skip env validation (see `PRODUCT_ADOPTION_SKIP_ENV_VALIDATION`).
+
 ### Run end-to-end tests
 ```bash
+# As script (runs all tests sequentially)
 python3 tests/test_commerce_cloud_e2e.py
+
+# Via pytest (better for single tests or debugging)
+python3 -m pytest tests/test_commerce_cloud_e2e.py -v
 ```
-Requires live Salesforce, Snowflake, and LLM credentials. Tests GM Review workflow (Section 5: WF-* tests).
+
+Tests GM Review workflow (Section 5: WF-* tests).
 
 ### Run dynamic account tests
 ```bash
 python3 tests/test_dynamic_accounts.py
+# or
+python3 -m pytest tests/test_dynamic_accounts.py -v
 ```
 
 ### Run single test
@@ -83,12 +97,13 @@ python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
 - Sequential: Per-account Salesforce + Snowflake → LLM (detailed, works for any input)
 
 ### Entry points
-- **`slack_app.py`** — Slack Bolt app (DMs, hub modules, file ingestion, slash commands including `/gm-review-canvas`, `/at-risk-canvas`)
+- **`slack_app.py`** — Slack Bolt app (DMs, hub modules, file ingestion, slash commands, App Home dashboard)
 - **`server.py`** — FastMCP server (brief CRUD, `query_brief`, `generate_gm_reviews`, `generate_gm_review_canvas`, `health_check`)
 
 ### Core modules
 - **`services/gm_review_workflow.py`** — GM Review orchestration: Salesforce + Snowflake + LLM + canvas markdown (account-by-account)
 - **`services/gm_review_bulk_workflow.py`** — Bulk GM Review: 3 queries → in-memory join → faster for large cloud scans
+- **`services/app_home.py`** — App Home blocks and dashboard publishing
 - **`domain/salesforce/org62_client.py`** — Salesforce authentication and query execution with concurrency limiting
 - **`domain/salesforce/bulk_org62.py`** — Bulk Salesforce queries for GM Review (dynamic fields, red accounts)
 - **`domain/analytics/snowflake_client.py`** — Snowflake enrichment, connection pooling, attrition queries
@@ -125,7 +140,6 @@ For non-internal URLs, TLS always uses certifi or custom CA bundle.
 - **Auth:** Key-pair authentication (`rsa_key.p8` in `keys/` folder)
 - **NEVER use `externalbrowser` authenticator** — production uses service account key-pair only
 - **Snapshot dates:**
-  - `SNOWFLAKE_RENEWAL_AS_OF_DATE=2026-03-01`
   - `SNOWFLAKE_CIDM_SNAPSHOT_DT=2026-04-01`
 
 ### GM Review: Bulk vs Account-by-Account
@@ -156,8 +170,12 @@ Key timeout environment variables (see `.env.example`):
 - `SNOWFLAKE_CIDM_SNAPSHOT_DT=YYYY-MM-DD` — pin snapshot date to skip MAX during unstable runs
 
 ### Bulk GM Review Configuration
-- `GM_REVIEW_FCAST_ATTRITION_THRESHOLD=-500000` — ATR threshold for bulk queries (default: -500k, meaning 500k+ attrition)
-- Bulk queries apply FY lookahead (current FY + 1) and close date filters automatically
+- `GM_REVIEW_BULK_MODE=1` — Enable bulk workflow (Snowflake-first, faster for cloud scans)
+- **`GM_REVIEW_FCAST_ATTRITION_THRESHOLD`** (default −500000) — **Commerce bulk Query 1** opp-level cutoff on **`RENEWAL_FCAST_ATTRITION_CONV <=`** this value ($500k+ forecast attrition when set to −500000). Applies in the INNER `WHERE` together with `BOOK_OF_BUSINESS`, opp-type clauses, **`RENEWAL_FCAST_CODE`**, **`M_A_LEGACY_RENEWAL_FLAG`**, **`ACCOUNT_NM`**, **30DE / stage** carve-out (replaces legacy 13-stage `NOT IN` list), plus **`RENEWAL_CLSD_DT`** window **SYSDATE()**‑relative (rollup fcast **`HAVING`** not used as a substitute).
+- **`GM_REVIEW_RENEWAL_CLSD_FORWARD_MONTHS`** (default **24**) — Commerce Query 1 close window endpoint: **`RENEWAL_CLSD_DT <= ADD_MONTHS(DATE_TRUNC('month', SYSDATE()), N)`**, so the renewal calendar is pinned to **`SYSDATE()`** rather than **`SNOWFLAKE_RENEWAL_AS_OF_DATE`** / hardcoded **`RENEWAL_FISCAL_YEAR`** buckets.
+- `GM_REVIEW_LIST_ID` — Slack List ID for `/gm-review-lists` command
+- **Commerce bulk Query 1** does **not** use multi-condition **`TARGET_CLOUD LIKE`** predicates on the INNER `WHERE` (uses **`BOOK_OF_BUSINESS = 'Commerce Cloud'`** instead).
+- **Non‑Commerce** bulk and **explicit `opp_ids`** paths still use **`SNOWFLAKE_RENEWAL_MIN_CLOSE_MONTH`**, dead-stage exclusions, cloud filter, FY lookahead/override as before.
 - For Financial Services Cloud: uses CIDM APM_L3 filtering instead of TARGET_CLOUD patterns
 - Result limit: default 500 renewals per bulk query (configurable via `limit` parameter)
 
@@ -173,6 +191,8 @@ Started automatically on bot startup via APScheduler.
 
 ### Slack slash commands
 - `/gm-review-canvas <accounts or opp IDs>` — Generate AI Council Review canvas with optional cloud token
+- `/gm-review-lists` — Update Slack Lists from GM Review bulk output (requires `GM_REVIEW_LIST_ID`)
+- `/gm-review-sheet` — Export GM Review bulk results to Google Sheets (requires `GSHEET_ID` or `GOOGLE_SHEET_ID`)
 - `/at-risk-canvas <optional filters>` — Generate at-risk renewal canvas
 - `/attrition-risk <Account Name>` — Get attrition risk summary from Excel model
 - `/attrition-clouds` — List available cloud filters

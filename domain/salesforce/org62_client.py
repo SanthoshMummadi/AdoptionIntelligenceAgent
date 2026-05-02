@@ -610,16 +610,27 @@ def expand_canvas_records_with_all_renewals(seed_records: list, cloud: str) -> l
 
 
 class Org62Client:
-    """Salesforce org62 client using an explicit access token (for adapters)."""
+    """Salesforce org62 client: explicit session token or shared ``get_sf_client()`` from env."""
 
-    def __init__(self, access_token: str, instance_url: str):
-        if not access_token or not instance_url:
-            raise ValueError("access_token and instance_url are required")
-        self._sf = Salesforce(
-            instance_url=instance_url.rstrip("/"),
-            session_id=access_token,
-        )
-        log_debug("✅ Org62Client connected (token)")
+    def __init__(
+        self,
+        access_token: Optional[str] = None,
+        instance_url: Optional[str] = None,
+    ):
+        if access_token and instance_url:
+            self._sf = Salesforce(
+                instance_url=instance_url.rstrip("/"),
+                session_id=access_token,
+            )
+            log_debug("✅ Org62Client connected (token)")
+        else:
+            self._sf = get_sf_client()
+            log_debug("✅ Org62Client using shared get_sf_client()")
+
+    def query(self, soql: str) -> List[Dict[str, Any]]:
+        """Run SOQL and return record list (no ``attributes`` stripping)."""
+        res = sf_query(soql, client=self._sf)
+        return list(res.get("records") or [])
 
     def resolve_account_id(self, account_name: str) -> Optional[str]:
         """Resolve account name to 15/18-char Account Id."""

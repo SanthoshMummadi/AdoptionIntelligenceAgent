@@ -5,6 +5,7 @@ from apscheduler.triggers.cron import CronTrigger
 import os
 import re
 import sys
+import threading
 import time
 import json
 import pickle
@@ -27,6 +28,8 @@ from domain.analytics.snowflake_client import (
 from domain.tracking.account_tracker import setup_tracking_tables
 from services.app_home import publish_app_home
 from services.daily_pulse_workflow import run_daily_pulse
+from services.classify_renewal_workflow import ClassifyRenewalWorkflow, ClassificationResult
+from services.gm_review_bulk_workflow import _lookup_record_channel
 from log_utils import log_error
 
 slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -1209,7 +1212,10 @@ def gm_review_canvas(ack, say, command, client):
                 )
                 sheet_name = date_type.today().strftime("GM Review %Y-%m-%d")
                 sheet_url = export_to_gsheet(
-                    reviews, sheet_name=sheet_name, cloud=detected_cloud
+                    reviews,
+                    sheet_name=sheet_name,
+                    cloud=detected_cloud,
+                    slack_client=client,
                 )
                 if sheet_url:
                     print(f"[gm-review-canvas] Sheets export OK: {sheet_url[:80]}...")
@@ -1441,6 +1447,7 @@ def gm_review_sheet(ack, say, command, client):
                 reviews,
                 sheet_name=sheet_name,
                 cloud=detected_cloud,
+                slack_client=client,
             )
             if not sheet_url:
                 say(":warning: Sheet export completed but no URL was returned. Check bot logs.")
@@ -1459,6 +1466,152 @@ def gm_review_sheet(ack, say, command, client):
             traceback.print_exc()
 
     import threading
+
+    threading.Thread(target=process, daemon=True).start()
+
+
+def _format_classification(r: ClassificationResult) -> str:
+    if "Actionable" in r.recommendation and "Non-Actionable" not in r.recommendation:
+        icon = ":white_check_mark:"
+    elif "Non-Actionable" in r.recommendation:
+        icon = ":no_entry:"
+    elif "Already Attrited" in r.recommendation:
+        icon = ":large_orange_circle:"
+    else:
+        icon = ":clock1:"
+    return (
+        f"{icon} *{r.account_nm}* | `{r.opp_id}`\n"
+        f"> Territory: {r.csg_territory}\n"
+        f"> Attrition: ${abs(r.attrition):,.0f} | Swing: ${r.swing_amount:,.0f}\n"
+        f"> Recommendation: *{r.recommendation}*\n"
+        f"> Rule: {r.rule_applied} | Source: {r.signal_source}\n"
+        f"> Reasoning: {r.reasoning}\n"
+        f"> Sheet Col 27 (AA) updated :white_check_mark:"
+    )
+
+
+@app.command("/classify-renewal")
+def handle_classify_renewal(ack, command, say, client):
+    """
+    Stage 2 V6 at-risk classification for Commerce GM Review sheet rows.
+    """
+    ack()
+    raw = (command.get("text") or "").strip()
+    if not raw:
+        say(
+            "Usage: `/classify-renewal [account-name | opp-id | all | next]`\n"
+            "Optional: paste a Google Sheet URL to target that spreadsheet."
+        )
+        return
+
+    def process():
+        try:
+            from domain.integrations.gsheet_exporter import (
+                GSheetExporter,
+                parse_gsheet_id_from_url,
+            )
+            from domain.salesforce.org62_client import Org62Client
+
+            sid = parse_gsheet_id_from_url(raw)
+            remainder = (
+                re.sub(
+                    r"https://docs\.google\.com/spreadsheets/d/[a-zA-Z0-9_-]+[^\s]*",
+                    "",
+                    raw,
+                    flags=re.I,
+                ).strip()
+            )
+            batch_classify = remainder.lower() == "all" or (
+                bool(sid) and remainder == ""
+            )
+
+            exporter = GSheetExporter(sheet_id=sid) if sid else GSheetExporter()
+            workflow = ClassifyRenewalWorkflow(
+                slack_client=client, org62_client=Org62Client()
+            )
+
+            if remainder.startswith("006"):
+                row = exporter.find_row_by_opp_id(remainder)
+                if not row:
+                    say(f":x: Opportunity `{remainder}` not found in the sheet.")
+                    return
+                result = workflow.classify(
+                    row, _lookup_record_channel(row.get("account_id"))
+                )
+                exporter.write_classification(
+                    row["sheet_row_index"], result.recommendation
+                )
+                say(_format_classification(result))
+                return
+
+            if remainder.lower() == "next":
+                row = exporter.find_next_pending()
+                if not row:
+                    say(
+                        ":white_check_mark: All accounts classified — no "
+                        "`Pending Review` rows remain."
+                    )
+                    return
+                result = workflow.classify(
+                    row, _lookup_record_channel(row.get("account_id"))
+                )
+                exporter.write_classification(
+                    row["sheet_row_index"], result.recommendation
+                )
+                remaining = exporter.count_pending()
+                say(
+                    _format_classification(result)
+                    + f"\n\n:hourglass: *{remaining} remaining* — send "
+                    "`/classify-renewal next` to continue."
+                )
+                return
+
+            if batch_classify:
+                rows = exporter.get_all_pending_rows()
+                say(
+                    f":hourglass_flowing_sand: Batch classifying *{len(rows)} accounts*..."
+                )
+                for row in rows:
+                    try:
+                        result = workflow.classify(
+                            row, _lookup_record_channel(row.get("account_id"))
+                        )
+                        exporter.write_classification(
+                            row["sheet_row_index"], result.recommendation
+                        )
+                        say(_format_classification(result))
+                    except Exception as e:
+                        nm = row.get("account_nm", "?")
+                        say(f":warning: Error on {nm}: {e}")
+                say(
+                    ":white_check_mark: Batch complete. Check column AA (classification) "
+                    "in the sheet."
+                )
+                return
+
+            rows = exporter.find_rows_by_name(remainder)
+            if not rows:
+                say(f":x: No accounts matching `{remainder}` found.")
+                return
+            if len(rows) > 1:
+                options = "\n".join(
+                    f"- {r['account_nm']} (`{r['opp_id']}`)" for r in rows
+                )
+                say(f":mag: Multiple matches — re-run with opp ID:\n{options}")
+                return
+            row = rows[0]
+            result = workflow.classify(
+                row, _lookup_record_channel(row.get("account_id"))
+            )
+            exporter.write_classification(
+                row["sheet_row_index"], result.recommendation
+            )
+            say(_format_classification(result))
+        except Exception as e:
+            say(f":x: `/classify-renewal` failed: {str(e)[:300]}")
+            import traceback
+
+            traceback.print_exc()
 
     threading.Thread(target=process, daemon=True).start()
 

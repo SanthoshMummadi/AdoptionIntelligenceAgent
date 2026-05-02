@@ -9,7 +9,11 @@ from domain.salesforce.org62_client import sf_query
 def get_red_accounts_bulk(account_ids: list[str]) -> dict:
     """
     Single SOQL query for all red accounts.
-    Returns {account_id: red_account_data}
+    Returns {account_id: red_account_data}.
+
+    Filters: ``Stage__c IN ('Open', 'Precautionary')`` only; commerce-related
+    ``Issue_Product__c`` via LIKE (null / blank product excludes the row — unknown product).
+    Selected ``Issue_Product__c`` is exposed as ``issue_product`` on each value dict.
     """
     if not account_ids:
         return {}
@@ -26,7 +30,13 @@ def get_red_accounts_bulk(account_ids: list[str]) -> dict:
                Days_Red__c
         FROM Red_Account__c
         WHERE Red_Account__c IN ('{ids_soql}')
-        AND Stage__c != 'Resolved'
+        AND Stage__c IN ('Open', 'Precautionary')
+        AND (
+            Issue_Product__c LIKE '%Commerce%'
+            OR Issue_Product__c LIKE '%B2C%'
+            OR Issue_Product__c LIKE '%B2B%'
+            OR Issue_Product__c LIKE '%Order Management%'
+        )
         ORDER BY Days_Red__c DESC
     """
 
@@ -38,12 +48,19 @@ def get_red_accounts_bulk(account_ids: list[str]) -> dict:
     for r in records:
         acct_id = r.get("Red_Account__c", "")
         if acct_id:
+            rid = str(r.get("Id") or "")
             red_map[acct_id[:15]] = {
+                "red_account_id": rid,
+                "red_account_url": (
+                    f"https://org62.lightning.force.com/lightning/r/Red_Account__c/{rid}/view"
+                    if rid
+                    else ""
+                ),
                 "stage": r.get("Stage__c", ""),
                 "acv_at_risk": r.get("ACV_at_Risk__c", 0),
                 "latest_updates": r.get("Latest_Updates__c", ""),
                 "action_plan": r.get("Action_Plan__c", ""),
-                "issue_product": r.get("Issue_Product__c", ""),
+                "issue_product": str(r.get("Issue_Product__c") or "").strip(),
                 "days_red": r.get("Days_Red__c", 0),
             }
 
@@ -53,7 +70,7 @@ def get_red_accounts_bulk(account_ids: list[str]) -> dict:
 def get_opp_dynamic_fields_bulk(opp_ids: list[str]) -> dict[str, dict]:
     """
     Fetch dynamic org62 fields for up to 500 opp IDs in one SOQL query.
-    Returns dict keyed by opp_id_15.
+    Returns dict keyed by opp Id (both 15- and 18-char forms alias the same bucket).
     """
     if not opp_ids:
         return {}
@@ -66,25 +83,39 @@ def get_opp_dynamic_fields_bulk(opp_ids: list[str]) -> dict[str, dict]:
         id_list = "','".join(batch)
         data = sf_query(
             f"""SELECT Id,
-                       Forecasted_Attrition__c,
                        Description,
                        StageName,
                        CloseDate,
                        IsClosed,
+                       sfbase__PriorContractStartDate__c,
+                       sfbase__PriorContractTerm__c,
                        Account.Id,
                        Account.Name
                 FROM Opportunity
                 WHERE Id IN ('{id_list}')"""
         )
         for rec in (data.get("records") or []):
-            oid = str(rec.get("Id") or "")[:15]
-            result[oid] = {
-                "forecasted_attrition": float(rec.get("Forecasted_Attrition__c") or 0),
+            oid_18 = str(rec.get("Id") or "").strip()
+            oid_15 = oid_18[:15] if oid_18 else ""
+            if not oid_15:
+                continue
+            pct = rec.get("sfbase__PriorContractTerm__c")
+            try:
+                prior_term = int(float(pct)) if pct not in (None, "") else None
+            except (TypeError, ValueError):
+                prior_term = None
+            bucket = {
                 "description": str(rec.get("Description") or "").strip(),
                 "stage": str(rec.get("StageName") or "").strip(),
                 "close_date": str(rec.get("CloseDate") or "").strip(),
                 "is_closed": bool(rec.get("IsClosed") or False),
+                "prior_contract_start_date": str(
+                    rec.get("sfbase__PriorContractStartDate__c") or ""
+                ).strip(),
+                "prior_contract_term_months": prior_term,
                 "account_id": str((rec.get("Account") or {}).get("Id") or "")[:15],
                 "account_name": str((rec.get("Account") or {}).get("Name") or "").strip(),
             }
+            result[oid_15] = bucket
+            result[oid_18] = bucket
     return result

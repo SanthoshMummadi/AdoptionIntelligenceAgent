@@ -22,7 +22,7 @@ if creds_json and creds_json.strip().startswith("{"):
 elif creds_json:
     print(f"From ENV: value set but not JSON (length {len(creds_json)}); try credentials file below.\n")
 
-for fname in ("credentials.json", "google_creds.json"):
+for fname in ("google_creds.json", "credentials.json"):
     fpath = _REPO_ROOT / fname
     if fpath.is_file():
         with open(fpath) as f:

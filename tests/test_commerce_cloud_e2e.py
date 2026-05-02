@@ -842,7 +842,7 @@ def test_gs_export():
 def test_gs_headers():
     from domain.integrations.gsheet_exporter import HEADERS_22
 
-    assert len(HEADERS_22) == 24, f"Expected 24 headers, got {len(HEADERS_22)}"
+    assert len(HEADERS_22) == 27, f"Expected 27 headers, got {len(HEADERS_22)}"
 
 
 for fn in [
