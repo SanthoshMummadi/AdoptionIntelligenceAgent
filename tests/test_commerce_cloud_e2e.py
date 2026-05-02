@@ -838,11 +838,13 @@ def test_gs_export():
     assert "spreadsheets" in url
 
 
-@test("GS-005: HEADERS_22 has expected column count")
+@test("GS-005: GM_REVIEW_SHEET_HEADERS has expected column count")
 def test_gs_headers():
-    from domain.integrations.gsheet_exporter import HEADERS_22
+    from domain.integrations.gsheet_exporter import GM_REVIEW_SHEET_HEADERS
 
-    assert len(HEADERS_22) == 27, f"Expected 27 headers, got {len(HEADERS_22)}"
+    assert len(GM_REVIEW_SHEET_HEADERS) == 29, (
+        f"Expected 29 headers, got {len(GM_REVIEW_SHEET_HEADERS)}"
+    )
 
 
 for fn in [

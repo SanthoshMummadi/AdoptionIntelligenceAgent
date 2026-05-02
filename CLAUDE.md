@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Slack-native **PM Intelligence Hub** that analyzes product briefs, runs V2MoM-style reviews, and predicts attrition risk. The system combines a **FastMCP server** with **Slack Bolt** integration, using Salesforce LLM Gateway (Claude) for AI analysis.
 
+**Requirements:** Python 3.13+ (current: 3.13.12)
+
 **Key capabilities:**
 - Product Brief & V2MoM document analysis with configurable prompt sets
 - AI Council Review (GM Review) — at-risk renewal synthesis with Salesforce + Snowflake + LLM
@@ -84,17 +86,27 @@ python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
 ## Architecture
 
 ### Data Flow
-**GM Review** follows this pattern:
+**GM Review** has two workflow modes — choose based on input type and scale:
+
+**1. Bulk workflow** (`gm_review_bulk_workflow.py`) — **Snowflake-first**
+- **When to use:** Large cloud scans (50+ accounts), FY filters, ATR thresholds
+- **Flow:** 3 Snowflake queries → in-memory join → parallel LLM analysis
+- **Speed:** Fast for bulk operations (minutes for 50+ accounts)
+- **Enable:** Set `GM_REVIEW_BULK_MODE=1` in `.env`
+
+**2. Account-by-account workflow** (`gm_review_workflow.py`) — **Salesforce-first**
+- **When to use:** Specific accounts/opps, need detailed Salesforce fields, custom enrichment
+- **Flow:** Per-account: Salesforce query → Snowflake enrichment → LLM analysis
+- **Speed:** Slower but more detailed (seconds per account)
+- **Best for:** Small sets, explicit opportunity IDs, deep field inspection
+
+**Common GM Review pipeline** (both modes):
 1. **Input:** Account names, opportunity IDs, or cloud + FY filters
 2. **Salesforce query:** Fetch opportunities, dynamic fields, red account flags
 3. **Snowflake enrichment:** Usage (CIDM), renewals, attrition risk, health scores
 4. **LLM analysis:** Risk theme classification + playbook recommendations (with circuit breaker fallback)
 5. **Canvas generation:** Slack Canvas markdown table with formatted results
 6. **Optional export:** Google Sheets export for downstream analysis
-
-**Bulk vs sequential:**
-- Bulk: 3 Snowflake queries → in-memory join → parallel LLM (fast for 50+ accounts)
-- Sequential: Per-account Salesforce + Snowflake → LLM (detailed, works for any input)
 
 ### Entry points
 - **`slack_app.py`** — Slack Bolt app (DMs, hub modules, file ingestion, slash commands, App Home dashboard)
@@ -189,6 +201,21 @@ Started automatically on bot startup via APScheduler.
 
 ## Common Commands
 
+### Running tests
+```bash
+# Run all GM Review tests
+python3 tests/test_commerce_cloud_e2e.py
+python3 -m pytest tests/test_commerce_cloud_e2e.py -v
+
+# Run dynamic account tests
+python3 tests/test_dynamic_accounts.py
+
+# Run single test
+python3 -m pytest tests/test_commerce_cloud_e2e.py::test_name -v
+```
+
+Tests require live Salesforce, Snowflake, and LLM credentials. Tests automatically skip env validation (via `PRODUCT_ADOPTION_SKIP_ENV_VALIDATION`).
+
 ### Slack slash commands
 - `/gm-review-canvas <accounts or opp IDs>` — Generate AI Council Review canvas with optional cloud token
 - `/gm-review-lists` — Update Slack Lists from GM Review bulk output (requires `GM_REVIEW_LIST_ID`)
@@ -224,5 +251,10 @@ Files with `explore*.py` or `fix_*.py` prefixes are experimental. Refer to docum
 - Never commit `.env` or credential files
 - Corporate CA certificate handling required for internal Salesforce endpoints
 
-### Python version
-Requires Python 3.13+ (current: 3.13.12)
+### Troubleshooting
+Common issues and solutions:
+- **Slack auth.test / proxy errors** — Check corporate proxy or Socket Mode firewall rules
+- **Snowflake auth failures** — Confirm key path, passphrase, role, and warehouse grants (prefer key-pair auth in production, avoid `externalbrowser`)
+- **Empty GM Review rows** — Validate cloud/FY filters, snapshot dates, and `GM_REVIEW_FCAST_ATTRITION_THRESHOLD`
+- **LLM circuit breaker open** — Transient LLM failures trigger fallback mode; check `LLM_CIRCUIT_THRESHOLD` and `LLM_CIRCUIT_COOLDOWN` settings
+- **Snowflake timeouts** — Tune timeout env vars in `.env.example` (e.g., `SNOWFLAKE_CIDM_SNAPSHOT_DT` to pin snapshot and skip `MAX` during unstable periods)

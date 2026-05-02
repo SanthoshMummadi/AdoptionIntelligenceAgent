@@ -1470,6 +1470,132 @@ def gm_review_sheet(ack, say, command, client):
     threading.Thread(target=process, daemon=True).start()
 
 
+_INITIATE_OUTREACH_CMD_RAW = (
+    os.getenv("SLACK_COMMAND_INITIATE_OUTREACH", "/initiate-outreach").strip()
+    or "/initiate-outreach"
+)
+_INITIATE_OUTREACH_CMD = (
+    _INITIATE_OUTREACH_CMD_RAW
+    if _INITIATE_OUTREACH_CMD_RAW.startswith("/")
+    else "/" + _INITIATE_OUTREACH_CMD_RAW.lstrip("/")
+)
+
+# Slash /initiate-outreach: cloud → Google Sheet tab. Add clouds here when new tabs ship.
+CLOUD_TAB_MAP = {
+    "Commerce Cloud": os.getenv("GM_REVIEW_GOOGLE_TAB", "Commerce Cloud GM Review"),
+}
+
+
+@app.command(_INITIATE_OUTREACH_CMD)
+def handle_initiate_outreach(ack, respond, command, client, logger):
+    """
+    Scan the GM Review Google Sheet tab for Col AB *Outreach Initiated* and run Stage 3
+    (create/open protect channel + post + watch channel + sheet checkmark).
+
+    Slack app manifest: register this slash command alongside existing ones:
+
+        {
+          "command": "/initiate-outreach",
+          "description": "Stage 3 outreach: /initiate-outreach Commerce Cloud (optional)",
+          "should_escape": false
+        }
+    """
+    ack()
+
+    text = (command.get("text") or "").strip() or "Commerce Cloud"
+    cloud = text.title()
+
+    tab_name = CLOUD_TAB_MAP.get(cloud)
+    supported = ", ".join(f"`{k}`" for k in CLOUD_TAB_MAP)
+    _cmd = os.getenv("SLACK_COMMAND_INITIATE_OUTREACH", "/initiate-outreach").strip()
+    if not _cmd.startswith("/"):
+        _cmd = "/" + _cmd.lstrip("/")
+    if not tab_name:
+        respond(
+            f"❌ Unknown cloud: `{cloud}`. Supported: {supported}\n\n"
+            f"*Usage:* `{_cmd} <cloud name>`\n"
+            f"*Example:* `{_cmd} Commerce Cloud`"
+        )
+        return
+
+    respond("⏳ Scanning sheet for outreach requests...")
+    chan = command.get("channel_id")
+    uid = command.get("user_id")
+
+    def _finish(text: str) -> None:
+        try:
+            respond(text=text, replace_original=True)
+        except Exception as resp_err:
+            logger.warning(
+                "initiate-outreach: respond(update) failed: %s; trying ephemeral",
+                resp_err,
+            )
+            try:
+                if chan and uid:
+                    client.chat_postEphemeral(channel=chan, user=uid, text=text)
+                else:
+                    logger.error("initiate-outreach: no channel_id/user_id for fallback")
+            except SlackApiError as se:
+                logger.error("initiate-outreach: chat_postEphemeral failed: %s", se)
+
+    def process(sheet_tab: str, cloud_label: str, trigger_user_id: str | None):
+        import gspread
+
+        from domain.integrations.gsheet_exporter import get_google_creds, _gsheet_id
+        from services.stage3_outreach import scan_sheet_for_outreach
+
+        try:
+            sid = _gsheet_id()
+            if not sid:
+                _finish(
+                    ":x: No sheet ID configured. Set `GSHEET_ID` or `GOOGLE_SHEET_ID` in `.env`."
+                )
+                return
+
+            creds = get_google_creds()
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_key(sid)
+            ws = sh.worksheet(sheet_tab)
+            count = scan_sheet_for_outreach(client, ws, trigger_user_id=trigger_user_id)
+            if count > 0:
+                _finish(
+                    f"✅ *{cloud_label}* — Outreach initiated for *{count}* account(s).\n"
+                    f"Check #cc-attrition-watch for updates."
+                )
+            else:
+                _finish(
+                    f"ℹ️ *{cloud_label}* — No accounts marked for outreach.\n"
+                    f"Set Col AB = `Outreach Initiated` in the sheet first."
+                )
+        except gspread.exceptions.WorksheetNotFound as e:
+            logger.exception("initiate-outreach worksheet: %s", e)
+            _finish(
+                f":x: Google Sheet tab not found: `{sheet_tab}`. Verify the tab exists for cloud "
+                f"*{cloud_label}* ({e})."
+            )
+        except gspread.exceptions.SpreadsheetNotFound as e:
+            logger.exception("initiate-outreach spreadsheet: %s", e)
+            _finish(
+                ":x: Google Sheet not found. Verify `GSHEET_ID` / `GOOGLE_SHEET_ID` and sharing."
+            )
+        except SlackApiError as e:
+            logger.exception("initiate-outreach Slack API error: %s", e)
+            err = getattr(e.response, "get", lambda k, d=None: d)("error", str(e))
+            _finish(f":x: Slack API error: `{err}`")
+        except Exception as e:
+            logger.exception("initiate-outreach failed: %s", e)
+            import traceback
+
+            traceback.print_exc()
+            _finish(f":x: Outreach scan failed: {str(e)[:500]}")
+
+    import threading
+
+    threading.Thread(
+        target=process, args=(tab_name, cloud, uid), daemon=True
+    ).start()
+
+
 def _format_classification(r: ClassificationResult) -> str:
     if "Actionable" in r.recommendation and "Non-Actionable" not in r.recommendation:
         icon = ":white_check_mark:"

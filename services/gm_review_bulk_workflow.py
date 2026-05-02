@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from domain.integrations.gsheet_exporter import (
     apply_classification_dropdown,
+    apply_outreach_status_dropdown,
     batch_write_classifications,
 )
 
@@ -387,6 +388,11 @@ def _run_classification_pass(
     except Exception as e:
         logger.warning("[Stage 2] Dropdown attach failed (non-fatal): %s", e)
 
+    try:
+        apply_outreach_status_dropdown(worksheet)
+    except Exception as e:
+        logger.warning("[Stage 2] Outreach dropdown attach failed (non-fatal): %s", e)
+
     classifications: list[str] = []
     for offset, row in enumerate(exported_rows):
         sheet_row_index = start_row_index + offset
@@ -419,3 +425,12 @@ def _run_classification_pass(
             len(classifications),
             ee,
         )
+
+    try:
+        from services.stage3_outreach import scan_sheet_for_outreach
+
+        count = scan_sheet_for_outreach(slack_client, worksheet)
+        if count > 0:
+            log_debug(f"Stage 3: {count} outreach(es) initiated")
+    except Exception as e:
+        logger.warning("[Stage 3] scan_sheet_for_outreach failed (non-fatal): %s", e)

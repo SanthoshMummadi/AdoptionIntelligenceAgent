@@ -13,7 +13,7 @@ import re
 import threading
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 from simple_salesforce import Salesforce
@@ -756,3 +756,58 @@ class Org62Client:
         except Exception as e:
             log_error(f"Org62Client.get_renewal_opportunity error: {e}")
             return None
+
+
+def _looks_like_slack_conversation_id(cid: str) -> bool:
+    s = str(cid or "").strip()
+    return bool(re.match(r"^[CG][A-Za-z0-9]{8,}$", s))
+
+
+def lookup_record_channel(
+    *,
+    org_id: Optional[Sequence[Optional[str]]] = None,
+    record_ids: Optional[Sequence[Optional[str]]] = None,
+) -> Optional[str]:
+    """
+    Slack channel Id for Salesforce record-linked channels via ``SlackChannelRelatedRecord``
+    (``RelatedRecord`` → ``SlackChannel`` on the authenticated org).
+
+    ``org_id`` entries that look like a Salesforce Org Id (``00D…``) are preserved for callers
+    that mirror Slack API shapes but **do not** filter this object — use non-``00D`` values
+    for ``TopLevelTeam`` (Slack Enterprise org) when multi-team disambiguation is required.
+    """
+    rec_ids: List[str] = []
+    for r in record_ids or []:
+        s = str(r or "").strip()
+        if s:
+            rec_ids.append(_escape(s))
+    if not rec_ids:
+        return None
+
+    team_filter_sql = ""
+    teams: List[str] = []
+    for o in org_id or []:
+        s = str(o or "").strip()
+        if not s:
+            continue
+        if len(s) >= 15 and s.startswith("00D"):
+            continue
+        teams.append(_escape(s))
+    if teams:
+        team_filter_sql = " AND TopLevelTeam IN ('" + "', '".join(teams) + "')"
+
+    in_clause = "'" + "', '".join(rec_ids) + "'"
+    query = (
+        "SELECT SlackChannel FROM SlackChannelRelatedRecord WHERE RelatedRecord "
+        f"IN ({in_clause}){team_filter_sql} LIMIT 5"
+    )
+    try:
+        rows = sf_query(query).get("records") or []
+        for row in rows:
+            ch = str((row or {}).get("SlackChannel") or "").strip()
+            if _looks_like_slack_conversation_id(ch):
+                return ch
+        return None
+    except Exception as e:
+        log_debug(f"lookup_record_channel: {str(e)[:240]}")
+        return None

@@ -91,9 +91,99 @@ def setup_tracking_tables():
         "CREATE INDEX IF NOT EXISTS idx_events_opp ON tracking_events(opp_id, event_type)"
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS outreach_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_nm TEXT,
+            opp_id TEXT,
+            protect_channel_id TEXT,
+            protect_channel_name TEXT,
+            watch_channel_id TEXT,
+            outreach_ts TEXT,
+            watch_ts TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
     logger.info("✓ Tracking tables ready")
+
+
+def has_prior_outreach_log(opp_id: str, account_nm: str) -> bool:
+    """
+    True if ``outreach_log`` already has a row for this opportunity or account name
+    (used to label *re-outreach* when GM resets Col AB to *Outreach Initiated*).
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        oid = (opp_id or "").strip()
+        anm = (account_nm or "").strip()
+        if oid:
+            cur.execute(
+                "SELECT 1 FROM outreach_log WHERE opp_id = ? LIMIT 1",
+                (oid,),
+            )
+            if cur.fetchone():
+                return True
+        if anm:
+            cur.execute(
+                "SELECT 1 FROM outreach_log WHERE account_nm = ? LIMIT 1",
+                (anm,),
+            )
+            if cur.fetchone():
+                return True
+        return False
+    finally:
+        conn.close()
+
+
+def log_outreach_event(
+    *,
+    account_nm: str,
+    opp_id: str,
+    protect_channel_id: str,
+    protect_channel_name: str,
+    watch_channel_id: str,
+    outreach_ts: str,
+    watch_ts: str,
+) -> None:
+    """Persist a Stage 3 outreach run (SQLite)."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO outreach_log (
+            account_nm,
+            opp_id,
+            protect_channel_id,
+            protect_channel_name,
+            watch_channel_id,
+            outreach_ts,
+            watch_ts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            account_nm,
+            opp_id,
+            protect_channel_id,
+            protect_channel_name,
+            watch_channel_id,
+            outreach_ts,
+            watch_ts,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    logger.info(
+        "Outreach logged: %s opp=%s protect=%s",
+        account_nm,
+        opp_id,
+        protect_channel_id,
+    )
 
 
 def is_strategic(opp: dict) -> bool:

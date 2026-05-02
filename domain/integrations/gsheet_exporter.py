@@ -1,6 +1,6 @@
 """
 domain/integrations/gsheet_exporter.py
-Google Sheets export — batched 27-column write.
+Google Sheets export — batched GM Review columns (see ``HEADERS_22`` / ``GM_REVIEW_SHEET_HEADERS``).
 """
 import json
 import os
@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import gspread
+
+from log_utils import log_debug
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 
@@ -65,12 +67,47 @@ HEADERS_22 = [
     "Why Explanation",
     "Exported At",
     "At-Risk Classification",
+    "Outreach Status",
+    "Protect Channel",
 ]
 
-# Column AA (27th column, 1-based) — Stage 2 V6 dropdown
+GM_REVIEW_SHEET_HEADERS = HEADERS_22
+
+_PROTECT_CHANNEL_COLUMN_MIN_COLS = 31
+
+
+def ensure_worksheet_min_columns(ws, min_cols: int = _PROTECT_CHANNEL_COLUMN_MIN_COLS) -> None:
+    """
+    Resize tab so columns like Col AC exist (protect channel id/name). Harmless no-op when wide enough.
+
+    Covers both new exports and `/initiate-outreach` scans that bypass ``export_to_gsheet``.
+    """
+    if ws is None:
+        return
+    try:
+        cur_cols = getattr(ws, "col_count", None)
+        if cur_cols is not None and cur_cols >= min_cols:
+            return
+        rows_n = getattr(ws, "row_count", None) or 500
+        ws.resize(rows=max(rows_n, 500), cols=min_cols)
+    except Exception as e:
+        print(
+            f"⚠️ Sheet resize cols>={min_cols} failed: {str(e)[:240]}"
+        )
+
+
+# Column AA (27th column, 1-based) — Stage 2 V6 classification dropdown
 CLASSIFICATION_COL_1BASE = 27
 CLASSIFICATION_CELL_PREFIX = "AA"
 CLASSIFICATION_PENDING = "Pending Review"
+
+# Col AB — outreach status (manual GM); data validation list
+OUTREACH_STATUS_VALUES = (
+    "Reviewed",
+    "Wait for CSG",
+    "Outreach Initiated",
+    "No Action Needed",
+)
 
 
 def _strip_slack_emoji(text: str) -> str:
@@ -447,9 +484,11 @@ def export_to_gsheet(
             try:
                 ws = sh.worksheet(sheet_name)
             except Exception:
-                ws = sh.add_worksheet(title=sheet_name, rows=500, cols=30)
+                ws = sh.add_worksheet(title=sheet_name, rows=500, cols=31)
 
-        headers_row = list(HEADERS_22)
+        ensure_worksheet_min_columns(ws, _PROTECT_CHANNEL_COLUMN_MIN_COLS)
+
+        headers_row = list(GM_REVIEW_SHEET_HEADERS)
         headers_row[2] = "Cloud AOV"
 
         existing_row1: list = []
@@ -715,6 +754,8 @@ def export_to_gsheet(
                     _safe_cell(why_explanation),
                     _safe_cell(exported_at),
                     _safe_cell(CLASSIFICATION_PENDING),
+                    _safe_cell(""),
+                    _safe_cell(""),
                 ]
             )
 
@@ -756,6 +797,27 @@ def export_to_gsheet(
                     print(
                         f"⚠️ Classification dropdown not applied: {str(e)[:200]}"
                     )
+                try:
+                    apply_outreach_status_dropdown(ws)
+                except Exception as e:
+                    print(
+                        f"⚠️ Outreach status dropdown not applied: {str(e)[:200]}"
+                    )
+                if slack_client is not None:
+                    try:
+                        from services.stage3_outreach import (
+                            scan_sheet_for_outreach,
+                        )
+
+                        c3 = scan_sheet_for_outreach(slack_client, ws)
+                        if c3 > 0:
+                            log_debug(
+                                f"Stage 3: {c3} outreach(es) initiated (post-export)"
+                            )
+                    except Exception as ex:
+                        print(
+                            f"⚠️ Stage 3 outreach scan failed: {str(ex)[:240]}"
+                        )
 
         sheet_url = (
             f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={ws.id}"
@@ -812,6 +874,31 @@ def apply_classification_dropdown(worksheet) -> None:
         strict=True,
     )
     set_data_validation_for_cell_range(worksheet, "AA2:AA1000", rule)
+
+
+def apply_outreach_status_dropdown(worksheet) -> None:
+    """Set Col AB (AB2:AB1000) dropdown for Outreach Status (manual GM entry)."""
+    try:
+        from gspread_formatting import (
+            BooleanCondition,
+            DataValidationRule,
+            set_data_validation_for_cell_range,
+        )
+    except ImportError:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "install gspread-formatting for Col AB outreach dropdown "
+            "(pip install gspread-formatting)"
+        )
+        return
+
+    rule = DataValidationRule(
+        BooleanCondition("ONE_OF_LIST", list(OUTREACH_STATUS_VALUES)),
+        showCustomUi=True,
+        strict=True,
+    )
+    set_data_validation_for_cell_range(worksheet, "AB2:AB1000", rule)
 
 
 def batch_write_classifications(
